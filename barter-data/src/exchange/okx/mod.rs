@@ -1,13 +1,26 @@
 use self::{
-    channel::OkxChannel, market::OkxMarket, subscription::OkxSubResponse, trade::OkxTrades,
+    channel::OkxChannel,
+    liquidation::OkxLiquidations,
+    market::OkxMarket,
+    open_interest::OkxOpenInterests,
+    subscription::OkxSubResponse,
+    trade::OkxTrades,
 };
 use crate::{
     ExchangeWsStream, NoInitialSnapshots,
     exchange::{Connector, ExchangeSub, PingInterval, StreamSelector},
     instrument::InstrumentData,
     subscriber::{WebSocketSubscriber, validator::WebSocketSubValidator},
-    subscription::trade::PublicTrades,
-    transformer::stateless::StatelessTransformer,
+    subscription::{
+        cvd::CumulativeVolumeDeltas,
+        liquidation::Liquidations,
+        open_interest::OpenInterests,
+        trade::PublicTrades,
+    },
+    transformer::{
+        cvd::CumulativeVolumeDeltaTransformer,
+        stateless::StatelessTransformer,
+    },
 };
 use barter_instrument::exchange::ExchangeId;
 use barter_integration::{
@@ -17,16 +30,22 @@ use barter_integration::{
 use barter_macro::{DeExchange, SerExchange};
 use derive_more::Display;
 use serde_json::json;
-use std::time::Duration;
+use std::{hash::Hash, time::Duration};
 use url::Url;
 
 /// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
 /// into an exchange [`Connector`] specific channel used for generating [`Connector::requests`].
 pub mod channel;
 
+/// Liquidation types for [`Okx`].
+pub mod liquidation;
+
 /// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
 /// into an exchange [`Connector`] specific market used for generating [`Connector::requests`].
 pub mod market;
+
+/// Open interest types for [`Okx`].
+pub mod open_interest;
 
 /// [`Subscription`](crate::subscription::Subscription) response type and response
 /// [`Validator`](barter_integration::Validator) for [`Okx`].
@@ -87,10 +106,30 @@ impl Connector for Okx {
     }
 
     fn requests(exchange_subs: Vec<ExchangeSub<Self::Channel, Self::Market>>) -> Vec<WsMessage> {
+        let args: Vec<serde_json::Value> = exchange_subs
+            .into_iter()
+            .map(|sub| {
+                // Liquidation orders use a different subscription format
+                if sub.channel.as_ref() == "liquidation-orders" {
+                    // For liquidations, use instType instead of instId
+                    json!({
+                        "channel": sub.channel.as_ref(),
+                        "instType": "SWAP"
+                    })
+                } else {
+                    // For other channels, use normal instId format
+                    json!({
+                        "channel": sub.channel.as_ref(),
+                        "instId": sub.market.as_ref()
+                    })
+                }
+            })
+            .collect();
+
         vec![WsMessage::text(
             json!({
                 "op": "subscribe",
-                "args": &exchange_subs,
+                "args": args,
             })
             .to_string(),
         )]
@@ -103,4 +142,32 @@ where
 {
     type SnapFetcher = NoInitialSnapshots;
     type Stream = OkxWsStream<StatelessTransformer<Self, Instrument::Key, PublicTrades, OkxTrades>>;
+}
+
+impl<Instrument> StreamSelector<Instrument, Liquidations> for Okx
+where
+    Instrument: InstrumentData,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream =
+        OkxWsStream<StatelessTransformer<Self, Instrument::Key, Liquidations, OkxLiquidations>>;
+}
+
+impl<Instrument> StreamSelector<Instrument, CumulativeVolumeDeltas> for Okx
+where
+    Instrument: InstrumentData,
+    Instrument::Key: Eq + Hash,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream =
+        OkxWsStream<CumulativeVolumeDeltaTransformer<Self, Instrument::Key, OkxTrades>>;
+}
+
+impl<Instrument> StreamSelector<Instrument, OpenInterests> for Okx
+where
+    Instrument: InstrumentData,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream =
+        OkxWsStream<StatelessTransformer<Self, Instrument::Key, OpenInterests, OkxOpenInterests>>;
 }
