@@ -4,6 +4,7 @@ use crate::{
     subscription::{
         Subscription,
         book::{OrderBooksL1, OrderBooksL2},
+        cvd::CumulativeVolumeDeltas,
         liquidation::Liquidations,
         trade::PublicTrades,
     },
@@ -77,6 +78,14 @@ impl<Instrument> Identifier<BinanceChannel>
 {
     fn id(&self) -> BinanceChannel {
         BinanceChannel::LIQUIDATIONS
+    }
+}
+
+impl<Server, Instrument> Identifier<BinanceChannel>
+    for Subscription<Binance<Server>, Instrument, CumulativeVolumeDeltas>
+{
+    fn id(&self) -> BinanceChannel {
+        BinanceChannel::TRADES
     }
 }
 

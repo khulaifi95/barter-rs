@@ -1,5 +1,5 @@
 use self::liquidation::BinanceLiquidation;
-use super::{Binance, ExchangeServer};
+use super::{Binance, ExchangeServer, trade::BinanceTrade};
 use crate::{
     NoInitialSnapshots,
     exchange::{
@@ -13,11 +13,15 @@ use crate::{
         },
     },
     instrument::InstrumentData,
-    subscription::{book::OrderBooksL2, liquidation::Liquidations},
-    transformer::stateless::StatelessTransformer,
+    subscription::{
+        book::OrderBooksL2,
+        cvd::CumulativeVolumeDeltas,
+        liquidation::Liquidations,
+    },
+    transformer::{cvd::CumulativeVolumeDeltaTransformer, stateless::StatelessTransformer},
 };
 use barter_instrument::exchange::ExchangeId;
-use std::fmt::{Display, Formatter};
+use std::{fmt::{Display, Formatter}, hash::Hash};
 
 /// Level 2 OrderBook types.
 pub mod l2;
@@ -61,6 +65,16 @@ where
     type Stream = BinanceWsStream<
         StatelessTransformer<Self, Instrument::Key, Liquidations, BinanceLiquidation>,
     >;
+}
+
+impl<Instrument> StreamSelector<Instrument, CumulativeVolumeDeltas> for BinanceFuturesUsd
+where
+    Instrument: InstrumentData,
+    Instrument::Key: Eq + Hash,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream =
+        BinanceWsStream<CumulativeVolumeDeltaTransformer<Self, Instrument::Key, BinanceTrade>>;
 }
 
 impl Display for BinanceFuturesUsd {
