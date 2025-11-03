@@ -4,6 +4,9 @@ use crate::{
     subscription::{
         Subscription,
         book::{OrderBooksL1, OrderBooksL2},
+        cvd::CumulativeVolumeDeltas,
+        liquidation::Liquidations,
+        open_interest::OpenInterests,
         trade::PublicTrades,
     },
 };
@@ -31,6 +34,16 @@ impl BybitChannel {
     ///
     /// See docs: <https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook>
     pub const ORDER_BOOK_L2: Self = Self("orderbook.50");
+
+    /// [`Bybit`] tickers channel name, used to stream open interest updates.
+    ///
+    /// See docs: <https://bybit-exchange.github.io/docs/v5/websocket/public/tickers>
+    pub const TICKERS: Self = Self("tickers");
+
+    /// [`Bybit`] stream emitting global liquidation events across instruments.
+    ///
+    /// See docs: <https://bybit-exchange.github.io/docs/v5/websocket/public/all-liquidation>
+    pub const ALL_LIQUIDATION: Self = Self("allLiquidation");
 }
 
 impl<Server, Instrument> Identifier<BybitChannel>
@@ -54,6 +67,30 @@ impl<Server, Instrument> Identifier<BybitChannel>
 {
     fn id(&self) -> BybitChannel {
         BybitChannel::ORDER_BOOK_L2
+    }
+}
+
+impl<Server, Instrument> Identifier<BybitChannel>
+    for Subscription<Bybit<Server>, Instrument, OpenInterests>
+{
+    fn id(&self) -> BybitChannel {
+        BybitChannel::TICKERS
+    }
+}
+
+impl<Server, Instrument> Identifier<BybitChannel>
+    for Subscription<Bybit<Server>, Instrument, Liquidations>
+{
+    fn id(&self) -> BybitChannel {
+        BybitChannel::ALL_LIQUIDATION
+    }
+}
+
+impl<Server, Instrument> Identifier<BybitChannel>
+    for Subscription<Bybit<Server>, Instrument, CumulativeVolumeDeltas>
+{
+    fn id(&self) -> BybitChannel {
+        BybitChannel::TRADES
     }
 }
 

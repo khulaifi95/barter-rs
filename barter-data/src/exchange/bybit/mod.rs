@@ -10,9 +10,12 @@ use crate::{
     subscription::{
         Map,
         book::{OrderBooksL1, OrderBooksL2},
+        cvd::CumulativeVolumeDeltas,
+        liquidation::Liquidations,
+        open_interest::OpenInterests,
         trade::PublicTrades,
     },
-    transformer::stateless::StatelessTransformer,
+    transformer::{cvd::CumulativeVolumeDeltaTransformer, stateless::StatelessTransformer},
 };
 use barter_instrument::exchange::ExchangeId;
 use barter_integration::{
@@ -20,10 +23,12 @@ use barter_integration::{
     protocol::websocket::{WebSocketSerdeParser, WsMessage},
 };
 use book::{BybitOrderBookMessage, l2::BybitOrderBooksL2Transformer};
+use liquidation::BybitLiquidationMessage;
+use open_interest::BybitOpenInterestMessage;
+use trade::BybitTradeMessage;
 use serde::de::{Error, Unexpected};
-use std::{fmt::Debug, marker::PhantomData, time::Duration};
+use std::{fmt::Debug, hash::Hash, marker::PhantomData, time::Duration};
 use tokio::time;
-use trade::BybitTrade;
 use url::Url;
 
 /// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
@@ -58,6 +63,12 @@ pub mod trade;
 /// Orderbook types common to both [`BybitSpot`](spot::BybitSpot) and
 /// [`BybitFuturesUsd`](futures::BybitPerpetualsUsd).
 pub mod book;
+
+/// Open interest types for [`Bybit`](Bybit) exchanges.
+pub mod open_interest;
+
+/// Liquidation types for [`Bybit`](Bybit) exchanges.
+pub mod liquidation;
 
 /// Convenient type alias for a Bybit [`ExchangeWsStream`] using [`WebSocketSerdeParser`](barter_integration::protocol::websocket::WebSocketSerdeParser).
 pub type BybitWsStream<Transformer> = ExchangeWsStream<WebSocketSerdeParser, Transformer>;
@@ -128,7 +139,7 @@ where
 {
     type SnapFetcher = NoInitialSnapshots;
     type Stream =
-        BybitWsStream<StatelessTransformer<Self, Instrument::Key, PublicTrades, BybitTrade>>;
+        BybitWsStream<StatelessTransformer<Self, Instrument::Key, PublicTrades, BybitTradeMessage>>;
 }
 
 impl<Instrument, Server> StreamSelector<Instrument, OrderBooksL1> for Bybit<Server>
@@ -149,6 +160,39 @@ where
 {
     type SnapFetcher = NoInitialSnapshots;
     type Stream = BybitWsStream<BybitOrderBooksL2Transformer<Instrument::Key>>;
+}
+
+impl<Instrument, Server> StreamSelector<Instrument, OpenInterests> for Bybit<Server>
+where
+    Instrument: InstrumentData,
+    Server: ExchangeServer + Debug + Send + Sync,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream = BybitWsStream<
+        StatelessTransformer<Self, Instrument::Key, OpenInterests, BybitOpenInterestMessage>,
+    >;
+}
+
+impl<Instrument, Server> StreamSelector<Instrument, Liquidations> for Bybit<Server>
+where
+    Instrument: InstrumentData,
+    Server: ExchangeServer + Debug + Send + Sync,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream = BybitWsStream<
+        StatelessTransformer<Self, Instrument::Key, Liquidations, BybitLiquidationMessage>,
+    >;
+}
+
+impl<Instrument, Server> StreamSelector<Instrument, CumulativeVolumeDeltas> for Bybit<Server>
+where
+    Instrument: InstrumentData,
+    Instrument::Key: Eq + Hash,
+    Server: ExchangeServer + Debug + Send + Sync,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream =
+        BybitWsStream<CumulativeVolumeDeltaTransformer<Self, Instrument::Key, BybitTradeMessage>>;
 }
 
 impl<'de, Server> serde::Deserialize<'de> for Bybit<Server>

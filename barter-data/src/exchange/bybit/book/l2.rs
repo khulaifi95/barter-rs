@@ -78,17 +78,23 @@ where
             Err(unidentifiable) => return vec![Err(DataError::from(unidentifiable))],
         };
 
+        // Unwrap the message payload
+        let payload = match input {
+            BybitOrderBookMessage::Ignore => return vec![],
+            BybitOrderBookMessage::Payload(payload) => payload,
+        };
+
         // Initialise a sequencer when snapshot received from the exchange. We
         // return immediately because the snapshot message is always valid.
-        if matches!(input.kind, BybitPayloadKind::Snapshot) {
+        if matches!(payload.kind, BybitPayloadKind::Snapshot) {
             instrument.sequencer.replace(BybitOrderBookL2Sequencer {
-                last_update_id: input.data.update_id,
+                last_update_id: payload.data.update_id,
             });
 
             return MarketIter::<InstrumentKey, OrderBookEvent>::from((
                 BybitSpot::ID,
                 instrument.key.clone(),
-                input,
+                BybitOrderBookMessage::Payload(payload),
             ))
             .0;
         }
@@ -100,7 +106,7 @@ where
         };
 
         // Drop any outdated updates & validate sequence for relevant updates
-        let valid_update = match sequencer.validate_sequence(input) {
+        let valid_update = match sequencer.validate_sequence(payload) {
             Ok(Some(valid_update)) => valid_update,
             Ok(None) => return vec![],
             Err(error) => return vec![Err(error)],
@@ -109,7 +115,7 @@ where
         MarketIter::<InstrumentKey, OrderBookEvent>::from((
             BybitSpot::ID,
             instrument.key.clone(),
-            valid_update,
+            BybitOrderBookMessage::Payload(valid_update),
         ))
         .0
     }
@@ -123,8 +129,8 @@ struct BybitOrderBookL2Sequencer {
 impl BybitOrderBookL2Sequencer {
     pub fn validate_sequence(
         &mut self,
-        update: BybitOrderBookMessage,
-    ) -> Result<Option<BybitOrderBookMessage>, DataError> {
+        update: super::BybitOrderBook,
+    ) -> Result<Option<super::BybitOrderBook>, DataError> {
         // Each new update_id should be `last_update_id + 1`
         if update.data.update_id != self.last_update_id + 1 {
             return Err(DataError::InvalidSequence {

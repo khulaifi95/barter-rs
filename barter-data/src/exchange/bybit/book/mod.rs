@@ -1,12 +1,15 @@
 use crate::{
+    Identifier,
     books::{Level, OrderBook},
     event::{MarketEvent, MarketIter},
     subscription::book::OrderBookEvent,
 };
 use barter_instrument::exchange::ExchangeId;
+use barter_integration::subscription::SubscriptionId;
 use chrono::Utc;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 use super::message::{BybitPayload, BybitPayloadKind};
 
@@ -16,8 +19,43 @@ pub mod l1;
 /// Level 2 OrderBook types.
 pub mod l2;
 
-/// Terse type alias for an [`BybitOrderBookMessage`] OrderBook WebSocket message.
-pub type BybitOrderBookMessage = BybitPayload<BybitOrderBookInner>;
+/// Terse type alias for an OrderBook WebSocket payload.
+pub type BybitOrderBook = BybitPayload<BybitOrderBookInner>;
+
+/// Messages received on the Bybit order book stream.
+#[derive(Clone, Debug)]
+pub enum BybitOrderBookMessage {
+    Ignore,
+    Payload(BybitOrderBook),
+}
+
+impl<'de> Deserialize<'de> for BybitOrderBookMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+
+        match value.get("topic") {
+            Some(topic) if topic.is_string() => {
+                let raw = serde_json::to_string(&value).map_err(serde::de::Error::custom)?;
+                serde_json::from_str(&raw)
+                    .map(BybitOrderBookMessage::Payload)
+                    .map_err(serde::de::Error::custom)
+            }
+            _ => Ok(BybitOrderBookMessage::Ignore),
+        }
+    }
+}
+
+impl Identifier<Option<SubscriptionId>> for BybitOrderBookMessage {
+    fn id(&self) -> Option<SubscriptionId> {
+        match self {
+            BybitOrderBookMessage::Payload(payload) => payload.id(),
+            BybitOrderBookMessage::Ignore => None,
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Debug, Deserialize, Serialize)]
 pub struct BybitOrderBookInner {
@@ -40,25 +78,30 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, BybitOrderBookMessage)>
     fn from(
         (exchange, instrument, message): (ExchangeId, InstrumentKey, BybitOrderBookMessage),
     ) -> Self {
-        let orderbook = OrderBook::new(
-            message.data.sequence,
-            Some(message.time),
-            message.data.bids,
-            message.data.asks,
-        );
+        match message {
+            BybitOrderBookMessage::Ignore => Self(vec![]),
+            BybitOrderBookMessage::Payload(payload) => {
+                let orderbook = OrderBook::new(
+                    payload.data.sequence,
+                    Some(payload.time),
+                    payload.data.bids,
+                    payload.data.asks,
+                );
 
-        let kind = match message.kind {
-            BybitPayloadKind::Snapshot => OrderBookEvent::Snapshot(orderbook),
-            BybitPayloadKind::Delta => OrderBookEvent::Update(orderbook),
-        };
+                let kind = match payload.kind {
+                    BybitPayloadKind::Snapshot => OrderBookEvent::Snapshot(orderbook),
+                    BybitPayloadKind::Delta => OrderBookEvent::Update(orderbook),
+                };
 
-        Self(vec![Ok(MarketEvent {
-            time_exchange: message.time,
-            time_received: Utc::now(),
-            exchange,
-            instrument,
-            kind,
-        })])
+                Self(vec![Ok(MarketEvent {
+                    time_exchange: payload.time,
+                    time_received: Utc::now(),
+                    exchange,
+                    instrument,
+                    kind,
+                })])
+            }
+        }
     }
 }
 

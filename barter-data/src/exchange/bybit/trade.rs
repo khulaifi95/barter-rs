@@ -1,14 +1,43 @@
 use crate::{
+    Identifier,
     event::{MarketEvent, MarketIter},
     exchange::bybit::message::BybitPayload,
     subscription::trade::PublicTrade,
 };
 use barter_instrument::{Side, exchange::ExchangeId};
+use barter_integration::subscription::SubscriptionId;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 /// Terse type alias for an [`BybitTrade`](BybitTradeInner) real-time trades WebSocket message.
 pub type BybitTrade = BybitPayload<Vec<BybitTradeInner>>;
+
+/// Messages received on the Bybit trade stream.
+#[derive(Clone, Debug)]
+pub enum BybitTradeMessage {
+    Ignore,
+    Payload(BybitTrade),
+}
+
+impl<'de> Deserialize<'de> for BybitTradeMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+
+        match value.get("topic") {
+            Some(topic) if topic.is_string() => {
+                let raw = serde_json::to_string(&value).map_err(serde::de::Error::custom)?;
+                serde_json::from_str(&raw)
+                    .map(BybitTradeMessage::Payload)
+                    .map_err(serde::de::Error::custom)
+            }
+            _ => Ok(BybitTradeMessage::Ignore),
+        }
+    }
+}
 
 /// ### Raw Payload Examples
 /// See docs: <https://bybit-exchange.github.io/docs/v5/websocket/public/trade>
@@ -49,30 +78,44 @@ pub struct BybitTradeInner {
     pub id: String,
 }
 
-impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, BybitTrade)>
+impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, BybitTradeMessage)>
     for MarketIter<InstrumentKey, PublicTrade>
 {
-    fn from((exchange, instrument, trades): (ExchangeId, InstrumentKey, BybitTrade)) -> Self {
-        Self(
-            trades
-                .data
-                .into_iter()
-                .map(|trade| {
-                    Ok(MarketEvent {
-                        time_exchange: trade.time,
-                        time_received: Utc::now(),
-                        exchange,
-                        instrument: instrument.clone(),
-                        kind: PublicTrade {
-                            id: trade.id,
-                            price: trade.price,
-                            amount: trade.amount,
-                            side: trade.side,
-                        },
-                    })
-                })
-                .collect(),
-        )
+    fn from((exchange, instrument, message): (ExchangeId, InstrumentKey, BybitTradeMessage)) -> Self {
+        match message {
+            BybitTradeMessage::Ignore => Self(vec![]),
+            BybitTradeMessage::Payload(trades) => {
+                Self(
+                    trades
+                        .data
+                        .into_iter()
+                        .map(|trade| {
+                            Ok(MarketEvent {
+                                time_exchange: trade.time,
+                                time_received: Utc::now(),
+                                exchange,
+                                instrument: instrument.clone(),
+                                kind: PublicTrade {
+                                    id: trade.id,
+                                    price: trade.price,
+                                    amount: trade.amount,
+                                    side: trade.side,
+                                },
+                            })
+                        })
+                        .collect(),
+                )
+            }
+        }
+    }
+}
+
+impl Identifier<Option<SubscriptionId>> for BybitTradeMessage {
+    fn id(&self) -> Option<SubscriptionId> {
+        match self {
+            BybitTradeMessage::Payload(payload) => payload.id(),
+            BybitTradeMessage::Ignore => None,
+        }
     }
 }
 

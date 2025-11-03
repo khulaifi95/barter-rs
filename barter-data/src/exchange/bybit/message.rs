@@ -79,6 +79,14 @@ where
             "{}|{market}",
             BybitChannel::ORDER_BOOK_L2.0,
         ))),
+        (Some("allLiquidation"), Some(market), None) => Ok(SubscriptionId::from(format!(
+            "{}|{market}",
+            BybitChannel::ALL_LIQUIDATION.0,
+        ))),
+        (Some("tickers"), Some(market), None) => Ok(SubscriptionId::from(format!(
+            "{}|{market}",
+            BybitChannel::TICKERS.0,
+        ))),
         _ => Err(Error::invalid_value(
             Unexpected::Str(input),
             &"invalid message type expected pattern: <type>.<symbol>",
