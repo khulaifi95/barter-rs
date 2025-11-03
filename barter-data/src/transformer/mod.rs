@@ -11,6 +11,9 @@ use tokio::sync::mpsc;
 /// [`PublicTrades`](crate::subscription::trade::PublicTrades) streams.
 pub mod stateless;
 
+/// Stateful transformers that derive cumulative volume delta from trade feeds.
+pub mod cvd;
+
 /// Defines how to construct a [`Transformer`] used by [`MarketStream`](super::MarketStream)s to
 /// translate exchange specific types to normalised Barter types.
 #[async_trait]

@@ -4,7 +4,9 @@ use crate::{
     subscription::{
         book::{OrderBookEvent, OrderBookL1},
         candle::Candle,
+        cvd::CumulativeVolumeDelta,
         liquidation::Liquidation,
+        open_interest::OpenInterest,
         trade::PublicTrade,
     },
 };
@@ -98,6 +100,22 @@ impl<InstrumentKey> MarketEvent<InstrumentKey, DataKind> {
         }
     }
 
+    pub fn as_open_interest(&self) -> Option<MarketEvent<&InstrumentKey, &OpenInterest>> {
+        match &self.kind {
+            DataKind::OpenInterest(open_interest) => Some(self.as_event(open_interest)),
+            _ => None,
+        }
+    }
+
+    pub fn as_cumulative_volume_delta(
+        &self,
+    ) -> Option<MarketEvent<&InstrumentKey, &CumulativeVolumeDelta>> {
+        match &self.kind {
+            DataKind::CumulativeVolumeDelta(cvd) => Some(self.as_event(cvd)),
+            _ => None,
+        }
+    }
+
     fn as_event<'a, K>(&'a self, kind: &'a K) -> MarketEvent<&'a InstrumentKey, &'a K> {
         MarketEvent {
             time_exchange: self.time_exchange,
@@ -127,6 +145,8 @@ pub enum DataKind {
     OrderBook(OrderBookEvent),
     Candle(Candle),
     Liquidation(Liquidation),
+    OpenInterest(OpenInterest),
+    CumulativeVolumeDelta(CumulativeVolumeDelta),
 }
 
 impl DataKind {
@@ -137,6 +157,8 @@ impl DataKind {
             DataKind::OrderBook(_) => "l2",
             DataKind::Candle(_) => "candle",
             DataKind::Liquidation(_) => "liquidation",
+            DataKind::OpenInterest(_) => "open_interest",
+            DataKind::CumulativeVolumeDelta(_) => "cumulative_volume_delta",
         }
     }
 }
@@ -218,5 +240,37 @@ impl<InstrumentKey> From<MarketEvent<InstrumentKey, Liquidation>>
 {
     fn from(value: MarketEvent<InstrumentKey, Liquidation>) -> Self {
         value.map_kind(Liquidation::into)
+    }
+}
+
+impl<InstrumentKey> From<MarketStreamResult<InstrumentKey, OpenInterest>>
+    for MarketStreamResult<InstrumentKey, DataKind>
+{
+    fn from(value: MarketStreamResult<InstrumentKey, OpenInterest>) -> Self {
+        value.map_ok(MarketEvent::from)
+    }
+}
+
+impl<InstrumentKey> From<MarketEvent<InstrumentKey, OpenInterest>>
+    for MarketEvent<InstrumentKey, DataKind>
+{
+    fn from(value: MarketEvent<InstrumentKey, OpenInterest>) -> Self {
+        value.map_kind(OpenInterest::into)
+    }
+}
+
+impl<InstrumentKey> From<MarketStreamResult<InstrumentKey, CumulativeVolumeDelta>>
+    for MarketStreamResult<InstrumentKey, DataKind>
+{
+    fn from(value: MarketStreamResult<InstrumentKey, CumulativeVolumeDelta>) -> Self {
+        value.map_ok(MarketEvent::from)
+    }
+}
+
+impl<InstrumentKey> From<MarketEvent<InstrumentKey, CumulativeVolumeDelta>>
+    for MarketEvent<InstrumentKey, DataKind>
+{
+    fn from(value: MarketEvent<InstrumentKey, CumulativeVolumeDelta>) -> Self {
+        value.map_kind(CumulativeVolumeDelta::into)
     }
 }

@@ -20,8 +20,14 @@ pub mod book;
 /// Candle [`SubscriptionKind`] and the associated Barter output data model.
 pub mod candle;
 
+/// Cumulative volume delta [`SubscriptionKind`] and associated data model.
+pub mod cvd;
+
 /// Liquidation [`SubscriptionKind`] and the associated Barter output data model.
 pub mod liquidation;
+
+/// Open interest [`SubscriptionKind`] and the associated Barter output data model.
+pub mod open_interest;
 
 /// Public trade [`SubscriptionKind`] and the associated Barter output data model.
 pub mod trade;
@@ -87,6 +93,8 @@ pub enum SubKind {
     OrderBooksL3,
     Liquidations,
     Candles,
+    CumulativeVolumeDelta,
+    OpenInterest,
 }
 
 impl<Exchange, S, Kind> From<(Exchange, S, S, MarketDataInstrumentKind, Kind)>
@@ -258,12 +266,21 @@ pub fn exchange_supports_instrument_kind_sub_kind(
         (
             BinanceFuturesUsd,
             Perpetual,
-            PublicTrades | OrderBooksL1 | OrderBooksL2 | Liquidations,
+            PublicTrades | OrderBooksL1 | OrderBooksL2 | Liquidations | CumulativeVolumeDelta,
         ) => true,
         (Bitfinex, Spot, PublicTrades) => true,
         (Bitmex, Perpetual, PublicTrades) => true,
         (BybitSpot, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2) => true,
-        (BybitPerpetualsUsd, Perpetual, PublicTrades | OrderBooksL1 | OrderBooksL2) => true,
+        (
+            BybitPerpetualsUsd,
+            Perpetual,
+            PublicTrades
+            | OrderBooksL1
+            | OrderBooksL2
+            | Liquidations
+            | OpenInterest
+            | CumulativeVolumeDelta,
+        ) => true,
         (Coinbase, Spot, PublicTrades) => true,
         (GateioSpot, Spot, PublicTrades) => true,
         (GateioFuturesUsd, Future { .. }, PublicTrades) => true,
@@ -272,7 +289,11 @@ pub fn exchange_supports_instrument_kind_sub_kind(
         (GateioPerpetualsBtc, Perpetual, PublicTrades) => true,
         (GateioOptions, Option { .. }, PublicTrades) => true,
         (Kraken, Spot, PublicTrades | OrderBooksL1) => true,
-        (Okx, Spot | Future { .. } | Perpetual | Option { .. }, PublicTrades) => true,
+        (
+            Okx,
+            Spot | Future { .. } | Perpetual | Option { .. },
+            PublicTrades | Liquidations | OpenInterest | CumulativeVolumeDelta,
+        ) => true,
 
         (_, _, _) => false,
     }

@@ -25,7 +25,9 @@ use crate::{
     subscription::{
         SubKind, Subscription,
         book::{OrderBookEvent, OrderBookL1, OrderBooksL1, OrderBooksL2},
+        cvd::{CumulativeVolumeDelta, CumulativeVolumeDeltas},
         liquidation::{Liquidation, Liquidations},
+        open_interest::{OpenInterest, OpenInterests},
         trade::{PublicTrade, PublicTrades},
     },
 };
@@ -41,6 +43,7 @@ use futures_util::{StreamExt, future::try_join_all};
 use itertools::Itertools;
 use std::{
     fmt::{Debug, Display},
+    hash::Hash,
     sync::Arc,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -60,9 +63,20 @@ pub struct DynamicStreams<InstrumentKey> {
     >,
     pub liquidations:
         VecMap<ExchangeId, UnboundedReceiverStream<MarketStreamResult<InstrumentKey, Liquidation>>>,
+    pub open_interests: VecMap<
+        ExchangeId,
+        UnboundedReceiverStream<MarketStreamResult<InstrumentKey, OpenInterest>>,
+    >,
+    pub cvds: VecMap<
+        ExchangeId,
+        UnboundedReceiverStream<MarketStreamResult<InstrumentKey, CumulativeVolumeDelta>>,
+    >,
 }
 
-impl<InstrumentKey> DynamicStreams<InstrumentKey> {
+impl<InstrumentKey> DynamicStreams<InstrumentKey>
+where
+    InstrumentKey: Eq + Hash,
+{
     /// Initialise a set of `Streams` by providing one or more [`Subscription`] batches.
     ///
     /// Each batch (ie/ `impl Iterator<Item = Subscription>`) will initialise at-least-one
@@ -80,7 +94,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
         SubIter: IntoIterator<Item = Sub>,
         Sub: Into<Subscription<ExchangeId, Instrument, SubKind>>,
         Instrument: InstrumentData<Key = InstrumentKey> + Ord + Display + 'static,
-        InstrumentKey: Debug + Clone + Send + 'static,
+        InstrumentKey: Debug + Clone + Eq + Hash + Send + 'static,
         Subscription<BinanceSpot, Instrument, PublicTrades>: Identifier<BinanceMarket>,
         Subscription<BinanceSpot, Instrument, OrderBooksL1>: Identifier<BinanceMarket>,
         Subscription<BinanceSpot, Instrument, OrderBooksL2>: Identifier<BinanceMarket>,
@@ -88,6 +102,8 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
         Subscription<BinanceFuturesUsd, Instrument, OrderBooksL1>: Identifier<BinanceMarket>,
         Subscription<BinanceFuturesUsd, Instrument, OrderBooksL2>: Identifier<BinanceMarket>,
         Subscription<BinanceFuturesUsd, Instrument, Liquidations>: Identifier<BinanceMarket>,
+        Subscription<BinanceFuturesUsd, Instrument, CumulativeVolumeDeltas>:
+            Identifier<BinanceMarket>,
         Subscription<Bitfinex, Instrument, PublicTrades>: Identifier<BitfinexMarket>,
         Subscription<Bitmex, Instrument, PublicTrades>: Identifier<BitmexMarket>,
         Subscription<BybitSpot, Instrument, PublicTrades>: Identifier<BybitMarket>,
@@ -96,6 +112,10 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
         Subscription<BybitPerpetualsUsd, Instrument, PublicTrades>: Identifier<BybitMarket>,
         Subscription<BybitPerpetualsUsd, Instrument, OrderBooksL1>: Identifier<BybitMarket>,
         Subscription<BybitPerpetualsUsd, Instrument, OrderBooksL2>: Identifier<BybitMarket>,
+        Subscription<BybitPerpetualsUsd, Instrument, Liquidations>: Identifier<BybitMarket>,
+        Subscription<BybitPerpetualsUsd, Instrument, OpenInterests>: Identifier<BybitMarket>,
+        Subscription<BybitPerpetualsUsd, Instrument, CumulativeVolumeDeltas>:
+            Identifier<BybitMarket>,
         Subscription<Coinbase, Instrument, PublicTrades>: Identifier<CoinbaseMarket>,
         Subscription<GateioSpot, Instrument, PublicTrades>: Identifier<GateioMarket>,
         Subscription<GateioFuturesUsd, Instrument, PublicTrades>: Identifier<GateioMarket>,
@@ -106,6 +126,9 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
         Subscription<Kraken, Instrument, PublicTrades>: Identifier<KrakenMarket>,
         Subscription<Kraken, Instrument, OrderBooksL1>: Identifier<KrakenMarket>,
         Subscription<Okx, Instrument, PublicTrades>: Identifier<OkxMarket>,
+        Subscription<Okx, Instrument, Liquidations>: Identifier<OkxMarket>,
+        Subscription<Okx, Instrument, OpenInterests>: Identifier<OkxMarket>,
+        Subscription<Okx, Instrument, CumulativeVolumeDeltas>: Identifier<OkxMarket>,
     {
         // Validate & dedup Subscription batches
         let batches = validate_batches(subscription_batches)?;
@@ -267,6 +290,29 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                             ))
                                         })
                                     }
+                                    (
+                                        ExchangeId::BinanceFuturesUsd,
+                                        SubKind::CumulativeVolumeDelta,
+                                    ) => {
+                                        init_market_stream(
+                                            STREAM_RECONNECTION_POLICY,
+                                            subs.into_iter()
+                                                .map(|sub| {
+                                                    Subscription::<_, Instrument, _>::new(
+                                                        BinanceFuturesUsd::default(),
+                                                        sub.instrument,
+                                                        CumulativeVolumeDeltas,
+                                                    )
+                                                })
+                                                .collect(),
+                                        )
+                                        .await
+                                        .map(|stream| {
+                                            tokio::spawn(stream.forward_to(
+                                                txs.cvds.get(&exchange).unwrap().clone(),
+                                            ))
+                                        })
+                                    }
                                     (ExchangeId::Bitfinex, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
@@ -424,6 +470,69 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                         .map(|stream| {
                                             tokio::spawn(stream.forward_to(
                                                 txs.l2s.get(&exchange).unwrap().clone(),
+                                            ))
+                                        })
+                                    }
+                                    (ExchangeId::BybitPerpetualsUsd, SubKind::Liquidations) => {
+                                        init_market_stream(
+                                            STREAM_RECONNECTION_POLICY,
+                                            subs.into_iter()
+                                                .map(|sub| {
+                                                    Subscription::new(
+                                                        BybitPerpetualsUsd::default(),
+                                                        sub.instrument,
+                                                        Liquidations,
+                                                    )
+                                                })
+                                                .collect(),
+                                        )
+                                        .await
+                                        .map(|stream| {
+                                            tokio::spawn(stream.forward_to(
+                                                txs.liquidations.get(&exchange).unwrap().clone(),
+                                            ))
+                                        })
+                                    }
+                                    (ExchangeId::BybitPerpetualsUsd, SubKind::OpenInterest) => {
+                                        init_market_stream(
+                                            STREAM_RECONNECTION_POLICY,
+                                            subs.into_iter()
+                                                .map(|sub| {
+                                                    Subscription::new(
+                                                        BybitPerpetualsUsd::default(),
+                                                        sub.instrument,
+                                                        OpenInterests,
+                                                    )
+                                                })
+                                                .collect(),
+                                        )
+                                        .await
+                                        .map(|stream| {
+                                            tokio::spawn(stream.forward_to(
+                                                txs.open_interests.get(&exchange).unwrap().clone(),
+                                            ))
+                                        })
+                                    }
+                                    (
+                                        ExchangeId::BybitPerpetualsUsd,
+                                        SubKind::CumulativeVolumeDelta,
+                                    ) => {
+                                        init_market_stream(
+                                            STREAM_RECONNECTION_POLICY,
+                                            subs.into_iter()
+                                                .map(|sub| {
+                                                    Subscription::new(
+                                                        BybitPerpetualsUsd::default(),
+                                                        sub.instrument,
+                                                        CumulativeVolumeDeltas,
+                                                    )
+                                                })
+                                                .collect(),
+                                        )
+                                        .await
+                                        .map(|stream| {
+                                            tokio::spawn(stream.forward_to(
+                                                txs.cvds.get(&exchange).unwrap().clone(),
                                             ))
                                         })
                                     }
@@ -623,6 +732,58 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                             ),
                                         )
                                     }),
+                                    (ExchangeId::Okx, SubKind::Liquidations) => {
+                                        init_market_stream(
+                                            STREAM_RECONNECTION_POLICY,
+                                            subs.into_iter()
+                                                .map(|sub| {
+                                                    Subscription::new(Okx, sub.instrument, Liquidations)
+                                                })
+                                                .collect(),
+                                        )
+                                        .await
+                                        .map(|stream| {
+                                            tokio::spawn(stream.forward_to(
+                                                txs.liquidations.get(&exchange).unwrap().clone(),
+                                            ))
+                                        })
+                                    }
+                                    (ExchangeId::Okx, SubKind::OpenInterest) => {
+                                        init_market_stream(
+                                            STREAM_RECONNECTION_POLICY,
+                                            subs.into_iter()
+                                                .map(|sub| {
+                                                    Subscription::new(Okx, sub.instrument, OpenInterests)
+                                                })
+                                                .collect(),
+                                        )
+                                        .await
+                                        .map(|stream| {
+                                            tokio::spawn(stream.forward_to(
+                                                txs.open_interests.get(&exchange).unwrap().clone(),
+                                            ))
+                                        })
+                                    }
+                                    (ExchangeId::Okx, SubKind::CumulativeVolumeDelta) => {
+                                        init_market_stream(
+                                            STREAM_RECONNECTION_POLICY,
+                                            subs.into_iter()
+                                                .map(|sub| {
+                                                    Subscription::new(
+                                                        Okx,
+                                                        sub.instrument,
+                                                        CumulativeVolumeDeltas,
+                                                    )
+                                                })
+                                                .collect(),
+                                        )
+                                        .await
+                                        .map(|stream| {
+                                            tokio::spawn(stream.forward_to(
+                                                txs.cvds.get(&exchange).unwrap().clone(),
+                                            ))
+                                        })
+                                    }
                                     (exchange, sub_kind) => {
                                         Err(DataError::Unsupported { exchange, sub_kind })
                                     }
@@ -657,6 +818,18 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
             liquidations: channels
                 .rxs
                 .liquidations
+                .into_iter()
+                .map(|(exchange, rx)| (exchange, rx.into_stream()))
+                .collect(),
+            open_interests: channels
+                .rxs
+                .open_interests
+                .into_iter()
+                .map(|(exchange, rx)| (exchange, rx.into_stream()))
+                .collect(),
+            cvds: channels
+                .rxs
+                .cvds
                 .into_iter()
                 .map(|(exchange, rx)| (exchange, rx.into_stream()))
                 .collect(),
@@ -737,6 +910,46 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
         )
     }
 
+    /// Remove an exchange [`OpenInterest`] `Stream` from the [`DynamicStreams`] collection.
+    ///
+    /// Note that calling this method will permanently remove this `Stream` from [`Self`].
+    pub fn select_open_interests(
+        &mut self,
+        exchange: ExchangeId,
+    ) -> Option<UnboundedReceiverStream<MarketStreamResult<InstrumentKey, OpenInterest>>> {
+        self.open_interests.remove(&exchange)
+    }
+
+    /// Select and merge every exchange [`OpenInterest`] `Stream` using
+    /// [`SelectAll`](futures_util::stream::select_all::select_all).
+    pub fn select_all_open_interests(
+        &mut self,
+    ) -> SelectAll<UnboundedReceiverStream<MarketStreamResult<InstrumentKey, OpenInterest>>> {
+        futures_util::stream::select_all::select_all(
+            std::mem::take(&mut self.open_interests).into_values(),
+        )
+    }
+
+    /// Remove an exchange [`CumulativeVolumeDelta`] `Stream` from the [`DynamicStreams`] collection.
+    ///
+    /// Note that calling this method will permanently remove this `Stream` from [`Self`].
+    pub fn select_cvds(
+        &mut self,
+        exchange: ExchangeId,
+    ) -> Option<UnboundedReceiverStream<MarketStreamResult<InstrumentKey, CumulativeVolumeDelta>>>
+    {
+        self.cvds.remove(&exchange)
+    }
+
+    /// Select and merge every exchange [`CumulativeVolumeDelta`] `Stream` using
+    /// [`SelectAll`](futures_util::stream::select_all::select_all).
+    pub fn select_all_cvds(
+        &mut self,
+    ) -> SelectAll<UnboundedReceiverStream<MarketStreamResult<InstrumentKey, CumulativeVolumeDelta>>>
+    {
+        futures_util::stream::select_all::select_all(std::mem::take(&mut self.cvds).into_values())
+    }
+
     /// Select and merge every exchange `Stream` for every data type using [`select_all`](futures_util::stream::select_all::select_all)
     ///
     /// Note that using [`MarketStreamResult<Instrument, DataKind>`] as the `Output` is suitable for most
@@ -749,12 +962,16 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
         MarketStreamResult<InstrumentKey, OrderBookL1>: Into<Output>,
         MarketStreamResult<InstrumentKey, OrderBookEvent>: Into<Output>,
         MarketStreamResult<InstrumentKey, Liquidation>: Into<Output>,
+        MarketStreamResult<InstrumentKey, OpenInterest>: Into<Output>,
+        MarketStreamResult<InstrumentKey, CumulativeVolumeDelta>: Into<Output>,
     {
         let Self {
             trades,
             l1s,
             l2s,
             liquidations,
+            open_interests,
+            cvds,
         } = self;
 
         let trades = trades
@@ -773,7 +990,20 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
             .into_values()
             .map(|stream| stream.map(MarketStreamResult::into).boxed());
 
-        let all = trades.chain(l1s).chain(l2s).chain(liquidations);
+        let open_interests = open_interests
+            .into_values()
+            .map(|stream| stream.map(MarketStreamResult::into).boxed());
+
+        let cvds = cvds
+            .into_values()
+            .map(|stream| stream.map(MarketStreamResult::into).boxed());
+
+        let all = trades
+            .chain(l1s)
+            .chain(l2s)
+            .chain(liquidations)
+            .chain(open_interests)
+            .chain(cvds);
 
         futures_util::stream::select_all::select_all(all)
     }
@@ -869,6 +1099,24 @@ where
                         rxs.liquidations.insert(sub.exchange, rx);
                     }
                 }
+                SubKind::OpenInterest => {
+                    if let (None, None) = (
+                        txs.open_interests.get(&sub.exchange),
+                        rxs.open_interests.get(&sub.exchange),
+                    ) {
+                        let (tx, rx) = mpsc_unbounded();
+                        txs.open_interests.insert(sub.exchange, tx);
+                        rxs.open_interests.insert(sub.exchange, rx);
+                    }
+                }
+                SubKind::CumulativeVolumeDelta => {
+                    if let (None, None) = (txs.cvds.get(&sub.exchange), rxs.cvds.get(&sub.exchange))
+                    {
+                        let (tx, rx) = mpsc_unbounded();
+                        txs.cvds.insert(sub.exchange, tx);
+                        rxs.cvds.insert(sub.exchange, rx);
+                    }
+                }
                 unsupported => return Err(DataError::UnsupportedSubKind(unsupported)),
             }
         }
@@ -886,6 +1134,12 @@ struct Txs<InstrumentKey> {
     l2s: FnvHashMap<ExchangeId, UnboundedTx<MarketStreamResult<InstrumentKey, OrderBookEvent>>>,
     liquidations:
         FnvHashMap<ExchangeId, UnboundedTx<MarketStreamResult<InstrumentKey, Liquidation>>>,
+    open_interests:
+        FnvHashMap<ExchangeId, UnboundedTx<MarketStreamResult<InstrumentKey, OpenInterest>>>,
+    cvds: FnvHashMap<
+        ExchangeId,
+        UnboundedTx<MarketStreamResult<InstrumentKey, CumulativeVolumeDelta>>,
+    >,
 }
 
 impl<InstrumentKey> Default for Txs<InstrumentKey> {
@@ -895,6 +1149,8 @@ impl<InstrumentKey> Default for Txs<InstrumentKey> {
             l1s: Default::default(),
             l2s: Default::default(),
             liquidations: Default::default(),
+            open_interests: Default::default(),
+            cvds: Default::default(),
         }
     }
 }
@@ -905,6 +1161,12 @@ struct Rxs<InstrumentKey> {
     l2s: FnvHashMap<ExchangeId, UnboundedRx<MarketStreamResult<InstrumentKey, OrderBookEvent>>>,
     liquidations:
         FnvHashMap<ExchangeId, UnboundedRx<MarketStreamResult<InstrumentKey, Liquidation>>>,
+    open_interests:
+        FnvHashMap<ExchangeId, UnboundedRx<MarketStreamResult<InstrumentKey, OpenInterest>>>,
+    cvds: FnvHashMap<
+        ExchangeId,
+        UnboundedRx<MarketStreamResult<InstrumentKey, CumulativeVolumeDelta>>,
+    >,
 }
 
 impl<InstrumentKey> Default for Rxs<InstrumentKey> {
@@ -914,6 +1176,8 @@ impl<InstrumentKey> Default for Rxs<InstrumentKey> {
             l1s: Default::default(),
             l2s: Default::default(),
             liquidations: Default::default(),
+            open_interests: Default::default(),
+            cvds: Default::default(),
         }
     }
 }
