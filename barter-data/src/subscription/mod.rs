@@ -292,8 +292,9 @@ pub fn exchange_supports_instrument_kind_sub_kind(
         (
             Okx,
             Spot | Future { .. } | Perpetual | Option { .. },
-            PublicTrades | Liquidations | OpenInterest | CumulativeVolumeDelta,
+            PublicTrades | OpenInterest | CumulativeVolumeDelta,
         ) => true,
+        (Okx, Perpetual, Liquidations) => true,
 
         (_, _, _) => false,
     }

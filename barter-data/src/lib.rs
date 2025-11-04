@@ -91,6 +91,10 @@
 //!     }
 //! }
 //! ```
+
+// Suppress unused dependency warning - prost is used transitively via barter-integration
+use prost as _;
+
 use crate::{
     error::DataError,
     event::MarketEvent,

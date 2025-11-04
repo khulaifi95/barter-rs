@@ -29,6 +29,13 @@ use tracing::warn;
 ///    [`select_all`](futures_util::stream::select_all::select_all)
 /// 4. Handles recoverable errors by logging them at `warn` level.
 ///
+/// ## Important Limitation
+/// This function uses `InstrumentIndex` as the instrument key, which does **not** support
+/// OKX liquidations. OKX liquidations require `InstrumentKey: From<MarketDataInstrument>`,
+/// which `InstrumentIndex` does not implement. If you include `SubKind::Liquidations` for
+/// OKX exchanges, compilation will fail. For indexed OKX liquidations, use
+/// `Keyed<InstrumentIndex, MarketDataInstrument>` instead.
+///
 /// See [`generate_indexed_market_data_subscription_batches`] for how indexed `Subscriptions` can
 /// be conveniently generated from an [`IndexedInstruments`] collection.
 ///
