@@ -1,7 +1,9 @@
 use barter_data::{
+    error::DataError,
     event::{DataKind, MarketEvent},
     streams::{
-        builder::dynamic::DynamicStreams, consumer::MarketStreamResult,
+        builder::dynamic::DynamicStreams,
+        consumer::MarketStreamResult,
         reconnect::{Event, stream::ReconnectingStream},
     },
     subscription::{SubKind, open_interest::OpenInterest},
@@ -14,9 +16,12 @@ use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream};
 use reqwest::Client;
 use serde::Deserialize;
-use std::{collections::HashMap, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 use tokio::time::interval;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 #[rustfmt::skip]
 #[tokio::main]
@@ -157,9 +162,17 @@ async fn main() {
     }
 
     // Select all WebSocket streams with an enhanced error handler that includes context
-    let ws_stream = streams
-        .select_all::<MarketStreamResult<MarketDataInstrument, DataKind>>()
-        .with_error_handler(move |error| {
+    exchange_subscriptions
+        .entry(ExchangeId::BinanceFuturesUsd)
+        .or_default()
+        .push("open_interest_polling");
+
+    let combined_results = stream::select(
+        streams.select_all::<MarketStreamResult<MarketDataInstrument, DataKind>>(),
+        binance_open_interest_stream(),
+    );
+
+    let market_stream = combined_results.with_error_handler(move |error| {
             // Try to extract exchange context from the error message if possible
             let error_str = format!("{:?}", error);
 
@@ -196,26 +209,13 @@ async fn main() {
             );
         });
 
-    // Create Binance open interest polling streams (REST API - polls every 10 seconds)
-    // Note: Binance doesn't provide open interest via WebSocket, only REST API
-    let binance_oi_streams = vec![
-        binance_open_interest_poller("BTCUSDT").await.boxed(),
-        binance_open_interest_poller("ETHUSDT").await.boxed(),
-        binance_open_interest_poller("SOLUSDT").await.boxed(),
-        binance_open_interest_poller("XRPUSDT").await.boxed(),
-    ];
-
-    let binance_oi_stream = futures::stream::select_all(binance_oi_streams);
-
-    // Merge WebSocket and REST API polling streams
-    let merged = stream::select(ws_stream, binance_oi_stream);
-    futures::pin_mut!(merged);
+    futures::pin_mut!(market_stream);
 
     // Track last emission time for CVD events per (exchange, instrument) pair (for throttling)
     let mut last_cvd_emission: HashMap<(ExchangeId, MarketDataInstrument), Instant> = HashMap::new();
     let cvd_throttle_duration = Duration::from_secs(5);
 
-    while let Some(event) = merged.next().await {
+    while let Some(event) = market_stream.next().await {
         match event {
             Event::Reconnecting(exchange) => {
                 warn!("Reconnecting to {exchange:?}");
@@ -259,15 +259,49 @@ async fn main() {
 // Binance REST API response for open interest
 #[derive(Debug, Deserialize)]
 struct BinanceOpenInterestResponse {
-    #[serde(rename = "openInterest", deserialize_with = "barter_integration::de::de_str")]
+    #[serde(
+        rename = "openInterest",
+        deserialize_with = "barter_integration::de::de_str"
+    )]
     open_interest: f64,
     time: i64,
 }
 
-/// Poll Binance REST API for open interest every 10 seconds
-async fn binance_open_interest_poller(
+/// Build a combined Stream of Binance open-interest polling events (REST fallback).
+fn binance_open_interest_stream()
+-> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> {
+    let specs = vec![
+        (
+            "BTCUSDT",
+            MarketDataInstrument::from(("btc", "usdt", MarketDataInstrumentKind::Perpetual)),
+        ),
+        (
+            "ETHUSDT",
+            MarketDataInstrument::from(("eth", "usdt", MarketDataInstrumentKind::Perpetual)),
+        ),
+        (
+            "SOLUSDT",
+            MarketDataInstrument::from(("sol", "usdt", MarketDataInstrumentKind::Perpetual)),
+        ),
+        (
+            "XRPUSDT",
+            MarketDataInstrument::from(("xrp", "usdt", MarketDataInstrumentKind::Perpetual)),
+        ),
+    ];
+
+    stream::select_all(
+        specs
+            .into_iter()
+            .map(|(symbol, instrument)| binance_open_interest_poller(symbol, instrument).boxed())
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Poll Binance REST API for open interest every 10 seconds.
+fn binance_open_interest_poller(
     symbol: &'static str,
-) -> impl futures::Stream<Item = Event<ExchangeId, MarketEvent<MarketDataInstrument, DataKind>>> {
+    instrument: MarketDataInstrument,
+) -> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> + Send {
     let client = Client::new();
     let url = format!(
         "https://fapi.binance.com/fapi/v1/openInterest?symbol={}",
@@ -275,78 +309,52 @@ async fn binance_open_interest_poller(
     );
 
     stream::unfold(
-        (client, url, interval(Duration::from_secs(10))),
-        move |(client, url, mut timer)| async move {
+        (client, url, interval(Duration::from_secs(10)), instrument),
+        move |(client, url, mut timer, instrument)| async move {
             // Wait for next tick (first one completes immediately)
             timer.tick().await;
 
-            match client.get(&url).send().await {
-                Ok(response) => match response.json::<BinanceOpenInterestResponse>().await {
-                    Ok(data) => {
-                        debug!("Polled Binance open interest: {:?}", data);
+            let instrument_clone = instrument.clone();
 
-                        let event = MarketEvent {
-                            time_exchange: DateTime::from_timestamp_millis(data.time)
-                                .unwrap_or_else(Utc::now),
-                            time_received: Utc::now(),
-                            exchange: ExchangeId::BinanceFuturesUsd,
-                            instrument: MarketDataInstrument {
-                                base: symbol[..symbol.len() - 4].to_lowercase().into(),
-                                quote: symbol[symbol.len() - 4..].to_lowercase().into(),
-                                kind: MarketDataInstrumentKind::Perpetual,
-                            },
-                            kind: DataKind::OpenInterest(OpenInterest {
-                                contracts: data.open_interest,
-                                notional: None,
-                                time: Some(
-                                    DateTime::from_timestamp_millis(data.time)
-                                        .unwrap_or_else(Utc::now),
-                                ),
-                            }),
-                        };
+            let result: Result<MarketEvent<MarketDataInstrument, DataKind>, DataError> =
+                match client.get(&url).send().await {
+                    Ok(response) => {
+                        if let Err(status_err) = response.error_for_status_ref() {
+                            Err(DataError::Socket(format!(
+                                "Binance open interest poll failed ({symbol}): {status_err}"
+                            )))
+                        } else {
+                            match response.json::<BinanceOpenInterestResponse>().await {
+                                Ok(data) => {
+                                    debug!("Polled Binance open interest: {:?}", data);
 
-                        Some((Event::Item(event), (client, url, timer)))
+                                    let time_exchange = DateTime::from_timestamp_millis(data.time)
+                                        .unwrap_or_else(Utc::now);
+
+                                    Ok(MarketEvent {
+                                        time_exchange,
+                                        time_received: Utc::now(),
+                                        exchange: ExchangeId::BinanceFuturesUsd,
+                                        instrument: instrument_clone,
+                                        kind: DataKind::OpenInterest(OpenInterest {
+                                            contracts: data.open_interest,
+                                            notional: None,
+                                            time: Some(time_exchange),
+                                        }),
+                                    })
+                                }
+                                Err(parse_err) => Err(DataError::Socket(format!(
+                                    "Binance open interest parse failed ({symbol}): {parse_err}"
+                                ))),
+                            }
+                        }
                     }
-                    Err(e) => {
-                        warn!("Failed to parse Binance open interest response: {}", e);
-                        // Keep trying on next tick
-                        Some((Event::Item(MarketEvent {
-                            time_exchange: Utc::now(),
-                            time_received: Utc::now(),
-                            exchange: ExchangeId::BinanceFuturesUsd,
-                            instrument: MarketDataInstrument {
-                                base: "btc".into(),
-                                quote: "usdt".into(),
-                                kind: MarketDataInstrumentKind::Perpetual,
-                            },
-                            kind: DataKind::OpenInterest(OpenInterest {
-                                contracts: 0.0,
-                                notional: None,
-                                time: None,
-                            }),
-                        }), (client, url, timer)))
-                    }
-                },
-                Err(e) => {
-                    warn!("Failed to fetch Binance open interest: {}", e);
-                    // Keep trying on next tick - return dummy event to continue stream
-                    Some((Event::Item(MarketEvent {
-                        time_exchange: Utc::now(),
-                        time_received: Utc::now(),
-                        exchange: ExchangeId::BinanceFuturesUsd,
-                        instrument: MarketDataInstrument {
-                            base: "btc".into(),
-                            quote: "usdt".into(),
-                            kind: MarketDataInstrumentKind::Perpetual,
-                        },
-                        kind: DataKind::OpenInterest(OpenInterest {
-                            contracts: 0.0,
-                            notional: None,
-                            time: None,
-                        }),
-                    }), (client, url, timer)))
-                }
-            }
+                    Err(request_err) => Err(DataError::Socket(format!(
+                        "Binance open interest request failed ({symbol}): {request_err}"
+                    ))),
+                };
+
+            Some((Event::Item(result), (client, url, timer, instrument)))
         },
     )
 }

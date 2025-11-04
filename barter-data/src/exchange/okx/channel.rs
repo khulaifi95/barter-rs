@@ -2,11 +2,8 @@ use super::Okx;
 use crate::{
     Identifier,
     subscription::{
-        Subscription,
-        liquidation::Liquidations,
-        open_interest::OpenInterests,
-        trade::PublicTrades,
-        cvd::CumulativeVolumeDeltas,
+        Subscription, cvd::CumulativeVolumeDeltas, liquidation::Liquidations,
+        open_interest::OpenInterests, trade::PublicTrades,
     },
 };
 use serde::Serialize;

@@ -42,17 +42,9 @@ pub struct OkxOpenInterest {
     pub inst_id: String,
     #[serde(rename = "oi", deserialize_with = "barter_integration::de::de_str")]
     pub contracts: f64,
-    #[serde(
-        rename = "oiCcy",
-        deserialize_with = "de_opt_str_f64",
-        default
-    )]
+    #[serde(rename = "oiCcy", deserialize_with = "de_opt_str_f64", default)]
     pub notional_ccy: Option<f64>,
-    #[serde(
-        rename = "oiUsd",
-        deserialize_with = "de_opt_str_f64",
-        default
-    )]
+    #[serde(rename = "oiUsd", deserialize_with = "de_opt_str_f64", default)]
     pub notional_usd: Option<f64>,
     #[serde(
         rename = "ts",

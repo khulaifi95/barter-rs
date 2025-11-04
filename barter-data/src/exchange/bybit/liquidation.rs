@@ -69,28 +69,26 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, BybitLiquidationMess
     ) -> Self {
         match message {
             BybitLiquidationMessage::Ignore => Self(vec![]),
-            BybitLiquidationMessage::Payload(payload) => {
-                Self(
-                    payload
-                        .data
-                        .into_iter()
-                        .map(|entry| {
-                            Ok(MarketEvent {
-                                time_exchange: entry.time,
-                                time_received: Utc::now(),
-                                exchange,
-                                instrument: instrument.clone(),
-                                kind: Liquidation {
-                                    side: entry.side,
-                                    price: entry.price,
-                                    quantity: entry.quantity,
-                                    time: entry.time,
-                                },
-                            })
+            BybitLiquidationMessage::Payload(payload) => Self(
+                payload
+                    .data
+                    .into_iter()
+                    .map(|entry| {
+                        Ok(MarketEvent {
+                            time_exchange: entry.time,
+                            time_received: Utc::now(),
+                            exchange,
+                            instrument: instrument.clone(),
+                            kind: Liquidation {
+                                side: entry.side,
+                                price: entry.price,
+                                quantity: entry.quantity,
+                                time: entry.time,
+                            },
                         })
-                        .collect(),
-                )
-            }
+                    })
+                    .collect(),
+            ),
         }
     }
 }

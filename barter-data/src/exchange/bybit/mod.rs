@@ -25,10 +25,10 @@ use barter_integration::{
 use book::{BybitOrderBookMessage, l2::BybitOrderBooksL2Transformer};
 use liquidation::BybitLiquidationMessage;
 use open_interest::BybitOpenInterestMessage;
-use trade::BybitTradeMessage;
 use serde::de::{Error, Unexpected};
 use std::{fmt::Debug, hash::Hash, marker::PhantomData, time::Duration};
 use tokio::time;
+use trade::BybitTradeMessage;
 use url::Url;
 
 /// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)

@@ -1,10 +1,6 @@
 use self::{
-    channel::OkxChannel,
-    liquidation::OkxLiquidations,
-    market::OkxMarket,
-    open_interest::OkxOpenInterests,
-    subscription::OkxSubResponse,
-    trade::OkxTrades,
+    channel::OkxChannel, liquidation::OkxLiquidations, market::OkxMarket,
+    open_interest::OkxOpenInterests, subscription::OkxSubResponse, trade::OkxTrades,
 };
 use crate::{
     ExchangeWsStream, NoInitialSnapshots,
@@ -12,15 +8,10 @@ use crate::{
     instrument::InstrumentData,
     subscriber::{WebSocketSubscriber, validator::WebSocketSubValidator},
     subscription::{
-        cvd::CumulativeVolumeDeltas,
-        liquidation::Liquidations,
-        open_interest::OpenInterests,
+        cvd::CumulativeVolumeDeltas, liquidation::Liquidations, open_interest::OpenInterests,
         trade::PublicTrades,
     },
-    transformer::{
-        cvd::CumulativeVolumeDeltaTransformer,
-        stateless::StatelessTransformer,
-    },
+    transformer::{cvd::CumulativeVolumeDeltaTransformer, stateless::StatelessTransformer},
 };
 use barter_instrument::exchange::ExchangeId;
 use barter_integration::{
@@ -159,8 +150,7 @@ where
     Instrument::Key: Eq + Hash,
 {
     type SnapFetcher = NoInitialSnapshots;
-    type Stream =
-        OkxWsStream<CumulativeVolumeDeltaTransformer<Self, Instrument::Key, OkxTrades>>;
+    type Stream = OkxWsStream<CumulativeVolumeDeltaTransformer<Self, Instrument::Key, OkxTrades>>;
 }
 
 impl<Instrument> StreamSelector<Instrument, OpenInterests> for Okx

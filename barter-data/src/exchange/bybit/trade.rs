@@ -81,31 +81,31 @@ pub struct BybitTradeInner {
 impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, BybitTradeMessage)>
     for MarketIter<InstrumentKey, PublicTrade>
 {
-    fn from((exchange, instrument, message): (ExchangeId, InstrumentKey, BybitTradeMessage)) -> Self {
+    fn from(
+        (exchange, instrument, message): (ExchangeId, InstrumentKey, BybitTradeMessage),
+    ) -> Self {
         match message {
             BybitTradeMessage::Ignore => Self(vec![]),
-            BybitTradeMessage::Payload(trades) => {
-                Self(
-                    trades
-                        .data
-                        .into_iter()
-                        .map(|trade| {
-                            Ok(MarketEvent {
-                                time_exchange: trade.time,
-                                time_received: Utc::now(),
-                                exchange,
-                                instrument: instrument.clone(),
-                                kind: PublicTrade {
-                                    id: trade.id,
-                                    price: trade.price,
-                                    amount: trade.amount,
-                                    side: trade.side,
-                                },
-                            })
+            BybitTradeMessage::Payload(trades) => Self(
+                trades
+                    .data
+                    .into_iter()
+                    .map(|trade| {
+                        Ok(MarketEvent {
+                            time_exchange: trade.time,
+                            time_received: Utc::now(),
+                            exchange,
+                            instrument: instrument.clone(),
+                            kind: PublicTrade {
+                                id: trade.id,
+                                price: trade.price,
+                                amount: trade.amount,
+                                side: trade.side,
+                            },
                         })
-                        .collect(),
-                )
-            }
+                    })
+                    .collect(),
+            ),
         }
     }
 }

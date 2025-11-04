@@ -13,15 +13,14 @@ use crate::{
         },
     },
     instrument::InstrumentData,
-    subscription::{
-        book::OrderBooksL2,
-        cvd::CumulativeVolumeDeltas,
-        liquidation::Liquidations,
-    },
+    subscription::{book::OrderBooksL2, cvd::CumulativeVolumeDeltas, liquidation::Liquidations},
     transformer::{cvd::CumulativeVolumeDeltaTransformer, stateless::StatelessTransformer},
 };
 use barter_instrument::exchange::ExchangeId;
-use std::{fmt::{Display, Formatter}, hash::Hash};
+use std::{
+    fmt::{Display, Formatter},
+    hash::Hash,
+};
 
 /// Level 2 OrderBook types.
 pub mod l2;

@@ -732,38 +732,38 @@ where
                                             ),
                                         )
                                     }),
-                                    (ExchangeId::Okx, SubKind::Liquidations) => {
-                                        init_market_stream(
-                                            STREAM_RECONNECTION_POLICY,
-                                            subs.into_iter()
-                                                .map(|sub| {
-                                                    Subscription::new(Okx, sub.instrument, Liquidations)
-                                                })
-                                                .collect(),
-                                        )
-                                        .await
-                                        .map(|stream| {
-                                            tokio::spawn(stream.forward_to(
-                                                txs.liquidations.get(&exchange).unwrap().clone(),
-                                            ))
-                                        })
-                                    }
-                                    (ExchangeId::Okx, SubKind::OpenInterest) => {
-                                        init_market_stream(
-                                            STREAM_RECONNECTION_POLICY,
-                                            subs.into_iter()
-                                                .map(|sub| {
-                                                    Subscription::new(Okx, sub.instrument, OpenInterests)
-                                                })
-                                                .collect(),
-                                        )
-                                        .await
-                                        .map(|stream| {
-                                            tokio::spawn(stream.forward_to(
-                                                txs.open_interests.get(&exchange).unwrap().clone(),
-                                            ))
-                                        })
-                                    }
+                                    (ExchangeId::Okx, SubKind::Liquidations) => init_market_stream(
+                                        STREAM_RECONNECTION_POLICY,
+                                        subs.into_iter()
+                                            .map(|sub| {
+                                                Subscription::new(Okx, sub.instrument, Liquidations)
+                                            })
+                                            .collect(),
+                                    )
+                                    .await
+                                    .map(|stream| {
+                                        tokio::spawn(stream.forward_to(
+                                            txs.liquidations.get(&exchange).unwrap().clone(),
+                                        ))
+                                    }),
+                                    (ExchangeId::Okx, SubKind::OpenInterest) => init_market_stream(
+                                        STREAM_RECONNECTION_POLICY,
+                                        subs.into_iter()
+                                            .map(|sub| {
+                                                Subscription::new(
+                                                    Okx,
+                                                    sub.instrument,
+                                                    OpenInterests,
+                                                )
+                                            })
+                                            .collect(),
+                                    )
+                                    .await
+                                    .map(|stream| {
+                                        tokio::spawn(stream.forward_to(
+                                            txs.open_interests.get(&exchange).unwrap().clone(),
+                                        ))
+                                    }),
                                     (ExchangeId::Okx, SubKind::CumulativeVolumeDelta) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
