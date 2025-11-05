@@ -100,18 +100,44 @@ impl Connector for Okx {
         let args: Vec<serde_json::Value> = exchange_subs
             .into_iter()
             .map(|sub| {
-                // Liquidation orders use a different subscription format
-                if sub.channel.as_ref() == "liquidation-orders" {
-                    // For liquidations, use instType instead of instId
-                    json!({
-                        "channel": sub.channel.as_ref(),
-                        "instType": "SWAP"
-                    })
+                let channel = sub.channel.as_ref();
+                let market = sub.market.as_ref();
+
+                if channel == "liquidation-orders" {
+                    // Liquidation channel expects derivatives metadata rather than plain instId
+                    let parts: Vec<&str> = market.split('-').collect();
+
+                    let inst_type = match parts.last().copied().unwrap_or_default() {
+                        last if last.eq_ignore_ascii_case("swap") => "SWAP",
+                        last if last.eq_ignore_ascii_case("c") || last.eq_ignore_ascii_case("p") =>
+                            "OPTION",
+                        _ => "FUTURES",
+                    };
+
+                    let uly = if parts.len() >= 2 {
+                        Some(format!("{}-{}", parts[0], parts[1]))
+                    } else {
+                        None
+                    };
+
+                    let mut arg = json!({
+                        "channel": channel,
+                        "instType": inst_type,
+                        "instId": market,
+                    });
+
+                    if let Some(uly) = uly {
+                        if let serde_json::Value::Object(ref mut map) = arg {
+                            map.insert("uly".into(), serde_json::Value::String(uly));
+                        }
+                    }
+
+                    arg
                 } else {
                     // For other channels, use normal instId format
                     json!({
-                        "channel": sub.channel.as_ref(),
-                        "instId": sub.market.as_ref()
+                        "channel": channel,
+                        "instId": market
                     })
                 }
             })

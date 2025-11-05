@@ -104,14 +104,17 @@ where
         channel: &'a str,
         inst_type: &'a str,
         #[serde(default)]
+        inst_id: Option<&'a str>,
+        #[serde(default)]
         uly: Option<&'a str>,
     }
 
     Deserialize::deserialize(deserializer).map(|arg: Arg<'_>| {
-        // For liquidation-orders, the subscription ID format is different
-        // It uses inst_type (e.g., "SWAP") instead of specific instId
-        if let Some(uly) = arg.uly {
-            ExchangeSub::from((arg.channel, &format!("{}-{}", arg.inst_type, uly))).id()
+        if let Some(inst_id) = arg.inst_id {
+            ExchangeSub::from((arg.channel, inst_id)).id()
+        } else if let Some(uly) = arg.uly {
+            let market = format!("{}-{}", uly, arg.inst_type);
+            ExchangeSub::from((arg.channel, market)).id()
         } else {
             ExchangeSub::from((arg.channel, arg.inst_type)).id()
         }
