@@ -1,0 +1,34 @@
+[package]
+name = "barter-data-server"
+version = "0.1.0"
+edition = "2024"
+authors = ["JustAStream <justastream.code@gmail.com>"]
+license = "MIT"
+description = "WebSocket server for broadcasting real-time market data from barter-data"
+
+[dependencies]
+# Barter Ecosystem
+barter-data = { workspace = true }
+barter-instrument = { workspace = true }
+barter-integration = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+
+# Async
+tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread", "net"] }
+futures = { workspace = true }
+
+# WebSocket
+tokio-tungstenite = { workspace = true }
+
+# SerDe
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# HTTP for REST polling
+reqwest = { workspace = true }
+
+# Misc
+chrono = { workspace = true }
