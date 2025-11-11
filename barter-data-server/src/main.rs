@@ -82,7 +82,7 @@ async fn main() {
     let tx = Arc::new(tx);
 
     // Start WebSocket server
-    let server_addr = "127.0.0.1:9001".parse::<SocketAddr>().unwrap();
+    let server_addr = "0.0.0.0:9001".parse::<SocketAddr>().unwrap();
     let tx_clone = tx.clone();
     tokio::spawn(async move {
         start_websocket_server(server_addr, tx_clone).await;
