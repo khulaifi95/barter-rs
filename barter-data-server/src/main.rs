@@ -46,13 +46,13 @@ struct InstrumentInfo {
 
 impl From<MarketEvent<MarketDataInstrument, DataKind>> for MarketEventMessage {
     fn from(event: MarketEvent<MarketDataInstrument, DataKind>) -> Self {
-        let kind_name = match &event.kind {
-            DataKind::Trade(_) => "trade",
-            DataKind::Liquidation(_) => "liquidation",
-            DataKind::OpenInterest(_) => "open_interest",
-            DataKind::CumulativeVolumeDelta(_) => "cumulative_volume_delta",
-            DataKind::OrderBookL1(_) => "order_book_l1",
-            _ => "other",
+        let (kind_name, data) = match &event.kind {
+            DataKind::Trade(trade) => ("trade", serde_json::to_value(trade).unwrap_or_default()),
+            DataKind::Liquidation(liq) => ("liquidation", serde_json::to_value(liq).unwrap_or_default()),
+            DataKind::OpenInterest(oi) => ("open_interest", serde_json::to_value(oi).unwrap_or_default()),
+            DataKind::CumulativeVolumeDelta(cvd) => ("cumulative_volume_delta", serde_json::to_value(cvd).unwrap_or_default()),
+            DataKind::OrderBookL1(ob) => ("order_book_l1", serde_json::to_value(ob).unwrap_or_default()),
+            _ => ("other", serde_json::Value::Null),
         };
 
         Self {
@@ -65,7 +65,7 @@ impl From<MarketEvent<MarketDataInstrument, DataKind>> for MarketEventMessage {
                 kind: format!("{:?}", event.instrument.kind),
             },
             kind: kind_name.to_string(),
-            data: serde_json::to_value(&event.kind).unwrap_or_default(),
+            data,
         }
     }
 }
