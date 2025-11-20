@@ -28,7 +28,8 @@ use std::{
     io,
     time::Duration,
 };
-use tracing::{info, warn};
+// Logging disabled for TUI - tracing output interferes with terminal rendering
+// use tracing::{info, warn};
 
 /// Main application state
 struct App {
@@ -1128,12 +1129,12 @@ fn render_correlation_matrix(f: &mut Frame, app: &App, area: Rect) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    // Logging disabled for TUI - tracing output interferes with terminal rendering
+    // tracing_subscriber::fmt()
+    //     .with_max_level(tracing::Level::INFO)
+    //     .init();
 
-    info!("Starting Risk & Arbitrage Scanner TUI");
+    // info!("Starting Risk & Arbitrage Scanner TUI");
 
     // Setup terminal
     enable_raw_mode()?;
@@ -1155,13 +1156,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         while let Some(status) = status_rx.recv().await {
             match status {
                 barter_trading_tuis::shared::websocket::ConnectionStatus::Connected => {
-                    info!("WebSocket connected");
+                    // info!("WebSocket connected");
                 }
                 barter_trading_tuis::shared::websocket::ConnectionStatus::Disconnected => {
-                    warn!("WebSocket disconnected");
+                    // warn!("WebSocket disconnected");
                 }
                 barter_trading_tuis::shared::websocket::ConnectionStatus::Reconnecting => {
-                    info!("WebSocket reconnecting...");
+                    // info!("WebSocket reconnecting...");
                 }
             }
         }
@@ -1212,7 +1213,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?;
     terminal.show_cursor()?;
 
-    info!("Risk & Arbitrage Scanner TUI shutdown complete");
+    // info!("Risk & Arbitrage Scanner TUI shutdown complete");
 
     Ok(())
 }

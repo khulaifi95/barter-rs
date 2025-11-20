@@ -478,11 +478,14 @@ impl App {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(std::io::stderr)
-        .init();
+    // Logging disabled to avoid interfering with TUI rendering.
+    // TUI applications should not output logs to stdout/stderr as it corrupts the terminal display.
+    // If debugging is needed, consider using a file-based logger or a separate terminal.
+    //
+    // tracing_subscriber::fmt()
+    //     .with_max_level(tracing::Level::INFO)
+    //     .with_writer(std::io::stderr)
+    //     .init();
 
     // Setup terminal
     enable_raw_mode()?;

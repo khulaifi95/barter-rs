@@ -37,7 +37,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
-use tracing::info;
 
 /// Supported trading pairs
 const TICKERS: [&str; 3] = ["btc", "eth", "sol"];
@@ -62,15 +61,9 @@ const MAX_LIQ_CLUSTERS: usize = 5;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(false)
-        .with_thread_ids(false)
-        .with_file(false)
-        .init();
-
-    info!("Starting Market Microstructure Dashboard");
+    // Disable logging in TUI mode (logs interfere with terminal display)
+    // To enable logs, set env var: RUST_LOG=info and redirect to file:
+    // RUST_LOG=info cargo run --bin market-microstructure 2> tui.log
 
     // Setup terminal
     enable_raw_mode()?;
@@ -106,10 +99,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Spawn connection status monitor
+    // Spawn connection status monitor (silently track status)
     tokio::spawn(async move {
-        while let Some(status) = status_rx.recv().await {
-            info!("Connection status: {:?}", status);
+        while let Some(_status) = status_rx.recv().await {
+            // Status changes tracked but not logged (would interfere with TUI)
         }
     });
 
