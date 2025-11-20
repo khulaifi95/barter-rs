@@ -4,7 +4,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -389,9 +389,27 @@ async fn websocket_client(state: Arc<Mutex<AppState>>) -> Result<(), Box<dyn std
                     s.connected = true;
                 }
 
-                let (mut _write, mut read) = ws_stream.split();
+                let (mut write, mut read) = ws_stream.split();
 
-                while let Some(msg) = read.next().await {
+                // Spawn ping task to keep connection alive (prevents timeouts)
+                let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel::<()>(1);
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(30));
+                    loop {
+                        interval.tick().await;
+                        if write.send(Message::Ping(vec![].into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = ping_tx.send(()).await; // Notify main loop if ping fails
+                });
+
+                loop {
+                    tokio::select! {
+                        msg = read.next() => {
+                            let Some(msg) = msg else {
+                                break;
+                            };
                     match msg {
                         Ok(Message::Text(text)) => {
                             // First check if it's a welcome message
@@ -415,12 +433,25 @@ async fn websocket_client(state: Arc<Mutex<AppState>>) -> Result<(), Box<dyn std
                             }
                         }
                         Ok(Message::Close(_)) => {
+                            eprintln!("Server closed connection");
                             break;
                         }
-                        Err(_) => {
+                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+                            // Heartbeat messages - ignore (tungstenite handles automatically)
+                        }
+                        Err(e) => {
+                            // Log error but don't disconnect - let auto-reconnect handle it
+                            eprintln!("WebSocket error (will reconnect): {}", e);
                             break;
                         }
                         _ => {}
+                    }
+                        }
+                        _ = ping_rx.recv() => {
+                            // Ping task died, connection likely dead
+                            eprintln!("Ping task died, reconnecting...");
+                            break;
+                        }
                     }
                 }
 

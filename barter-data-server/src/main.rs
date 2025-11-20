@@ -78,7 +78,14 @@ async fn main() {
     info!("Starting barter-data WebSocket server");
 
     // Create broadcast channel for market events
-    let (tx, _rx) = broadcast::channel::<MarketEventMessage>(1000);
+    // Configurable buffer size via WS_BUFFER_SIZE env var (default: 10,000)
+    let buffer_size = std::env::var("WS_BUFFER_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    info!("WebSocket broadcast buffer size: {}", buffer_size);
+    let (tx, _rx) = broadcast::channel::<MarketEventMessage>(buffer_size);
     let tx = Arc::new(tx);
 
     // Start WebSocket server
@@ -173,9 +180,24 @@ async fn handle_client(
 
     // Spawn task to send market events to this client
     let mut send_task = tokio::spawn(async move {
-        while let Ok(event) = rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&event) {
-                if ws_sender.send(Message::Text(json.into())).await.is_err() {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if let Ok(json) = serde_json::to_string(&event) {
+                        if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Client fell behind - this is NORMAL under high load
+                    // Just log and continue, don't disconnect
+                    warn!("Client {} lagged, skipped {} messages", peer_addr, skipped);
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    // Channel closed, exit gracefully
+                    info!("Broadcast channel closed for {}", peer_addr);
                     break;
                 }
             }
