@@ -76,9 +76,12 @@ pub struct TickerSnapshot {
     pub spot_mid: Option<f64>,
     pub perp_mid: Option<f64>,
     pub basis: Option<BasisStats>,
+    // Multi-timeframe orderflow (P0: added 30s for scalper)
+    pub orderflow_30s: OrderflowStats,
     pub orderflow_1m: OrderflowStats,
     pub orderflow_5m: OrderflowStats,
     pub exchange_dominance: HashMap<String, f64>,
+    pub vwap_30s: Option<f64>,
     pub vwap_1m: Option<f64>,
     pub vwap_5m: Option<f64>,
     pub best_bid: Option<(f64, f64)>, // (price, size)
@@ -92,17 +95,27 @@ pub struct TickerSnapshot {
     pub next_cascade_level: Option<CascadeLevel>,
     pub protection_level: Option<CascadeLevel>,
     pub cvd: CvdSummary,
+    // Multi-timeframe CVD (P0: added 30s for scalper)
+    pub cvd_30s: f64,
     pub cvd_1m_total: f64,
     pub cvd_per_exchange_5m: HashMap<String, f64>,
     pub trades_5m: usize,
     pub vol_5m: f64,
     pub avg_trade_usd_5m: f64,
+    // OI with velocity (P1)
     pub oi_total: f64,
+    pub oi_delta_5m: f64,
+    pub oi_velocity: f64,
     pub tick_direction: TickDirection,
     pub tick_direction_5m: TickDirection,
+    pub tick_direction_30s: TickDirection,
     pub trade_speed: f64,
     pub avg_trade_usd: f64,
     pub cvd_divergence: DivergenceSignal,
+    // P1: Flow signal detection
+    pub flow_signal: FlowSignal,
+    // P1: Basis momentum
+    pub basis_momentum: Option<BasisMomentum>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -180,6 +193,50 @@ pub enum DivergenceSignal {
 impl Default for DivergenceSignal {
     fn default() -> Self {
         DivergenceSignal::Unknown
+    }
+}
+
+/// P1: Flow signal for CVD momentum panel
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum FlowSignal {
+    /// Price flat, CVD rising - accumulation
+    Accumulation,
+    /// Price up, CVD falling - distribution (smart money selling into strength)
+    Distribution,
+    /// Price moving but CVD flat - exhaustion (momentum fading)
+    Exhaustion,
+    /// Price and CVD aligned - confirmation (trend supported by flow)
+    Confirmation,
+    /// No clear signal
+    Neutral,
+}
+
+impl Default for FlowSignal {
+    fn default() -> Self {
+        FlowSignal::Neutral
+    }
+}
+
+/// P1: Basis momentum for tracking basis velocity
+#[derive(Clone, Debug, Default)]
+pub struct BasisMomentum {
+    pub delta_1m: f64,
+    pub delta_5m: f64,
+    pub trend: BasisTrend,
+    pub signal: Option<String>,
+}
+
+/// P1: Basis trend direction
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum BasisTrend {
+    Widening,
+    Narrowing,
+    Stable,
+}
+
+impl Default for BasisTrend {
+    fn default() -> Self {
+        BasisTrend::Stable
     }
 }
 
@@ -399,6 +456,24 @@ struct CvdRecord {
     total_quote: f64,
 }
 
+/// OI retention for velocity calculation (10 minutes)
+const OI_RETENTION_SECS: i64 = 10 * 60;
+/// Basis retention for momentum tracking (10 minutes)
+const BASIS_RETENTION_SECS: i64 = 10 * 60;
+
+#[derive(Clone, Debug)]
+struct OiRecord {
+    time: DateTime<Utc>,
+    total: f64,
+}
+
+#[derive(Clone, Debug)]
+struct BasisRecord {
+    time: DateTime<Utc>,
+    basis_usd: f64,
+    basis_pct: f64,
+}
+
 #[derive(Clone, Debug)]
 struct TickerState {
     ticker: String,
@@ -409,7 +484,11 @@ struct TickerState {
     // Rolling CVD deltas per exchange (time, delta_quote)
     cvd_deltas_by_exchange: HashMap<String, VecDeque<(DateTime<Utc>, f64)>>,
     cvd_history: VecDeque<CvdRecord>, // snapshots of total CVD (used for divergence)
+    // P1: OI time-series for velocity calculation
     oi_by_exchange: HashMap<String, f64>,
+    oi_history: VecDeque<OiRecord>,
+    // P1: Basis history for momentum tracking
+    basis_history: VecDeque<BasisRecord>,
     spot_mid: Option<f64>,
     perp_mid: Option<f64>,
     spread_pct: Option<f64>,
@@ -432,6 +511,8 @@ impl TickerState {
             cvd_deltas_by_exchange: HashMap::new(),
             cvd_history: VecDeque::new(),
             oi_by_exchange: HashMap::new(),
+            oi_history: VecDeque::new(),
+            basis_history: VecDeque::new(),
             spot_mid: None,
             perp_mid: None,
             spread_pct: None,
@@ -559,6 +640,21 @@ impl TickerState {
 
     fn push_oi(&mut self, exchange: &str, contracts: f64) {
         self.oi_by_exchange.insert(exchange.to_string(), contracts);
+
+        // P1: Track OI time-series for velocity calculation
+        let now = Utc::now();
+        let total: f64 = self.oi_by_exchange.values().copied().sum();
+        self.oi_history.push_back(OiRecord { time: now, total });
+
+        // Prune old OI records
+        let cutoff = now - ChronoDuration::seconds(OI_RETENTION_SECS);
+        while let Some(front) = self.oi_history.front() {
+            if front.time < cutoff {
+                self.oi_history.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     fn push_orderbook(
@@ -595,8 +691,32 @@ impl TickerState {
 
         if let Some(mid_price) = mid {
             self.price_history.push_back((time, mid_price));
-            self.prune(time);
         }
+
+        // P1: Track basis history for momentum
+        if let (Some(spot), Some(perp)) = (self.spot_mid, self.perp_mid) {
+            if spot > 0.0 {
+                let basis_usd = perp - spot;
+                let basis_pct = (basis_usd / spot) * 100.0;
+                self.basis_history.push_back(BasisRecord {
+                    time,
+                    basis_usd,
+                    basis_pct,
+                });
+
+                // Prune old basis records
+                let cutoff = time - ChronoDuration::seconds(BASIS_RETENTION_SECS);
+                while let Some(front) = self.basis_history.front() {
+                    if front.time < cutoff {
+                        self.basis_history.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.prune(time);
     }
 
     fn last_whale(&self, exchange: &str) -> Option<&str> {
@@ -653,9 +773,12 @@ impl TickerState {
     }
 
     fn to_snapshot(&self) -> TickerSnapshot {
+        // P0: Multi-timeframe orderflow (30s, 1m, 5m)
+        let orderflow_30s = self.orderflow(30);
         let orderflow_1m = self.orderflow(60);
         let orderflow_5m = self.orderflow(300);
         let exchange_dominance = self.exchange_dominance(60);
+        let vwap_30s = self.vwap(30);
         let vwap_1m = self.vwap(60);
         let vwap_5m = self.vwap(300);
         // Per-exchange fairness: ensure all exchanges represented in whale display
@@ -664,15 +787,24 @@ impl TickerState {
         let liq_rate_per_min = self.liquidation_rate_per_min();
         let liq_bucket = self.liquidation_bucket_size();
         let cvd = self.cvd_summary();
+        // P0: Multi-timeframe CVD (30s, 1m)
+        let cvd_30s = self.cvd_total(30);
         let cvd_1m_total = self.cvd_total(60);
+        let cvd_per_exchange_5m = self.cvd_per_exchange(300);
+        // P1: OI with velocity
         let oi_total: f64 = self.oi_by_exchange.values().copied().sum();
+        let (oi_delta_5m, oi_velocity) = self.oi_velocity(300);
+        // P0: Multi-timeframe tick direction (30s, 1m, 5m)
+        let tick_direction_30s = self.tick_direction(30);
         let tick_direction = self.tick_direction(60);
         let tick_direction_5m = self.tick_direction(300);
         let (trade_speed, avg_trade_usd) = self.trade_speed(60);
         let (trades_5m, vol_5m, avg_5m) = self.trade_stats(300);
         let basis = self.basis();
         let cvd_divergence = self.cvd_divergence();
-        let cvd_per_exchange_5m = self.cvd_per_exchange(300);
+        // P1: Flow signal and basis momentum
+        let flow_signal = self.detect_flow_signal();
+        let basis_momentum = self.basis_momentum();
 
         TickerSnapshot {
             ticker: self.ticker.clone(),
@@ -681,9 +813,11 @@ impl TickerState {
             spot_mid: self.spot_mid,
             perp_mid: self.perp_mid,
             basis,
+            orderflow_30s,
             orderflow_1m,
             orderflow_5m,
             exchange_dominance,
+            vwap_30s,
             vwap_1m,
             vwap_5m,
             whales,
@@ -694,17 +828,23 @@ impl TickerState {
             next_cascade_level: next_level,
             protection_level,
             cvd,
+            cvd_30s,
             cvd_1m_total,
             cvd_per_exchange_5m,
             oi_total,
+            oi_delta_5m,
+            oi_velocity,
             tick_direction,
             tick_direction_5m,
+            tick_direction_30s,
             trade_speed,
             avg_trade_usd,
             trades_5m,
             vol_5m,
             avg_trade_usd_5m: avg_5m,
             cvd_divergence,
+            flow_signal,
+            basis_momentum,
             best_bid: self.best_bid,
             best_ask: self.best_ask,
             exchange_prices: self.last_trade_by_exchange.clone(),
@@ -1137,9 +1277,15 @@ impl TickerState {
                 .map(|c| c.total_quote)
                 .unwrap_or(0.0);
 
-        // Thresholds
-        let price_threshold = self.latest_price().unwrap_or(1.0) * 0.001; // 0.1%
-        let cvd_threshold = 1000.0;
+        // P0: Tighten thresholds for more actionable signals
+        // Price threshold: 0.05% instead of 0.1% (more sensitive)
+        let price_threshold = self.latest_price().unwrap_or(1.0) * 0.0005;
+        // CVD threshold scaled by asset: BTC needs higher, alts lower
+        let cvd_threshold = match self.ticker.as_str() {
+            "BTC" => 50_000.0,  // $50K for BTC (was $1K - too sensitive)
+            "ETH" => 20_000.0,  // $20K for ETH
+            _ => 5_000.0,       // $5K for alts
+        };
 
         let price_up = price_trend > price_threshold;
         let price_down = price_trend < -price_threshold;
@@ -1154,6 +1300,162 @@ impl TickerState {
             (false, false, false, false) => DivergenceSignal::Neutral,
             _ => DivergenceSignal::Neutral,
         }
+    }
+
+    /// P1: OI velocity calculation - returns (delta over window, velocity in $/sec)
+    fn oi_velocity(&self, window_secs: i64) -> (f64, f64) {
+        if self.oi_history.len() < 2 {
+            return (0.0, 0.0);
+        }
+
+        let now = Utc::now();
+        let cutoff = now - ChronoDuration::seconds(window_secs);
+
+        // Find first record within window
+        let first = self.oi_history.iter().find(|r| r.time >= cutoff);
+        let last = self.oi_history.back();
+
+        match (first, last) {
+            (Some(f), Some(l)) if l.time > f.time => {
+                let delta = l.total - f.total;
+                let time_diff = (l.time - f.time).num_seconds().max(1) as f64;
+                let velocity = delta / time_diff;
+                (delta, velocity)
+            }
+            _ => (0.0, 0.0),
+        }
+    }
+
+    /// P1: Flow signal detection based on price/CVD relationship
+    fn detect_flow_signal(&self) -> FlowSignal {
+        if self.price_history.len() < 10 || self.cvd_history.len() < 10 {
+            return FlowSignal::Neutral;
+        }
+
+        // Use 1-minute window for flow signal
+        let now = Utc::now();
+        let cutoff_1m = now - ChronoDuration::seconds(60);
+
+        // Calculate price change over 1m
+        let recent_prices: Vec<f64> = self
+            .price_history
+            .iter()
+            .rev()
+            .take_while(|(t, _)| *t >= cutoff_1m)
+            .map(|(_, p)| *p)
+            .collect();
+
+        if recent_prices.len() < 2 {
+            return FlowSignal::Neutral;
+        }
+
+        let price_start = *recent_prices.last().unwrap_or(&0.0);
+        let price_end = *recent_prices.first().unwrap_or(&0.0);
+        let price_pct_change = if price_start > 0.0 {
+            ((price_end - price_start) / price_start) * 100.0
+        } else {
+            0.0
+        };
+
+        // Calculate CVD change over 1m
+        let cvd_1m = self.cvd_total(60);
+
+        // Thresholds for signal detection (tightened from original)
+        // P0: Use 48-52% band (±2% from neutral) instead of 45-55%
+        let price_flat_threshold = 0.02; // ±0.02% considered flat
+        let cvd_significant = match self.ticker.as_str() {
+            "BTC" => 100_000.0,  // $100K CVD significant for BTC
+            "ETH" => 50_000.0,   // $50K for ETH
+            _ => 10_000.0,       // $10K for alts
+        };
+
+        let price_flat = price_pct_change.abs() < price_flat_threshold;
+        let price_up = price_pct_change > price_flat_threshold;
+        let price_down = price_pct_change < -price_flat_threshold;
+        let cvd_up = cvd_1m > cvd_significant;
+        let cvd_down = cvd_1m < -cvd_significant;
+        let cvd_flat = cvd_1m.abs() < cvd_significant;
+
+        match (price_flat, price_up, price_down, cvd_up, cvd_down, cvd_flat) {
+            // Accumulation: price flat but CVD rising (buying absorbed)
+            (true, _, _, true, _, _) => FlowSignal::Accumulation,
+            // Distribution: price up but CVD falling (smart money selling into strength)
+            (_, true, _, _, true, _) => FlowSignal::Distribution,
+            // Exhaustion: price moving but CVD flat (momentum fading)
+            (_, true, _, _, _, true) => FlowSignal::Exhaustion,
+            (_, _, true, _, _, true) => FlowSignal::Exhaustion,
+            // Confirmation: price and CVD aligned
+            (_, true, _, true, _, _) => FlowSignal::Confirmation,
+            (_, _, true, _, true, _) => FlowSignal::Confirmation,
+            _ => FlowSignal::Neutral,
+        }
+    }
+
+    /// P1: Basis momentum calculation with trend detection
+    fn basis_momentum(&self) -> Option<BasisMomentum> {
+        if self.basis_history.len() < 2 {
+            return None;
+        }
+
+        let now = Utc::now();
+        let cutoff_1m = now - ChronoDuration::seconds(60);
+        let cutoff_5m = now - ChronoDuration::seconds(300);
+
+        // Get current basis
+        let current = self.basis_history.back()?;
+
+        // Find basis 1m ago
+        let basis_1m_ago = self
+            .basis_history
+            .iter()
+            .rev()
+            .find(|r| r.time <= cutoff_1m)
+            .map(|r| r.basis_usd)
+            .unwrap_or(current.basis_usd);
+
+        // Find basis 5m ago
+        let basis_5m_ago = self
+            .basis_history
+            .iter()
+            .rev()
+            .find(|r| r.time <= cutoff_5m)
+            .map(|r| r.basis_usd)
+            .unwrap_or(current.basis_usd);
+
+        let delta_1m = current.basis_usd - basis_1m_ago;
+        let delta_5m = current.basis_usd - basis_5m_ago;
+
+        // Determine trend based on delta magnitude
+        let threshold = match self.ticker.as_str() {
+            "BTC" => 5.0,   // $5 change significant for BTC
+            "ETH" => 1.0,   // $1 for ETH
+            _ => 0.1,       // $0.10 for alts
+        };
+
+        let trend = if delta_5m.abs() < threshold {
+            BasisTrend::Stable
+        } else if delta_5m > 0.0 {
+            BasisTrend::Widening
+        } else {
+            BasisTrend::Narrowing
+        };
+
+        // Generate actionable signal
+        let basis_state = self.basis().map(|b| b.state).unwrap_or(BasisState::Unknown);
+        let signal = match (&basis_state, &trend) {
+            (BasisState::Contango, BasisTrend::Widening) => Some("Long risk".to_string()),
+            (BasisState::Backwardation, BasisTrend::Narrowing) => Some("Squeeze setup".to_string()),
+            (BasisState::Contango, BasisTrend::Narrowing) => Some("Longs unwinding".to_string()),
+            (BasisState::Backwardation, BasisTrend::Widening) => Some("Shorts pressing".to_string()),
+            _ => None,
+        };
+
+        Some(BasisMomentum {
+            delta_1m,
+            delta_5m,
+            trend,
+            signal,
+        })
     }
 }
 

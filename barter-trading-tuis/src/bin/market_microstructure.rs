@@ -13,8 +13,8 @@ use std::{
 };
 
 use barter_trading_tuis::{
-    AggregatedSnapshot, Aggregator, BasisState, ConnectionStatus, DivergenceSignal, Side,
-    WebSocketClient, WebSocketConfig,
+    AggregatedSnapshot, Aggregator, BasisState, BasisTrend, ConnectionStatus, DivergenceSignal,
+    FlowSignal, Side, WebSocketClient, WebSocketConfig,
 };
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -180,17 +180,18 @@ fn render_ui(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot, 
         ])
         .split(area);
 
+    // Uniform 50/50 split for all rows
     let row1 = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[0]);
     let row2 = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
     let row3 = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[2]);
 
     render_orderflow_panel(f, row1[0], snapshot);
@@ -290,12 +291,19 @@ fn render_orderflow_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggrega
 }
 
 fn render_basis_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot) {
+    // P1: Enhanced Basis panel with momentum
     let block = Block::default()
-        .title(" SPOT vs PERP BASIS ")
+        .title(" BASIS MOMENTUM ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
     let mut lines = Vec::new();
+
+    // Header
+    lines.push(Line::from(Span::styled(
+        "     BASIS     Δ1m    Δ5m    STATE      SIGNAL",
+        Style::default().fg(Color::DarkGray),
+    )));
 
     for ticker in tickers() {
         if let Some(t) = snapshot.tickers.get(ticker) {
@@ -306,33 +314,62 @@ fn render_basis_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedS
                     BasisState::Unknown => ("NEUTRAL", Color::Gray),
                 };
 
-                let mut label = state_label.to_string();
-                if basis.steep {
-                    label.push_str(" STEEP");
-                }
+                // Format basis value
+                let basis_str = format!("{:+.2}", basis.basis_usd);
 
-                // Format absolute basis in USD and percent
-                let usd = basis.basis_usd;
-                let usd_str = format!("{:+.2}", usd);
+                // Momentum deltas
+                let (delta_1m_str, delta_5m_str, trend_arrow, signal_str) =
+                    if let Some(momentum) = &t.basis_momentum {
+                        let d1 = format!("{:+.2}", momentum.delta_1m);
+                        let d5 = format!("{:+.2}", momentum.delta_5m);
+                        let arrow = match momentum.trend {
+                            BasisTrend::Widening => "↑",
+                            BasisTrend::Narrowing => "↓",
+                            BasisTrend::Stable => "→",
+                        };
+                        let signal = momentum.signal.clone().unwrap_or_default();
+                        (d1, d5, arrow, signal)
+                    } else {
+                        ("--".to_string(), "--".to_string(), "→", String::new())
+                    };
+
+                let trend_color = match trend_arrow {
+                    "↑" => Color::Green,
+                    "↓" => Color::Red,
+                    _ => Color::Gray,
+                };
 
                 lines.push(Line::from(vec![
-                    Span::raw(format!("{:3}  ", ticker)),
                     Span::styled(
-                        format!("${} ({:+.2}%) ", usd_str, basis.basis_pct),
+                        format!("{:3}  ", ticker),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("${:>6} ", basis_str),
                         Style::default().fg(state_color),
                     ),
-                    Span::styled(label, Style::default().fg(state_color)),
+                    Span::styled(format!("{:>6}", delta_1m_str), Style::default().fg(trend_color)),
+                    Span::styled(trend_arrow, Style::default().fg(trend_color)),
+                    Span::raw(" "),
+                    Span::styled(format!("{:>6}", delta_5m_str), Style::default().fg(trend_color)),
+                    Span::styled(trend_arrow, Style::default().fg(trend_color)),
+                    Span::raw(" "),
+                    Span::styled(format!("{:<8} ", state_label), Style::default().fg(state_color)),
+                    Span::styled(signal_str, Style::default().fg(Color::Magenta)),
                 ]));
             } else {
                 lines.push(Line::from(vec![
-                    Span::raw(format!("{:3}  ", ticker)),
+                    Span::styled(
+                        format!("{:3}  ", ticker),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled("N/A", Style::default().fg(Color::DarkGray)),
                 ]));
             }
         }
     }
 
-    if lines.is_empty() {
+    if lines.len() <= 1 {
         lines.push(Line::from(Span::styled(
             "Waiting for basis data...",
             Style::default().fg(Color::DarkGray),
@@ -458,71 +495,129 @@ fn render_liquidation_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggre
 }
 
 fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot) {
+    // P0: Compact Market Stats - single line per asset
     let block = Block::default()
-        .title(" MARKET STATS (5m) ")
+        .title(" MARKET PULSE ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
     let mut lines = Vec::new();
 
+    // Compact header
+    lines.push(Line::from(Span::styled(
+        "     PRICE   VOL   SPD  DOM       OIΔ",
+        Style::default().fg(Color::DarkGray),
+    )));
+
     for ticker in tickers() {
         if let Some(t) = snapshot.tickers.get(ticker) {
-            // Dominance: take top 3 and show exchange-kind tags
+            // Price display (compact)
+            let price_str = t
+                .latest_price
+                .map(|p| {
+                    if p >= 1000.0 {
+                        format!("{:.1}K", p / 1000.0)
+                    } else {
+                        format!("{:.1}", p)
+                    }
+                })
+                .unwrap_or_else(|| "---".to_string());
+
+            // Volume display (very compact)
+            let vol_str = if t.vol_5m >= 1_000_000.0 {
+                format!("{:.0}M", t.vol_5m / 1_000_000.0)
+            } else {
+                format!("{:.0}K", t.vol_5m / 1_000.0)
+            };
+
+            // Speed with color (short)
+            let (speed_label, speed_color) = if t.trade_speed >= 100.0 {
+                ("H", Color::Red)
+            } else if t.trade_speed >= 50.0 {
+                ("M", Color::Yellow)
+            } else {
+                ("L", Color::Gray)
+            };
+
+            // Dominant exchange (short format: OKX 96%)
             let mut ex: Vec<_> = t.exchange_dominance.iter().collect();
             ex.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
             let dom_str = ex
-                .iter()
-                .take(3)
-                .map(|(k, v)| format!("{} {:.0}%", abbreviate_exchange_kind(k), v))
-                .collect::<Vec<_>>()
-                .join(" | ");
+                .first()
+                .map(|(k, v)| {
+                    let abbr = abbreviate_exchange_short(k);
+                    format!("{}{:.0}%", abbr, v)
+                })
+                .unwrap_or_else(|| "---".to_string());
 
-            // Spread proxy
-            let spread_str = t
-                .latest_spread_pct
-                .map(|s| format!("{:.2}%", s))
-                .unwrap_or_else(|| "--".to_string());
-
-            // 5m stats
-            let vol_display = format!("${:.1}M", t.vol_5m / 1_000_000.0);
-            let avg_display = format!("${:.0}K/trade", t.avg_trade_usd_5m / 1_000.0);
-            let trades_display = format!("{:.0} t/5m", t.trades_5m as f64);
-
-            // Speed label
-            let speed_label = if t.trade_speed >= 8.0 {
-                "HIGH"
-            } else if t.trade_speed >= 4.0 {
-                "MED"
+            // OI delta (compact)
+            let oi_delta = t.oi_delta_5m;
+            let (oi_str, oi_color) = if oi_delta.abs() < 1.0 {
+                ("→".to_string(), Color::Gray)
             } else {
-                "LOW"
+                let arrow = if oi_delta > 0.0 { "↑" } else { "↓" };
+                let color = if oi_delta > 0.0 { Color::Green } else { Color::Red };
+                let (val, suffix) = scale_number(oi_delta.abs(), true);
+                (format!("{:.0}{}{}", val, suffix, arrow), color)
             };
 
-            lines.push(Line::from(Span::styled(
-                format!("{:3}:", ticker),
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(Span::raw(format!(
-                "   {}  {}  {}  {}",
-                trades_display, vol_display, avg_display, ""
-            ))));
-            lines.push(Line::from(Span::raw(format!("   {}", dom_str))));
-            lines.push(Line::from(Span::raw(format!(
-                "   Speed: {:.1} t/s ({})  Spread: {}",
-                t.trade_speed, speed_label, spread_str
-            ))));
-            lines.push(Line::from(Span::raw("")));
+            // Single compact line per asset
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:3} ", ticker), Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(format!("{:>6} {:>4} ", price_str, vol_str)),
+                Span::styled(format!("{} ", speed_label), Style::default().fg(speed_color)),
+                Span::raw(format!("{:<8} ", dom_str)),
+                Span::styled(oi_str, Style::default().fg(oi_color)),
+            ]));
         }
     }
 
-    if lines.is_empty() {
+    // Compact OI Velocity section
+    lines.push(Line::from(Span::raw("")));
+    lines.push(Line::from(Span::styled("OI VEL:", Style::default().fg(Color::DarkGray))));
+
+    for ticker in tickers() {
+        if let Some(t) = snapshot.tickers.get(ticker) {
+            let velocity = t.oi_velocity;
+            let (signal, color) = if velocity > 100.0 {
+                ("LONGS↑", Color::Green)
+            } else if velocity < -100.0 {
+                ("SHRTS↓", Color::Red)
+            } else {
+                ("BAL", Color::Gray)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:3} ", ticker), Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(format!("{:+.0}/s ", velocity)),
+                Span::styled(signal, Style::default().fg(color)),
+            ]));
+        }
+    }
+
+    if lines.len() <= 2 {
         lines.push(Line::from(Span::styled(
-            "No market stats available",
+            "No data",
             Style::default().fg(Color::DarkGray),
         )));
     }
 
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);
+}
+
+/// Short exchange abbreviation (3 chars max)
+fn abbreviate_exchange_short(name: &str) -> &'static str {
+    let lower = name.to_lowercase();
+    if lower.contains("binance") {
+        "BNC"
+    } else if lower.contains("bybit") {
+        "BBT"
+    } else if lower.contains("okx") {
+        "OKX"
+    } else {
+        "OTH"
+    }
 }
 
 fn render_whale_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot) {
