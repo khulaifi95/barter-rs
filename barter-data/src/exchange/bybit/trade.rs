@@ -27,14 +27,41 @@ impl<'de> Deserialize<'de> for BybitTradeMessage {
     {
         let value = Value::deserialize(deserializer)?;
 
+        // DIAGNOSTIC LOGGING - Check if this is a trade-related message
+        if value.get("data").is_some() || value.get("topic").and_then(|t| t.as_str()).map(|s| s.contains("publicTrade")).unwrap_or(false) {
+            let has_topic = value.get("topic").is_some();
+            let topic_value = value.get("topic").and_then(|t| t.as_str()).unwrap_or("NONE");
+
+            eprintln!("[BYBIT TRADE DEBUG] Message received:");
+            eprintln!("[BYBIT TRADE DEBUG]   - has 'topic' field: {}", has_topic);
+            eprintln!("[BYBIT TRADE DEBUG]   - topic value: {}", topic_value);
+            eprintln!("[BYBIT TRADE DEBUG]   - has 'data' field: {}", value.get("data").is_some());
+
+            if !has_topic {
+                eprintln!("[BYBIT TRADE DEBUG] ⚠️  MESSAGE WITHOUT TOPIC - WILL BE DROPPED!");
+                eprintln!("[BYBIT TRADE DEBUG] Full message: {}", serde_json::to_string_pretty(&value).unwrap_or_default());
+            }
+        }
+
         match value.get("topic") {
             Some(topic) if topic.is_string() => {
+                eprintln!("[BYBIT TRADE DEBUG] ✓ Processing message with topic");
                 let raw = serde_json::to_string(&value).map_err(serde::de::Error::custom)?;
-                serde_json::from_str(&raw)
-                    .map(BybitTradeMessage::Payload)
-                    .map_err(serde::de::Error::custom)
+                match serde_json::from_str::<BybitPayload<Vec<BybitTradeInner>>>(&raw) {
+                    Ok(payload) => {
+                        eprintln!("[BYBIT TRADE DEBUG] ✓ Successfully deserialized {} trades", payload.data.len());
+                        Ok(BybitTradeMessage::Payload(payload))
+                    }
+                    Err(e) => {
+                        eprintln!("[BYBIT TRADE DEBUG] ✗ Deserialization failed: {}", e);
+                        Err(serde::de::Error::custom(e))
+                    }
+                }
             }
-            _ => Ok(BybitTradeMessage::Ignore),
+            _ => {
+                eprintln!("[BYBIT TRADE DEBUG] → Ignoring message (no topic or non-string topic)");
+                Ok(BybitTradeMessage::Ignore)
+            }
         }
     }
 }
@@ -85,27 +112,35 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, BybitTradeMessage)>
         (exchange, instrument, message): (ExchangeId, InstrumentKey, BybitTradeMessage),
     ) -> Self {
         match message {
-            BybitTradeMessage::Ignore => Self(vec![]),
-            BybitTradeMessage::Payload(trades) => Self(
-                trades
-                    .data
-                    .into_iter()
-                    .map(|trade| {
-                        Ok(MarketEvent {
-                            time_exchange: trade.time,
-                            time_received: Utc::now(),
-                            exchange,
-                            instrument: instrument.clone(),
-                            kind: PublicTrade {
-                                id: trade.id,
-                                price: trade.price,
-                                amount: trade.amount,
-                                side: trade.side,
-                            },
+            BybitTradeMessage::Ignore => {
+                eprintln!("[BYBIT TRADE DEBUG] Converting Ignore to empty vec - trade(s) lost");
+                Self(vec![])
+            }
+            BybitTradeMessage::Payload(trades) => {
+                eprintln!("[BYBIT TRADE DEBUG] Converting {} Bybit trades to MarketEvents", trades.data.len());
+                Self(
+                    trades
+                        .data
+                        .into_iter()
+                        .map(|trade| {
+                            eprintln!("[BYBIT TRADE DEBUG]   Trade: {} @ {} qty {} side {:?}",
+                                trade.market, trade.price, trade.amount, trade.side);
+                            Ok(MarketEvent {
+                                time_exchange: trade.time,
+                                time_received: Utc::now(),
+                                exchange,
+                                instrument: instrument.clone(),
+                                kind: PublicTrade {
+                                    id: trade.id,
+                                    price: trade.price,
+                                    amount: trade.amount,
+                                    side: trade.side,
+                                },
+                            })
                         })
-                    })
-                    .collect(),
-            ),
+                        .collect(),
+                )
+            }
         }
     }
 }

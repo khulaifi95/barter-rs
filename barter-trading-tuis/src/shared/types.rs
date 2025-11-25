@@ -2,7 +2,6 @@
 ///
 /// These types match the JSON message format from the WebSocket server
 /// at ws://127.0.0.1:9001
-
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -170,9 +169,7 @@ impl OrderBookL1Data {
     /// Calculate the mid price
     pub fn mid_price(&self) -> Option<Decimal> {
         match (&self.best_bid, &self.best_ask) {
-            (Some(bid), Some(ask)) => {
-                Some((bid.price + ask.price) / Decimal::from(2))
-            }
+            (Some(bid), Some(ask)) => Some((bid.price + ask.price) / Decimal::from(2)),
             _ => None,
         }
     }

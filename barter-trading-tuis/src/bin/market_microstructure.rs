@@ -1,22 +1,21 @@
-/// Market Microstructure Dashboard
+/// Market Microstructure Dashboard (Opus TUI #1)
 ///
-/// Real-time orderflow and market activity monitoring
-/// Refresh Rate: 250ms
-/// Primary Use: Active trading decisions
-///
-/// Panels:
-/// 1. Orderflow Imbalance (1m window)
-/// 2. Spot vs Perp Basis
-/// 3. Liquidation Clusters
-/// 4. Funding Momentum
-/// 5. Whale Detector (>$500K)
-/// 6. CVD Divergence
+/// Renders orderflow, basis, liquidation clusters, whales, and CVD signals
+/// using the shared aggregation engine so all TUIs share one source of truth.
+use std::{
+    error::Error,
+    io,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
+    time::{Duration, Instant},
+};
 
 use barter_trading_tuis::{
-    CvdData, LiquidationData, MarketEventMessage, OpenInterestData, OrderBookL1Data, Side,
-    TradeData, WebSocketClient, WebSocketConfig,
+    AggregatedSnapshot, Aggregator, BasisState, ConnectionStatus, DivergenceSignal, Side,
+    WebSocketClient, WebSocketConfig,
 };
-use chrono::{DateTime, Utc};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -24,46 +23,67 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
-use std::{
-    collections::{HashMap, VecDeque},
-    io,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
-use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
-/// Supported trading pairs
-const TICKERS: [&str; 3] = ["btc", "eth", "sol"];
+static TICKERS: OnceLock<Vec<String>> = OnceLock::new();
 
-/// Large trade threshold ($500K)
-const WHALE_THRESHOLD: f64 = 500_000.0;
+/// Get tickers from TICKERS env var (default: BTC,ETH,SOL)
+fn get_tickers() -> Vec<String> {
+    std::env::var("TICKERS")
+        .unwrap_or_else(|_| "BTC,ETH,SOL".to_string())
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .collect()
+}
 
-/// Mega whale threshold ($5M)
-const MEGA_WHALE_THRESHOLD: f64 = 5_000_000.0;
+/// Get WebSocket URL from WS_URL env var (default: ws://127.0.0.1:9001)
+fn get_ws_url() -> String {
+    std::env::var("WS_URL").unwrap_or_else(|_| "ws://127.0.0.1:9001".to_string())
+}
 
-/// Orderflow window size (1 minute at ~100 events/sec)
-const ORDERFLOW_WINDOW_SIZE: usize = 6000;
+/// Get mega whale threshold from MEGA_WHALE_THRESHOLD env var (default: $5,000,000)
+fn mega_whale_threshold() -> f64 {
+    std::env::var("MEGA_WHALE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000_000.0)
+}
 
-/// Liquidation cluster price bucket size ($100)
-const LIQ_BUCKET_SIZE: f64 = 100.0;
+/// Get liq display danger threshold from LIQ_DISPLAY_DANGER_THRESHOLD env var (default: $1,000,000)
+fn liq_display_danger_threshold() -> f64 {
+    std::env::var("LIQ_DISPLAY_DANGER_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000.0)
+}
 
-/// Maximum whale trades to display
-const MAX_WHALE_DISPLAY: usize = 10;
+/// Whale threshold for display (shared with aggregator; default $500,000)
+fn whale_threshold_display() -> f64 {
+    std::env::var("WHALE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500_000.0)
+}
 
-/// Maximum liquidation clusters to display
-const MAX_LIQ_CLUSTERS: usize = 5;
+fn tickers() -> &'static [String] {
+    TICKERS.get_or_init(get_tickers)
+}
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Disable logging in TUI mode (logs interfere with terminal display)
-    // To enable logs, set env var: RUST_LOG=info and redirect to file:
-    // RUST_LOG=info cargo run --bin market-microstructure 2> tui.log
+async fn main() -> Result<(), Box<dyn Error>> {
+    // Setup panic hook to restore terminal on crash
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        original_hook(panic_info);
+    }));
 
     // Setup terminal
     enable_raw_mode()?;
@@ -72,62 +92,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create WebSocket client
-    let config = WebSocketConfig::new("ws://127.0.0.1:9001")
+    // Shared aggregation engine
+    let aggregator = Arc::new(Mutex::new(Aggregator::new()));
+    let connected = Arc::new(AtomicBool::new(false));
+
+    // WebSocket client
+    let ws_url = get_ws_url();
+    let config = WebSocketConfig::new(ws_url)
         .with_ping_interval(Duration::from_secs(30))
         .with_reconnect_delay(Duration::from_secs(2))
-        .with_channel_buffer_size(5000);
-
+        .with_channel_buffer_size(50_000);
     let client = WebSocketClient::with_config(config);
     let (mut event_rx, mut status_rx) = client.start();
 
-    // Create app state (wrapped in Arc<Mutex> for sharing)
-    let app = Arc::new(Mutex::new(AppState::new()));
-
-    // Create channel for UI updates
-    let (ui_tx, mut ui_rx) = mpsc::channel::<()>(100);
-
-    // Spawn event processing task
-    let ui_tx_clone = ui_tx.clone();
-    let app_clone = Arc::clone(&app);
-    let app_handle = tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
-            if let Ok(mut app_state) = app_clone.lock() {
-                app_state.process_event(event);
+    // Event processor
+    {
+        let agg = Arc::clone(&aggregator);
+        tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                let mut guard = agg.lock().await;
+                guard.process_event(event);
             }
-            let _ = ui_tx_clone.send(()).await;
-        }
-    });
+        });
+    }
 
-    // Spawn connection status monitor (silently track status)
-    tokio::spawn(async move {
-        while let Some(_status) = status_rx.recv().await {
-            // Status changes tracked but not logged (would interfere with TUI)
-        }
-    });
+    // Connection status tracker
+    {
+        let connected_flag = Arc::clone(&connected);
+        tokio::spawn(async move {
+            while let Some(status) = status_rx.recv().await {
+                match status {
+                    ConnectionStatus::Connected => connected_flag.store(true, Ordering::Relaxed),
+                    ConnectionStatus::Disconnected | ConnectionStatus::Reconnecting => {
+                        connected_flag.store(false, Ordering::Relaxed)
+                    }
+                }
+            }
+        });
+    }
 
-    // Main UI loop
+    // UI loop
     let mut last_draw = Instant::now();
     let draw_interval = Duration::from_millis(250);
 
     let result = loop {
-        // Handle keyboard input
         if event::poll(Duration::from_millis(10))? {
             if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') {
+                if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
                     break Ok(());
                 }
             }
         }
 
-        // Check for UI update trigger
-        if ui_rx.try_recv().is_ok() || last_draw.elapsed() >= draw_interval {
-            if let Ok(app_state) = app.lock() {
-                terminal.draw(|f| {
-                    let size = f.area();
-                    render_ui(f, size, &app_state);
-                })?;
-            }
+        if last_draw.elapsed() >= draw_interval {
+            let snapshot = {
+                let guard = aggregator.lock().await;
+                guard.snapshot()
+            };
+
+            let connected_now = connected.load(Ordering::Relaxed);
+            terminal.draw(|f| render_ui(f, f.area(), &snapshot, connected_now))?;
             last_draw = Instant::now();
         }
 
@@ -135,7 +159,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Cleanup
-    app_handle.abort();
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -147,398 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-/// Application state
-#[derive(Debug)]
-struct AppState {
-    /// Per-ticker metrics
-    tickers: HashMap<String, TickerMetrics>,
-    /// Last update time
-    last_update: Instant,
-}
-
-impl AppState {
-    fn new() -> Self {
-        let mut tickers = HashMap::new();
-        for ticker in TICKERS {
-            tickers.insert(ticker.to_uppercase(), TickerMetrics::new(ticker));
-        }
-
-        Self {
-            tickers,
-            last_update: Instant::now(),
-        }
-    }
-
-    fn process_event(&mut self, event: MarketEventMessage) {
-        let ticker = event.instrument.base.to_uppercase();
-
-        if let Some(metrics) = self.tickers.get_mut(&ticker) {
-            match event.kind.as_str() {
-                "trade" => {
-                    if let Ok(trade) = serde_json::from_value::<TradeData>(event.data) {
-                        metrics.process_trade(trade, &event.exchange, event.time_exchange);
-                    }
-                }
-                "liquidation" => {
-                    if let Ok(liq) = serde_json::from_value::<LiquidationData>(event.data) {
-                        metrics.process_liquidation(liq, &event.exchange);
-                    }
-                }
-                "cumulative_volume_delta" => {
-                    if let Ok(cvd) = serde_json::from_value::<CvdData>(event.data) {
-                        metrics.process_cvd(cvd);
-                    }
-                }
-                "order_book_l1" => {
-                    if let Ok(ob) = serde_json::from_value::<OrderBookL1Data>(event.data) {
-                        metrics.process_orderbook(ob);
-                    }
-                }
-                "open_interest" => {
-                    if let Ok(oi) = serde_json::from_value::<OpenInterestData>(event.data) {
-                        metrics.process_open_interest(oi);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        self.last_update = Instant::now();
-    }
-}
-
-/// Metrics for a single ticker
-#[derive(Debug)]
-struct TickerMetrics {
-    ticker: String,
-
-    // Orderflow Imbalance
-    orderflow: OrderflowMetrics,
-
-    // Spot vs Perp Basis (placeholder - needs spot data)
-    basis_usd: Option<f64>,
-    basis_pct: Option<f64>,
-
-    // Liquidation Clusters
-    liquidations: Vec<LiquidationEvent>,
-    liq_clusters: HashMap<i64, Vec<LiquidationEvent>>,
-
-    // Funding Rate (placeholder - needs funding data)
-    funding_rate: Option<f64>,
-
-    // Whale Detector
-    whale_trades: VecDeque<WhaleTrade>,
-
-    // CVD Divergence
-    cvd_history: VecDeque<CvdPoint>,
-    price_history: VecDeque<PricePoint>,
-
-    // Latest market data
-    latest_price: Option<f64>,
-    latest_spread: Option<f64>,
-}
-
-impl TickerMetrics {
-    fn new(ticker: &str) -> Self {
-        Self {
-            ticker: ticker.to_uppercase(),
-            orderflow: OrderflowMetrics::new(),
-            basis_usd: None,
-            basis_pct: None,
-            liquidations: Vec::new(),
-            liq_clusters: HashMap::new(),
-            funding_rate: None,
-            whale_trades: VecDeque::new(),
-            cvd_history: VecDeque::new(),
-            price_history: VecDeque::new(),
-            latest_price: None,
-            latest_spread: None,
-        }
-    }
-
-    fn process_trade(&mut self, trade: TradeData, exchange: &str, time: DateTime<Utc>) {
-        let volume_usd = trade.price * trade.amount;
-
-        // Update orderflow
-        self.orderflow.add_trade(&trade.side, volume_usd);
-
-        // Check for whale trades
-        if volume_usd >= WHALE_THRESHOLD {
-            let whale = WhaleTrade {
-                time,
-                side: trade.side.clone(),
-                volume_usd,
-                price: trade.price,
-                exchange: exchange.to_string(),
-            };
-
-            self.whale_trades.push_front(whale);
-            if self.whale_trades.len() > MAX_WHALE_DISPLAY {
-                self.whale_trades.pop_back();
-            }
-        }
-
-        // Update price history for divergence detection
-        self.latest_price = Some(trade.price);
-        self.price_history.push_back(PricePoint {
-            time,
-            price: trade.price,
-        });
-
-        // Keep last 60 seconds
-        let cutoff = Utc::now() - chrono::Duration::seconds(60);
-        while let Some(point) = self.price_history.front() {
-            if point.time < cutoff {
-                self.price_history.pop_front();
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn process_liquidation(&mut self, liq: LiquidationData, exchange: &str) {
-        let volume_usd = liq.price * liq.quantity;
-
-        let liq_event = LiquidationEvent {
-            time: liq.time,
-            side: liq.side,
-            price: liq.price,
-            volume_usd,
-            exchange: exchange.to_string(),
-        };
-
-        // Add to raw liquidations
-        self.liquidations.push(liq_event.clone());
-
-        // Keep last 5 minutes only
-        let cutoff = Utc::now() - chrono::Duration::minutes(5);
-        self.liquidations.retain(|l| l.time >= cutoff);
-
-        // Update clusters (bucket by $100 price levels)
-        let bucket = (liq_event.price / LIQ_BUCKET_SIZE).floor() as i64;
-        self.liq_clusters
-            .entry(bucket)
-            .or_insert_with(Vec::new)
-            .push(liq_event);
-
-        // Clean old clusters
-        for cluster in self.liq_clusters.values_mut() {
-            cluster.retain(|l| l.time >= cutoff);
-        }
-        self.liq_clusters.retain(|_, v| !v.is_empty());
-    }
-
-    fn process_cvd(&mut self, cvd: CvdData) {
-        let cvd_point = CvdPoint {
-            time: Utc::now(),
-            delta: cvd.delta_quote,
-        };
-
-        self.cvd_history.push_back(cvd_point);
-
-        // Keep last 60 seconds
-        let cutoff = Utc::now() - chrono::Duration::seconds(60);
-        while let Some(point) = self.cvd_history.front() {
-            if point.time < cutoff {
-                self.cvd_history.pop_front();
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn process_orderbook(&mut self, ob: OrderBookL1Data) {
-        if let Some(mid) = ob.mid_price() {
-            self.latest_price = Some(mid.to_string().parse().unwrap_or(0.0));
-        }
-        self.latest_spread = ob.spread_percentage();
-    }
-
-    fn process_open_interest(&mut self, _oi: OpenInterestData) {
-        // Could track OI changes here if needed
-    }
-
-    /// Calculate CVD divergence signal
-    fn cvd_divergence(&self) -> DivergenceSignal {
-        if self.price_history.len() < 2 || self.cvd_history.len() < 2 {
-            return DivergenceSignal::Unknown;
-        }
-
-        // Get price trend (last 30s)
-        let now = Utc::now();
-        let cutoff = now - chrono::Duration::seconds(30);
-
-        let recent_prices: Vec<_> = self
-            .price_history
-            .iter()
-            .filter(|p| p.time >= cutoff)
-            .collect();
-
-        let recent_cvds: Vec<_> = self
-            .cvd_history
-            .iter()
-            .filter(|c| c.time >= cutoff)
-            .collect();
-
-        if recent_prices.len() < 2 || recent_cvds.len() < 2 {
-            return DivergenceSignal::Unknown;
-        }
-
-        // Calculate trends
-        let price_trend = recent_prices.last().unwrap().price - recent_prices.first().unwrap().price;
-        let cvd_trend = recent_cvds.last().unwrap().delta - recent_cvds.first().unwrap().delta;
-
-        // Classify divergence
-        const THRESHOLD: f64 = 0.0001; // Minimum movement to consider
-
-        let price_up = price_trend > THRESHOLD;
-        let price_down = price_trend < -THRESHOLD;
-        let cvd_up = cvd_trend > THRESHOLD;
-        let cvd_down = cvd_trend < -THRESHOLD;
-
-        match (price_up, price_down, cvd_up, cvd_down) {
-            (false, true, true, false) => DivergenceSignal::Bullish, // Price down, CVD up
-            (true, false, false, true) => DivergenceSignal::Bearish, // Price up, CVD down
-            (true, false, true, false) => DivergenceSignal::Aligned, // Both up
-            (false, true, false, true) => DivergenceSignal::Aligned, // Both down
-            _ => DivergenceSignal::Neutral,
-        }
-    }
-}
-
-/// Orderflow metrics for 1-minute window
-#[derive(Debug)]
-struct OrderflowMetrics {
-    buy_volume: f64,
-    sell_volume: f64,
-    window_start: Instant,
-}
-
-impl OrderflowMetrics {
-    fn new() -> Self {
-        Self {
-            buy_volume: 0.0,
-            sell_volume: 0.0,
-            window_start: Instant::now(),
-        }
-    }
-
-    fn add_trade(&mut self, side: &Side, volume_usd: f64) {
-        // Reset if window expired (1 minute)
-        if self.window_start.elapsed() > Duration::from_secs(60) {
-            self.buy_volume = 0.0;
-            self.sell_volume = 0.0;
-            self.window_start = Instant::now();
-        }
-
-        match side {
-            Side::Buy => self.buy_volume += volume_usd,
-            Side::Sell => self.sell_volume += volume_usd,
-        }
-    }
-
-    fn total_volume(&self) -> f64 {
-        self.buy_volume + self.sell_volume
-    }
-
-    fn imbalance_pct(&self) -> f64 {
-        let total = self.total_volume();
-        if total > 0.0 {
-            (self.buy_volume / total) * 100.0
-        } else {
-            50.0
-        }
-    }
-
-    fn net_flow(&self) -> f64 {
-        self.buy_volume - self.sell_volume
-    }
-
-    fn trend_arrow(&self) -> &'static str {
-        let imbalance = self.imbalance_pct();
-        if imbalance >= 75.0 {
-            "↑↑"
-        } else if imbalance >= 60.0 {
-            "↑"
-        } else if imbalance <= 25.0 {
-            "↓↓"
-        } else if imbalance <= 40.0 {
-            "↓"
-        } else {
-            "→"
-        }
-    }
-}
-
-/// Liquidation event with metadata
-#[derive(Debug, Clone)]
-struct LiquidationEvent {
-    time: DateTime<Utc>,
-    side: Side,
-    price: f64,
-    volume_usd: f64,
-    exchange: String,
-}
-
-/// Whale trade (>$500K)
-#[derive(Debug, Clone)]
-struct WhaleTrade {
-    time: DateTime<Utc>,
-    side: Side,
-    volume_usd: f64,
-    price: f64,
-    exchange: String,
-}
-
-/// CVD data point
-#[derive(Debug, Clone)]
-struct CvdPoint {
-    time: DateTime<Utc>,
-    delta: f64,
-}
-
-/// Price data point
-#[derive(Debug, Clone)]
-struct PricePoint {
-    time: DateTime<Utc>,
-    price: f64,
-}
-
-/// CVD divergence signal
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum DivergenceSignal {
-    Bullish,  // Price down, CVD up (accumulation)
-    Bearish,  // Price up, CVD down (distribution)
-    Aligned,  // Same direction
-    Neutral,  // No clear trend
-    Unknown,  // Not enough data
-}
-
-impl DivergenceSignal {
-    fn display(&self) -> (&'static str, Color) {
-        match self {
-            DivergenceSignal::Bullish => ("BULLISH", Color::Green),
-            DivergenceSignal::Bearish => ("BEARISH", Color::Red),
-            DivergenceSignal::Aligned => ("ALIGNED", Color::Blue),
-            DivergenceSignal::Neutral => ("NEUTRAL", Color::Yellow),
-            DivergenceSignal::Unknown => ("---", Color::Gray),
-        }
-    }
-
-    fn description(&self) -> &'static str {
-        match self {
-            DivergenceSignal::Bullish => "Price ↓ CVD ↑",
-            DivergenceSignal::Bearish => "Price ↑ CVD ↓",
-            DivergenceSignal::Aligned => "Price ≈ CVD",
-            DivergenceSignal::Neutral => "Ranging",
-            DivergenceSignal::Unknown => "N/A",
-        }
-    }
-}
-
-/// Render the main UI
-fn render_ui(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
-    // Main layout: 3 rows
+fn render_ui(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot, connected: bool) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -548,83 +180,101 @@ fn render_ui(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
         ])
         .split(area);
 
-    // Row 1: Orderflow Imbalance | Spot vs Perp Basis
-    let row1_cols = Layout::default()
+    let row1 = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(rows[0]);
-
-    render_orderflow_panel(f, row1_cols[0], app);
-    render_basis_panel(f, row1_cols[1], app);
-
-    // Row 2: Liquidation Clusters | Funding Momentum
-    let row2_cols = Layout::default()
+    let row2 = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(rows[1]);
-
-    render_liquidation_panel(f, row2_cols[0], app);
-    render_funding_panel(f, row2_cols[1], app);
-
-    // Row 3: Whale Detector | CVD Divergence
-    let row3_cols = Layout::default()
+    let row3 = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(rows[2]);
 
-    render_whale_panel(f, row3_cols[0], app);
-    render_cvd_panel(f, row3_cols[1], app);
+    render_orderflow_panel(f, row1[0], snapshot);
+    render_basis_panel(f, row1[1], snapshot);
+    render_liquidation_panel(f, row2[0], snapshot);
+    render_market_stats_panel(f, row2[1], snapshot);
+    render_whale_panel(f, row3[0], snapshot);
+    render_cvd_panel(f, row3[1], snapshot, connected);
 }
 
-/// Panel 1: Orderflow Imbalance
-fn render_orderflow_panel(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
+fn render_orderflow_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot) {
     let block = Block::default()
-        .title(" ORDERFLOW IMBALANCE (1m) ")
+        .title(" ORDERFLOW IMBALANCE ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let mut lines = vec![];
+    let mut lines = Vec::new();
 
-    for ticker in TICKERS {
-        let ticker_upper = ticker.to_uppercase();
-        if let Some(metrics) = app.tickers.get(&ticker_upper) {
-            let imbalance = metrics.orderflow.imbalance_pct();
-            let net_flow = metrics.orderflow.net_flow();
-            let trend = metrics.orderflow.trend_arrow();
-
-            // Progress bar
-            let filled = (imbalance / 10.0).round() as usize;
-            let bar = format!(
+    for ticker in tickers() {
+        if let Some(t) = snapshot.tickers.get(ticker) {
+            // 1m view
+            let imb_1m = t.orderflow_1m.imbalance_pct;
+            let flow_1m = t.orderflow_1m.net_flow_per_min;
+            let bar_1m = format!(
                 "[{}{}]",
-                "█".repeat(filled.min(10)),
-                "░".repeat(10 - filled.min(10))
+                "█".repeat(((imb_1m / 10.0).round() as usize).min(10)),
+                "░".repeat(10 - ((imb_1m / 10.0).round() as usize).min(10))
             );
-
-            // Color based on imbalance
-            let color = if imbalance >= 60.0 {
+            let color_1m = if imb_1m >= 60.0 {
                 Color::Green
-            } else if imbalance <= 40.0 {
+            } else if imb_1m <= 40.0 {
                 Color::Red
             } else {
                 Color::Yellow
             };
 
-            let line = Line::from(vec![
-                Span::raw(format!("{:3}  ", ticker_upper)),
-                Span::styled(bar, Style::default().fg(color)),
-                Span::styled(
-                    format!(" {:>3.0}% ", imbalance),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(if imbalance >= 50.0 { "BUY" } else { "SELL" }),
-                Span::raw(format!(
-                    "   Δ {:>+.1}M/min {}",
-                    net_flow / 1_000_000.0,
-                    trend
-                )),
-            ]);
+            // 5m view
+            let imb_5m = t.orderflow_5m.imbalance_pct;
+            let flow_5m = t.orderflow_5m.net_flow_per_min * 5.0 / 5.0; // per min already
+            let bar_5m = format!(
+                "[{}{}]",
+                "█".repeat(((imb_5m / 10.0).round() as usize).min(10)),
+                "░".repeat(10 - ((imb_5m / 10.0).round() as usize).min(10))
+            );
+            let color_5m = if imb_5m >= 60.0 {
+                Color::Green
+            } else if imb_5m <= 40.0 {
+                Color::Red
+            } else {
+                Color::Yellow
+            };
 
-            lines.push(line);
+            // Trend hint
+            let trend = if imb_1m > imb_5m + 5.0 {
+                "ACCEL"
+            } else if imb_1m + 5.0 < imb_5m {
+                "FADING"
+            } else {
+                "STABLE"
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:3}:", ticker),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("   1m "),
+                Span::styled(bar_1m, Style::default().fg(color_1m)),
+                Span::styled(
+                    format!(" {:>3.0}% Δ {:>+.1}M/min  ", imb_1m, flow_1m / 1_000_000.0),
+                    Style::default().fg(color_1m),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("   5m "),
+                Span::styled(bar_5m, Style::default().fg(color_5m)),
+                Span::styled(
+                    format!(" {:>3.0}% Δ {:>+.1}M/min  {}", imb_5m, flow_5m / 1_000_000.0, trend),
+                    Style::default().fg(color_5m),
+                ),
+            ]));
+            lines.push(Line::from(Span::raw("")));
         }
     }
 
@@ -635,129 +285,164 @@ fn render_orderflow_panel(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
         )));
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: true });
-
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
 }
 
-/// Panel 2: Spot vs Perp Basis
-fn render_basis_panel(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
+fn render_basis_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot) {
     let block = Block::default()
         .title(" SPOT vs PERP BASIS ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let mut lines = vec![Line::from(Span::styled(
-        "Data not available",
-        Style::default().fg(Color::DarkGray),
-    ))];
+    let mut lines = Vec::new();
 
-    // Placeholder: would need spot price data
-    // For now, show estimated basis from spread
-    for ticker in TICKERS {
-        let ticker_upper = ticker.to_uppercase();
-        if let Some(metrics) = app.tickers.get(&ticker_upper) {
-            if let (Some(_price), Some(spread_pct)) = (metrics.latest_price, metrics.latest_spread)
-            {
-                // Estimate basis from spread (placeholder)
-                let est_basis_pct = spread_pct * 10.0; // Rough estimate
-                let state = if est_basis_pct > 0.5 {
-                    ("STEEP", Color::Red)
-                } else if est_basis_pct > 0.0 {
-                    ("CONTANGO", Color::Yellow)
-                } else {
-                    ("BACKWRD", Color::Blue)
+    for ticker in tickers() {
+        if let Some(t) = snapshot.tickers.get(ticker) {
+            if let Some(basis) = &t.basis {
+                let (state_label, state_color) = match basis.state {
+                    BasisState::Contango => ("CONTANGO", Color::Yellow),
+                    BasisState::Backwardation => ("BACKWRD", Color::Blue),
+                    BasisState::Unknown => ("NEUTRAL", Color::Gray),
                 };
 
-                lines = vec![Line::from(vec![
-                    Span::raw(format!("{:3}  ", ticker_upper)),
+                let mut label = state_label.to_string();
+                if basis.steep {
+                    label.push_str(" STEEP");
+                }
+
+                // Format absolute basis in USD and percent
+                let usd = basis.basis_usd;
+                let usd_str = format!("{:+.2}", usd);
+
+                lines.push(Line::from(vec![
+                    Span::raw(format!("{:3}  ", ticker)),
                     Span::styled(
-                        format!("{:>+.2}%  ", est_basis_pct),
-                        Style::default().fg(state.1),
+                        format!("${} ({:+.2}%) ", usd_str, basis.basis_pct),
+                        Style::default().fg(state_color),
                     ),
-                    Span::styled(state.0, Style::default().fg(state.1)),
-                ])];
-                break;
+                    Span::styled(label, Style::default().fg(state_color)),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw(format!("{:3}  ", ticker)),
+                    Span::styled("N/A", Style::default().fg(Color::DarkGray)),
+                ]));
             }
         }
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: true });
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Waiting for basis data...",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
+    // Cache last rendered lines to avoid flicker; update only on content change
+    static BASIS_CACHE: OnceLock<std::sync::Mutex<Option<Vec<Line>>>> = OnceLock::new();
+    let cache = BASIS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+
+    let snapshot_text: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect::<Vec<_>>().join(""))
+        .collect();
+
+    let mut cached = cache.lock().unwrap();
+    let update = cached
+        .as_ref()
+        .map(|old| {
+            let old_text: Vec<String> = old
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.clone()).collect::<Vec<_>>().join(""))
+                .collect();
+            old_text != snapshot_text
+        })
+        .unwrap_or(true);
+
+    if update {
+        *cached = Some(lines.clone());
+    }
+
+    let to_render = cached.as_ref().cloned().unwrap_or_else(|| lines.clone());
+    let paragraph = Paragraph::new(to_render).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
 }
 
-/// Panel 3: Liquidation Clusters
-fn render_liquidation_panel(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
+fn render_liquidation_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot) {
     let block = Block::default()
         .title(" LIQUIDATION CLUSTERS ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let mut lines = vec![];
+    let mut lines = Vec::new();
+    let max_rows = area.height.saturating_sub(3) as usize;
 
-    // Find ticker with most recent liquidations
-    let mut best_ticker = None;
-    let mut max_liqs = 0;
-
-    for (ticker, metrics) in &app.tickers {
-        let total = metrics.liquidations.len();
-        if total > max_liqs {
-            max_liqs = total;
-            best_ticker = Some((ticker, metrics));
-        }
-    }
-
-    if let Some((ticker, metrics)) = best_ticker {
-        // Group by price buckets and sort by volume
-        let mut clusters: Vec<_> = metrics
-            .liq_clusters
-            .iter()
-            .map(|(bucket, events)| {
-                let price_level = (*bucket as f64) * LIQ_BUCKET_SIZE;
-                let total_volume: f64 = events.iter().map(|e| e.volume_usd).sum();
-                let long_count = events.iter().filter(|e| e.side == Side::Buy).count();
-                let short_count = events.iter().filter(|e| e.side == Side::Sell).count();
-
-                (price_level, total_volume, long_count, short_count)
-            })
-            .collect();
-
-        clusters.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-        lines.push(Line::from(Span::styled(
-            format!("{} Liquidations:", ticker),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )));
-
-        for (price, volume, longs, shorts) in
-            clusters.iter().take(MAX_LIQ_CLUSTERS)
-        {
-            let danger = if *volume > 1_000_000.0 {
-                " DANGER ZONE"
-            } else {
-                ""
-            };
-
-            let bar_width = (volume / 1_000_000.0).min(10.0) as usize;
-            let bar = "█".repeat(bar_width);
-
-            let color = if !danger.is_empty() {
-                Color::Red
-            } else {
-                Color::Yellow
-            };
-
+    for ticker in tickers() {
+        if let Some(t) = snapshot.tickers.get(ticker) {
             lines.push(Line::from(vec![
-                Span::raw(format!("${:.1}K ", price / 1000.0)),
-                Span::styled(format!("{:10}", bar), Style::default().fg(color)),
-                Span::raw(format!(" ({} L, {} S)", longs, shorts)),
-                Span::styled(danger, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{}: ", ticker),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "rate {:.1}/min  bucket ${}  window 10m",
+                        t.liq_rate_per_min, t.liq_bucket as i64
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]));
+
+            if t.liquidations.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  No liquidations detected",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                continue;
+            }
+
+            let max_volume = t
+                .liquidations
+                .iter()
+                .map(|c| c.total_usd)
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+
+            for cluster in t.liquidations.iter().take(max_rows.saturating_sub(1)) {
+                let normalized = (cluster.total_usd / max_volume).clamp(0.0, 1.0);
+                // Keep bars compact so multiple rows fit nicely
+                let bar_space = area.width.saturating_sub(36).max(10) as usize;
+                let bar_len = ((normalized * bar_space as f64).ceil() as usize).max(1);
+                let bar = "█".repeat(bar_len);
+                let danger = cluster.total_usd > liq_display_danger_threshold();
+                let color = if danger { Color::Red } else { Color::Yellow };
+
+                let usd_display = if cluster.total_usd >= 1_000_000.0 {
+                    format!("{:.1}M", cluster.total_usd / 1_000_000.0)
+                } else {
+                    format!("{:.0}K", cluster.total_usd / 1_000.0)
+                };
+
+                lines.push(Line::from(vec![
+                    Span::raw(format!("${:.0}  ", cluster.price_level)),
+                    Span::styled(bar, Style::default().fg(color)),
+                    Span::raw(format!(
+                        " ({:>5} | {} L / {} S)",
+                        usd_display, cluster.long_count, cluster.short_count
+                    )),
+                    if danger {
+                        Span::styled(
+                            " DANGER",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Span::raw("")
+                    },
+                ]));
+            }
         }
     }
 
@@ -768,78 +453,115 @@ fn render_liquidation_panel(f: &mut ratatui::Frame, area: Rect, app: &AppState) 
         )));
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: true });
-
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
 }
 
-/// Panel 4: Funding Momentum
-fn render_funding_panel(f: &mut ratatui::Frame, area: Rect, _app: &AppState) {
+fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot) {
     let block = Block::default()
-        .title(" FUNDING MOMENTUM ")
+        .title(" MARKET STATS (5m) ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let lines = vec![Line::from(Span::styled(
-        "Data not available",
-        Style::default().fg(Color::DarkGray),
-    ))];
+    let mut lines = Vec::new();
 
-    // Placeholder: would need funding rate data
-    // Format would be:
-    // BTC: 0.012% ↑↑ LONGS PAY
-    // ETH: -0.008% ↓ SHORTS PAY
-    // SOL: 0.045% ↑↑↑ EXTREME
+    for ticker in tickers() {
+        if let Some(t) = snapshot.tickers.get(ticker) {
+            // Dominance: take top 3 and show exchange-kind tags
+            let mut ex: Vec<_> = t.exchange_dominance.iter().collect();
+            ex.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let dom_str = ex
+                .iter()
+                .take(3)
+                .map(|(k, v)| format!("{} {:.0}%", abbreviate_exchange_kind(k), v))
+                .collect::<Vec<_>>()
+                .join(" | ");
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: true });
+            // Spread proxy
+            let spread_str = t
+                .latest_spread_pct
+                .map(|s| format!("{:.2}%", s))
+                .unwrap_or_else(|| "--".to_string());
 
-    f.render_widget(paragraph, area);
-}
+            // 5m stats
+            let vol_display = format!("${:.1}M", t.vol_5m / 1_000_000.0);
+            let avg_display = format!("${:.0}K/trade", t.avg_trade_usd_5m / 1_000.0);
+            let trades_display = format!("{:.0} t/5m", t.trades_5m as f64);
 
-/// Panel 5: Whale Detector (>$500K)
-fn render_whale_panel(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
-    let block = Block::default()
-        .title(" WHALE DETECTOR (>$500K) ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+            // Speed label
+            let speed_label = if t.trade_speed >= 8.0 {
+                "HIGH"
+            } else if t.trade_speed >= 4.0 {
+                "MED"
+            } else {
+                "LOW"
+            };
 
-    let mut lines = vec![];
-
-    // Collect all whale trades across tickers
-    let mut all_whales: Vec<(&str, &WhaleTrade)> = vec![];
-    for (ticker, metrics) in &app.tickers {
-        for whale in &metrics.whale_trades {
-            all_whales.push((ticker.as_str(), whale));
+            lines.push(Line::from(Span::styled(
+                format!("{:3}:", ticker),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::raw(format!(
+                "   {}  {}  {}  {}",
+                trades_display, vol_display, avg_display, ""
+            ))));
+            lines.push(Line::from(Span::raw(format!("   {}", dom_str))));
+            lines.push(Line::from(Span::raw(format!(
+                "   Speed: {:.1} t/s ({})  Spread: {}",
+                t.trade_speed, speed_label, spread_str
+            ))));
+            lines.push(Line::from(Span::raw("")));
         }
     }
 
-    // Sort by time (newest first)
-    all_whales.sort_by(|a, b| b.1.time.cmp(&a.1.time));
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No market stats available",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
-    for (ticker, whale) in all_whales.iter().take(MAX_WHALE_DISPLAY) {
-        let time_str = whale.time.format("%H:%M:%S");
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    f.render_widget(paragraph, area);
+}
+
+fn render_whale_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot) {
+    let threshold_k = whale_threshold_display() / 1_000.0;
+    let block = Block::default()
+        .title(format!(" WHALE DETECTOR (> ${:.0}K) ", threshold_k))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let available_rows = area.height.saturating_sub(2) as usize;
+    let display_limit = available_rows.max(5);
+
+    let mut whales = Vec::new();
+    for (ticker, snap) in &snapshot.tickers {
+        for w in &snap.whales {
+            whales.push((ticker.as_str(), w));
+        }
+    }
+
+    whales.sort_by(|a, b| b.1.time.cmp(&a.1.time));
+
+    let mut lines = Vec::new();
+    for (ticker, whale) in whales.into_iter().take(display_limit) {
+        let time_str = whale.time.with_timezone(&chrono::Utc).format("%H:%M:%S");
         let side_color = if whale.side == Side::Buy {
             Color::Green
         } else {
             Color::Red
         };
+        let mega = whale.volume_usd >= mega_whale_threshold();
 
-        let mega_flag = if whale.volume_usd >= MEGA_WHALE_THRESHOLD {
-            " ⚠️"
-        } else {
-            ""
-        };
-
-        let exchange_short = match whale.exchange.as_str() {
-            "BinanceFuturesUsd" => "BNC",
+        // Build exchange label from exchange abbreviation + market kind (SPOT/PERP/OTHER)
+        let exchange_abbrev = match whale.exchange.as_str() {
+            "BinanceFuturesUsd" | "BinanceSpot" => "BNC",
+            "BybitPerpetualsUsd" | "BybitSpot" => "BBT",
             "Okx" => "OKX",
-            "Bybit" => "BBT",
-            _ => "???",
+            other => other,
         };
+        let exch_label = format!("{}-{}", exchange_abbrev, whale.market_kind);
 
         lines.push(Line::from(vec![
             Span::raw(format!("{} ", time_str)),
@@ -853,14 +575,20 @@ fn render_whale_panel(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
             ),
             Span::styled(
                 format!("${:.1}M ", whale.volume_usd / 1_000_000.0),
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("@${:.1}K ", whale.price / 1000.0)),
             Span::styled(
-                format!("[{}]", exchange_short),
+                format!("[{}]", exch_label),
                 Style::default().fg(Color::Cyan),
             ),
-            Span::styled(mega_flag, Style::default().fg(Color::Red)),
+            if mega {
+                Span::styled(" ⚠️", Style::default().fg(Color::Red))
+            } else {
+                Span::raw("")
+            },
         ]));
     }
 
@@ -871,54 +599,215 @@ fn render_whale_panel(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
         )));
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: true });
-
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
 }
 
-/// Panel 6: CVD Divergence
-fn render_cvd_panel(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
+fn render_cvd_panel(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    snapshot: &AggregatedSnapshot,
+    connected: bool,
+) {
     let block = Block::default()
         .title(" CVD DIVERGENCE ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let mut lines = vec![];
+    let mut lines = Vec::new();
+    let log_debug = std::env::var("LOG_CVD_DEBUG").is_ok();
+    let mut binance_lines: Vec<Line> = Vec::new();
 
-    for ticker in TICKERS {
-        let ticker_upper = ticker.to_uppercase();
-        if let Some(metrics) = app.tickers.get(&ticker_upper) {
-            let signal = metrics.cvd_divergence();
-            let (label, color) = signal.display();
-            let desc = signal.description();
+    for ticker in tickers() {
+        if let Some(t) = snapshot.tickers.get(ticker) {
+            // Two horizons: 5m (main) and 1m (fast)
+            // Price direction: use tick direction over last minute
+            let price_dir = if t.tick_direction.uptick_pct >= 55.0 {
+                "↑"
+            } else if t.tick_direction.uptick_pct <= 45.0 {
+                "↓"
+            } else {
+                "→"
+            };
 
-            lines.push(Line::from(vec![
+            // Helper to render one horizon
+            let render_line = |label: &str,
+                               cvd_total: f64,
+                               price_dir: &str,
+                               cvd_label: &str,
+                               state: (&'static str, Color)| {
+                let (cvd_val, cvd_suf) = scale_number(cvd_total, true);
+                Line::from(vec![
+                    Span::raw(format!("   {}  {:+.2}{} | Price {} CVD {}  ", label, cvd_val, cvd_suf, price_dir, cvd_label)),
+                    Span::styled(
+                        state.0,
+                        Style::default().fg(state.1).add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            };
+
+            // 5m uses stored total_quote (pruned to 5m)
+            let cvd_total_5m = t.cvd.total_quote;
+            let cvd_dir_5m = if cvd_total_5m > 0.0 {
+                "↑"
+            } else if cvd_total_5m < 0.0 {
+                "↓"
+            } else {
+                "→"
+            };
+            let state_5m = divergence_label(divergence_from_dirs(price_dir, cvd_dir_5m));
+
+            // 1m uses rolling CVD total over 60s (from aggregator)
+            let cvd_total_1m = t.cvd_1m_total;
+            let cvd_dir_1m = if cvd_total_1m > 0.0 {
+                "↑"
+            } else if cvd_total_1m < 0.0 {
+                "↓"
+            } else {
+                "→"
+            };
+            let state_1m = divergence_label(divergence_from_dirs(price_dir, cvd_dir_1m));
+
+            if log_debug {
+                eprintln!(
+                    "[CVD-DEBUG] {} 5m raw={} 1m raw={} price_dir={} cvd_dir5={} cvd_dir1={}",
+                    ticker, cvd_total_5m, cvd_total_1m, price_dir, cvd_dir_5m, cvd_dir_1m
+                );
+            }
+
+            // Header per ticker
+            lines.push(Line::from(Span::styled(
+                format!("{:3}:", ticker),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(render_line("5m", cvd_total_5m, price_dir, cvd_dir_5m, state_5m));
+            lines.push(render_line("1m", cvd_total_1m, price_dir, cvd_dir_1m, state_1m));
+            lines.push(Line::from(Span::raw("")));
+
+            // Collect Binance-only detail for bottom section (flexible name match)
+            let bin_total: f64 = t
+                .cvd_per_exchange_5m
+                .iter()
+                .filter(|(ex, _)| {
+                    let ex_l = ex.to_lowercase();
+                    ex_l.contains("binance") && (ex_l.contains("perp") || ex_l.contains("future") || ex_l.contains("futures"))
+                })
+                .map(|(_, v)| *v)
+                .sum();
+            // Use 5m price direction to align with 5m CVD for this section
+            let price_dir_5m = if t.tick_direction_5m.uptick_pct >= 55.0 {
+                "↑"
+            } else if t.tick_direction_5m.uptick_pct <= 45.0 {
+                "↓"
+            } else {
+                "→"
+            };
+            let dir = if bin_total > 0.0 { "↑" } else if bin_total < 0.0 { "↓" } else { "→" };
+            let (val, suf) = scale_number(bin_total, true);
+            let state = divergence_label(divergence_from_dirs(price_dir_5m, dir));
+            binance_lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{:3}: ", ticker_upper),
+                    format!("{:3}:", ticker),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!("{} ", desc)),
+                Span::raw(format!(" {:+.2}{} | Price {} CVD {}", val, suf, price_dir_5m, dir)),
                 Span::styled(
-                    label,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    format!(" {}", state.0),
+                    Style::default().fg(state.1).add_modifier(Modifier::BOLD),
                 ),
             ]));
         }
     }
 
+    lines.push(Line::from(Span::styled(
+        "Binance (5m):",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+
+    // If no Binance entries were produced (e.g., no trades received), show a placeholder
+    if binance_lines.is_empty() {
+        lines.push(Line::from(Span::raw("   No Binance trades in the last 5m")));
+    }
+
+    lines.extend(binance_lines);
+
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            "Waiting for CVD data...",
+            if connected {
+                "Waiting for CVD data..."
+            } else {
+                "Disconnected"
+            },
             Style::default().fg(Color::DarkGray),
         )));
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .alignment(Alignment::Left)
-        .wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
 
     f.render_widget(paragraph, area);
+}
+
+fn divergence_label(signal: DivergenceSignal) -> (&'static str, Color) {
+    match signal {
+        DivergenceSignal::Bullish => ("BULLISH", Color::Green),
+        DivergenceSignal::Bearish => ("BEARISH", Color::Red),
+        DivergenceSignal::Aligned => ("ALIGNED", Color::Blue),
+        DivergenceSignal::Neutral => ("NEUTRAL", Color::Yellow),
+        DivergenceSignal::Unknown => ("---", Color::Gray),
+    }
+}
+
+fn divergence_from_dirs(price_dir: &str, cvd_dir: &str) -> DivergenceSignal {
+    match (price_dir, cvd_dir) {
+        ("↑", "↑") => DivergenceSignal::Bullish,
+        ("↓", "↓") => DivergenceSignal::Bearish,
+        ("↑", "↓") => DivergenceSignal::Bearish,
+        ("↓", "↑") => DivergenceSignal::Bullish,
+        _ => DivergenceSignal::Neutral,
+    }
+}
+
+/// Convert a verbose exchange name into the compact tag used in whales, including market kind.
+fn abbreviate_exchange_kind(name: &str) -> String {
+    let lower = name.to_lowercase();
+    let ex = if lower.contains("binance") {
+        "BNC"
+    } else if lower.contains("bybit") {
+        "BBT"
+    } else if lower.contains("okx") {
+        "OKX"
+    } else {
+        name
+    };
+
+    let kind = if lower.contains("spot") {
+        "SPOT"
+    } else if lower.contains("perp") || lower.contains("future") || lower.contains("futures") {
+        "PERP"
+    } else {
+        // Default to PERP for okx when kind not explicit; otherwise OTHER
+        if lower.contains("okx") {
+            "PERP"
+        } else {
+            "OTHER"
+        }
+    };
+
+    format!("{}-{}", ex, kind)
+}
+
+/// Scale large numbers into a compact value + suffix (K/M/B/T)
+fn scale_number(v: f64, clamp_to_b: bool) -> (f64, &'static str) {
+    let abs = v.abs();
+    if !clamp_to_b && abs >= 1_000_000_000_000.0 {
+        (v / 1_000_000_000_000.0, "T")
+    } else if abs >= 1_000_000_000.0 {
+        (v / 1_000_000_000.0, "B")
+    } else if abs >= 1_000_000.0 {
+        (v / 1_000_000.0, "M")
+    } else if abs >= 1_000.0 {
+        (v / 1_000.0, "K")
+    } else {
+        (v, "")
+    }
 }

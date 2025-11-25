@@ -1,11 +1,7 @@
 use barter_data::{
     error::DataError,
     event::{DataKind, MarketEvent},
-    streams::{
-        builder::dynamic::DynamicStreams,
-        consumer::MarketStreamResult,
-        reconnect::Event,
-    },
+    streams::{builder::dynamic::DynamicStreams, consumer::MarketStreamResult, reconnect::Event},
     subscription::open_interest::OpenInterest,
 };
 use barter_instrument::{
@@ -48,10 +44,21 @@ impl From<MarketEvent<MarketDataInstrument, DataKind>> for MarketEventMessage {
     fn from(event: MarketEvent<MarketDataInstrument, DataKind>) -> Self {
         let (kind_name, data) = match &event.kind {
             DataKind::Trade(trade) => ("trade", serde_json::to_value(trade).unwrap_or_default()),
-            DataKind::Liquidation(liq) => ("liquidation", serde_json::to_value(liq).unwrap_or_default()),
-            DataKind::OpenInterest(oi) => ("open_interest", serde_json::to_value(oi).unwrap_or_default()),
-            DataKind::CumulativeVolumeDelta(cvd) => ("cumulative_volume_delta", serde_json::to_value(cvd).unwrap_or_default()),
-            DataKind::OrderBookL1(ob) => ("order_book_l1", serde_json::to_value(ob).unwrap_or_default()),
+            DataKind::Liquidation(liq) => {
+                ("liquidation", serde_json::to_value(liq).unwrap_or_default())
+            }
+            DataKind::OpenInterest(oi) => (
+                "open_interest",
+                serde_json::to_value(oi).unwrap_or_default(),
+            ),
+            DataKind::CumulativeVolumeDelta(cvd) => (
+                "cumulative_volume_delta",
+                serde_json::to_value(cvd).unwrap_or_default(),
+            ),
+            DataKind::OrderBookL1(ob) => (
+                "order_book_l1",
+                serde_json::to_value(ob).unwrap_or_default(),
+            ),
             _ => ("other", serde_json::Value::Null),
         };
 
@@ -62,7 +69,11 @@ impl From<MarketEvent<MarketDataInstrument, DataKind>> for MarketEventMessage {
             instrument: InstrumentInfo {
                 base: event.instrument.base.to_string(),
                 quote: event.instrument.quote.to_string(),
-                kind: format!("{:?}", event.instrument.kind),
+                kind: match event.instrument.kind {
+                    MarketDataInstrumentKind::Spot => "Spot".to_string(),
+                    MarketDataInstrumentKind::Perpetual => "Perpetual".to_string(),
+                    _ => format!("{:?}", event.instrument.kind),
+                },
             },
             kind: kind_name.to_string(),
             data,
@@ -89,7 +100,11 @@ async fn main() {
     let tx = Arc::new(tx);
 
     // Start WebSocket server
-    let server_addr = "0.0.0.0:9001".parse::<SocketAddr>().unwrap();
+    // Configurable via WS_ADDR env var (default: 0.0.0.0:9001)
+    let server_addr_str = std::env::var("WS_ADDR").unwrap_or_else(|_| "0.0.0.0:9001".to_string());
+    let server_addr = server_addr_str
+        .parse::<SocketAddr>()
+        .unwrap_or_else(|_| "0.0.0.0:9001".parse().unwrap());
     let tx_clone = tx.clone();
     tokio::spawn(async move {
         start_websocket_server(server_addr, tx_clone).await;
@@ -117,15 +132,134 @@ async fn main() {
             }
             Event::Item(result) => match result {
                 Ok(market_event) => {
+                    // Debug logging for large spot trades to verify spot streams
+                    // Threshold configurable via SPOT_LOG_THRESHOLD env var (default: $50,000)
+                    if let DataKind::Trade(trade) = &market_event.kind {
+                        let spot_log_threshold = std::env::var("SPOT_LOG_THRESHOLD")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(50_000.0);
+                        let notional = trade.price * trade.amount;
+                        let is_spot =
+                            matches!(market_event.instrument.kind, MarketDataInstrumentKind::Spot);
+                        if is_spot && notional >= spot_log_threshold {
+                            info!(
+                                "SPOT TRADE >=50k {} {}/{} @ {} qty {} notional {} side {:?}",
+                                market_event.exchange,
+                                market_event.instrument.base,
+                                market_event.instrument.quote,
+                                trade.price,
+                                trade.amount,
+                                notional,
+                                trade.side
+                            );
+                        }
+                    }
+
+                    // Debug logging for liquidation events to verify flow
+                    if let DataKind::Liquidation(liq) = &market_event.kind {
+                        info!(
+                            "LIQ EVENT {} {}/{} @ {} qty {} side {:?}",
+                            market_event.exchange,
+                            market_event.instrument.base,
+                            market_event.instrument.quote,
+                            liq.price,
+                            liq.quantity,
+                            liq.side
+                        );
+                    }
+
+                    // Debug logging for open interest events
+                    if let DataKind::OpenInterest(oi) = &market_event.kind {
+                        info!(
+                            "OI EVENT {} {}/{} contracts: {} notional: {:?}",
+                            market_event.exchange,
+                            market_event.instrument.base,
+                            market_event.instrument.quote,
+                            oi.contracts,
+                            oi.notional
+                        );
+                    }
+
+                    let is_liquidation = matches!(&market_event.kind, DataKind::Liquidation(_));
+                    let is_open_interest = matches!(&market_event.kind, DataKind::OpenInterest(_));
+                    let is_trade = matches!(&market_event.kind, DataKind::Trade(_));
+
+                    // Extract notional value for trades
+                    let trade_notional = if let DataKind::Trade(t) = &market_event.kind {
+                        Some(t.price * t.amount)
+                    } else {
+                        None
+                    };
+
                     let message = MarketEventMessage::from(market_event);
 
+                    // Debug: log broadcast attempt for all event types
+                    if is_trade {
+                        let receivers = tx.receiver_count();
+                        info!(
+                            "TRADE→{} clients: {} {} {}/{} ${:.0}",
+                            receivers,
+                            message.exchange,
+                            message.instrument.kind,
+                            message.instrument.base,
+                            message.instrument.quote,
+                            trade_notional.unwrap_or(0.0)
+                        );
+                    }
+                    if is_liquidation {
+                        let receivers = tx.receiver_count();
+                        info!(
+                            "BROADCASTING liquidation to {} clients: {} {}/{}",
+                            receivers,
+                            message.exchange,
+                            message.instrument.base,
+                            message.instrument.quote
+                        );
+                    }
+                    if is_open_interest {
+                        let receivers = tx.receiver_count();
+                        info!(
+                            "BROADCASTING open_interest to {} clients: {} {}/{}",
+                            receivers,
+                            message.exchange,
+                            message.instrument.base,
+                            message.instrument.quote
+                        );
+                    }
+
                     // Broadcast to all connected clients (ignore errors if no receivers)
-                    let _ = tx.send(message);
+                    match tx.send(message) {
+                        Ok(count) => {
+                            if is_trade {
+                                debug!("Trade sent to {} receivers", count);
+                            }
+                            if is_liquidation {
+                                debug!("Liquidation sent to {} receivers", count);
+                            }
+                            if is_open_interest {
+                                debug!("OpenInterest sent to {} receivers", count);
+                            }
+                        }
+                        Err(e) => {
+                            if is_trade {
+                                warn!("Failed to broadcast trade: {:?}", e);
+                            }
+                            if is_liquidation {
+                                warn!("Failed to broadcast liquidation: {:?}", e);
+                            }
+                            if is_open_interest {
+                                warn!("Failed to broadcast open_interest: {:?}", e);
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
                     // Filter out known non-errors
                     let error_str = format!("{:?}", error);
-                    if !error_str.contains("payload: pong") && !error_str.contains("liquidation-orders|SWAP") {
+                    if !error_str.contains("payload: pong")
+                        && !error_str.contains("liquidation-orders|SWAP")
+                    {
                         debug!("Market stream error: {:?}", error);
                     }
                 }
@@ -240,55 +374,188 @@ async fn handle_client(
 
 /// Initialize market data streams (same as the example)
 async fn init_market_streams() -> DynamicStreams<MarketDataInstrument> {
-    use barter_data::subscription::SubKind;
     use ExchangeId::*;
     use MarketDataInstrumentKind::*;
     use SubKind::*;
+    use barter_data::subscription::SubKind;
 
     DynamicStreams::init([
+        // === SPOT SUBSCRIPTIONS (for basis calculation) ===
+        // Bybit Spot
         vec![
-            (BybitPerpetualsUsd, "btc", "usdt", Perpetual, OpenInterest),
+            (BybitSpot, "btc", "usdt", Spot, OrderBooksL1),
+            (BybitSpot, "eth", "usdt", Spot, OrderBooksL1),
+            (BybitSpot, "sol", "usdt", Spot, OrderBooksL1),
         ],
         vec![
-            (BybitPerpetualsUsd, "btc", "usdt", Perpetual, Liquidations),
+            (BybitSpot, "btc", "usdt", Spot, PublicTrades),
+            (BybitSpot, "eth", "usdt", Spot, PublicTrades),
+            (BybitSpot, "sol", "usdt", Spot, PublicTrades),
+        ],
+        // Binance Spot
+        vec![
+            (BinanceSpot, "btc", "usdt", Spot, OrderBooksL1),
+            (BinanceSpot, "eth", "usdt", Spot, OrderBooksL1),
+            (BinanceSpot, "sol", "usdt", Spot, OrderBooksL1),
         ],
         vec![
-            (BybitPerpetualsUsd, "btc", "usdt", Perpetual, CumulativeVolumeDelta),
+            (BinanceSpot, "btc", "usdt", Spot, PublicTrades),
+            (BinanceSpot, "eth", "usdt", Spot, PublicTrades),
+            (BinanceSpot, "sol", "usdt", Spot, PublicTrades),
         ],
+        // OKX Spot (OrderBooksL1 unsupported) -> skip L1, keep trades for basis estimation
         vec![
-            (BinanceFuturesUsd, "btc", "usdt", Perpetual, Liquidations),
+            (Okx, "btc", "usdt", Spot, PublicTrades),
+            (Okx, "eth", "usdt", Spot, PublicTrades),
+            (Okx, "sol", "usdt", Spot, PublicTrades),
         ],
-        vec![
-            (BinanceFuturesUsd, "btc", "usdt", Perpetual, CumulativeVolumeDelta),
-        ],
-        vec![
-            (Okx, "btc", "usdt", Perpetual, OpenInterest),
-        ],
-        vec![
-            (Okx, "btc", "usdt", Perpetual, Liquidations),
-        ],
-        vec![
-            (Okx, "btc", "usdt", Perpetual, CumulativeVolumeDelta),
-        ],
-        vec![
-            (BinanceFuturesUsd, "btc", "usdt", Perpetual, OrderBooksL1),
-        ],
-        vec![
-            (BybitPerpetualsUsd, "btc", "usdt", Perpetual, OrderBooksL1),
-        ],
-        vec![
-            (BinanceFuturesUsd, "btc", "usdt", Perpetual, PublicTrades),
-        ],
-        vec![
-            (BybitPerpetualsUsd, "btc", "usdt", Perpetual, PublicTrades),
-        ],
-        vec![
-            (Okx, "btc", "usdt", Perpetual, PublicTrades),
-        ],
+        // === PERPETUAL SUBSCRIPTIONS ===
+        // BTC Perpetuals
+        vec![(BybitPerpetualsUsd, "btc", "usdt", Perpetual, OpenInterest)],
+        vec![(BybitPerpetualsUsd, "btc", "usdt", Perpetual, Liquidations)],
+        vec![(
+            BybitPerpetualsUsd,
+            "btc",
+            "usdt",
+            Perpetual,
+            CumulativeVolumeDelta,
+        )],
+        vec![(BinanceFuturesUsd, "btc", "usdt", Perpetual, Liquidations)],
+        vec![(
+            BinanceFuturesUsd,
+            "btc",
+            "usdt",
+            Perpetual,
+            CumulativeVolumeDelta,
+        )],
+        vec![(Okx, "btc", "usdt", Perpetual, OpenInterest)],
+        vec![(Okx, "btc", "usdt", Perpetual, Liquidations)],
+        vec![(Okx, "btc", "usdt", Perpetual, CumulativeVolumeDelta)],
+        vec![(BinanceFuturesUsd, "btc", "usdt", Perpetual, OrderBooksL1)],
+        vec![(BybitPerpetualsUsd, "btc", "usdt", Perpetual, OrderBooksL1)],
+        vec![(BinanceFuturesUsd, "btc", "usdt", Perpetual, PublicTrades)],
+        vec![(BybitPerpetualsUsd, "btc", "usdt", Perpetual, PublicTrades)],
+        vec![(Okx, "btc", "usdt", Perpetual, PublicTrades)],
+        // ETH Perpetuals
+        vec![(BybitPerpetualsUsd, "eth", "usdt", Perpetual, OpenInterest)],
+        vec![(BybitPerpetualsUsd, "eth", "usdt", Perpetual, Liquidations)],
+        vec![(
+            BybitPerpetualsUsd,
+            "eth",
+            "usdt",
+            Perpetual,
+            CumulativeVolumeDelta,
+        )],
+        vec![(BinanceFuturesUsd, "eth", "usdt", Perpetual, Liquidations)],
+        vec![(
+            BinanceFuturesUsd,
+            "eth",
+            "usdt",
+            Perpetual,
+            CumulativeVolumeDelta,
+        )],
+        vec![(Okx, "eth", "usdt", Perpetual, OpenInterest)],
+        vec![(Okx, "eth", "usdt", Perpetual, Liquidations)],
+        vec![(Okx, "eth", "usdt", Perpetual, CumulativeVolumeDelta)],
+        vec![(BinanceFuturesUsd, "eth", "usdt", Perpetual, OrderBooksL1)],
+        vec![(BybitPerpetualsUsd, "eth", "usdt", Perpetual, OrderBooksL1)],
+        vec![(BinanceFuturesUsd, "eth", "usdt", Perpetual, PublicTrades)],
+        vec![(BybitPerpetualsUsd, "eth", "usdt", Perpetual, PublicTrades)],
+        vec![(Okx, "eth", "usdt", Perpetual, PublicTrades)],
+        // SOL Perpetuals
+        vec![(BybitPerpetualsUsd, "sol", "usdt", Perpetual, OpenInterest)],
+        vec![(BybitPerpetualsUsd, "sol", "usdt", Perpetual, Liquidations)],
+        vec![(
+            BybitPerpetualsUsd,
+            "sol",
+            "usdt",
+            Perpetual,
+            CumulativeVolumeDelta,
+        )],
+        vec![(BinanceFuturesUsd, "sol", "usdt", Perpetual, Liquidations)],
+        vec![(
+            BinanceFuturesUsd,
+            "sol",
+            "usdt",
+            Perpetual,
+            CumulativeVolumeDelta,
+        )],
+        vec![(Okx, "sol", "usdt", Perpetual, OpenInterest)],
+        vec![(Okx, "sol", "usdt", Perpetual, Liquidations)],
+        vec![(Okx, "sol", "usdt", Perpetual, CumulativeVolumeDelta)],
+        vec![(BinanceFuturesUsd, "sol", "usdt", Perpetual, OrderBooksL1)],
+        vec![(BybitPerpetualsUsd, "sol", "usdt", Perpetual, OrderBooksL1)],
+        vec![(BinanceFuturesUsd, "sol", "usdt", Perpetual, PublicTrades)],
+        vec![(BybitPerpetualsUsd, "sol", "usdt", Perpetual, PublicTrades)],
+        vec![(Okx, "sol", "usdt", Perpetual, PublicTrades)],
     ])
     .await
     .expect("Failed to initialize market streams")
 }
+
+/// (unused) dedicated liquidation stream builder -- kept for reference
+/// NOTE: not used in the main pipeline; DynamicStreams already carries liquidations.
+// async fn init_liquidation_streams()
+// -> Streams<MarketEvent<MarketDataInstrument, barter_data::subscription::liquidation::Liquidation>> {
+//     use ExchangeId::*;
+//     use MarketDataInstrumentKind::*;
+//
+//     Streams::builder::<MarketDataInstrument, Liquidations>()
+//         .subscribe([
+//             (
+//                 BinanceFuturesUsd::default(),
+//                 "btc",
+//                 "usdt",
+//                 Perpetual,
+//                 Liquidations,
+//             ),
+//             (
+//                 BybitPerpetualsUsd::default(),
+//                 "btc",
+//                 "usdt",
+//                 Perpetual,
+//                 Liquidations,
+//             ),
+//             (Okx::default(), "btc", "usdt", Perpetual, Liquidations),
+//         ])
+//         .subscribe([
+//             (
+//                 BinanceFuturesUsd::default(),
+//                 "eth",
+//                 "usdt",
+//                 Perpetual,
+//                 Liquidations,
+//             ),
+//             (
+//                 BybitPerpetualsUsd::default(),
+//                 "eth",
+//                 "usdt",
+//                 Perpetual,
+//                 Liquidations,
+//             ),
+//             (Okx::default(), "eth", "usdt", Perpetual, Liquidations),
+//         ])
+//         .subscribe([
+//             (
+//                 BinanceFuturesUsd::default(),
+//                 "sol",
+//                 "usdt",
+//                 Perpetual,
+//                 Liquidations,
+//             ),
+//             (
+//                 BybitPerpetualsUsd::default(),
+//                 "sol",
+//                 "usdt",
+//                 Perpetual,
+//                 Liquidations,
+//             ),
+//             (Okx::default(), "sol", "usdt", Perpetual, Liquidations),
+//         ])
+//         .init()
+//         .await
+//         .expect("Failed to init liquidation streams")
+// }
 
 /// Binance REST API response for open interest
 #[derive(Debug, Deserialize)]
@@ -303,7 +570,7 @@ struct BinanceOpenInterestResponse {
 
 /// Build a combined Stream of Binance open-interest polling events (REST fallback)
 fn binance_open_interest_stream()
-    -> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> {
+-> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> {
     let specs = vec![
         (
             "BTCUSDT",
@@ -343,7 +610,12 @@ fn binance_open_interest_poller(
     );
 
     stream::unfold(
-        (client, url, interval(std::time::Duration::from_secs(10)), instrument),
+        (
+            client,
+            url,
+            interval(std::time::Duration::from_secs(10)),
+            instrument,
+        ),
         move |(client, url, mut timer, instrument)| async move {
             timer.tick().await;
 

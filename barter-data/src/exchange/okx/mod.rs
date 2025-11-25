@@ -109,8 +109,11 @@ impl Connector for Okx {
 
                     let inst_type = match parts.last().copied().unwrap_or_default() {
                         last if last.eq_ignore_ascii_case("swap") => "SWAP",
-                        last if last.eq_ignore_ascii_case("c") || last.eq_ignore_ascii_case("p") =>
-                            "OPTION",
+                        last if last.eq_ignore_ascii_case("c")
+                            || last.eq_ignore_ascii_case("p") =>
+                        {
+                            "OPTION"
+                        }
                         _ => "FUTURES",
                     };
 

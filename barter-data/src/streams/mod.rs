@@ -17,6 +17,9 @@ pub mod consumer;
 /// for generating an auto reconnecting `Stream`.
 pub mod reconnect;
 
+/// Timeout wrapper for WebSocket streams to detect silent disconnections.
+pub mod timeout;
+
 /// Ergonomic collection of exchange market event receivers.
 #[derive(Debug)]
 pub struct Streams<T> {

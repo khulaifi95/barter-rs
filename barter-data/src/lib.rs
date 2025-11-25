@@ -168,8 +168,9 @@ pub mod books;
 pub mod transformer;
 
 /// Convenient type alias for an [`ExchangeStream`] utilizing a tungstenite
-/// [`WebSocket`](barter_integration::protocol::websocket::WebSocket).
-pub type ExchangeWsStream<Parser, Transformer> = ExchangeStream<Parser, WsStream, Transformer>;
+/// [`WebSocket`](barter_integration::protocol::websocket::WebSocket) with timeout detection.
+pub type ExchangeWsStream<Parser, Transformer> =
+    ExchangeStream<Parser, streams::timeout::TimeoutStream<WsStream>, Transformer>;
 
 /// Defines a generic identification type for the implementor.
 pub trait Identifier<T> {
@@ -248,6 +249,10 @@ where
 
         // Split WebSocket into WsStream & WsSink components
         let (ws_sink, ws_stream) = websocket.split();
+
+        // Wrap the stream with a timeout detector to catch silent disconnections
+        // This is critical for exchanges like Binance that can silently stop sending data
+        let ws_stream = streams::timeout::TimeoutStream::with_default_timeout(ws_stream);
 
         // Spawn task to distribute Transformer messages (eg/ custom pongs) to the exchange
         let (ws_sink_tx, ws_sink_rx) = mpsc::unbounded_channel();

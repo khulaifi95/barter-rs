@@ -1,7 +1,6 @@
 /// Aggregation utilities for market data analysis
 ///
 /// Provides common calculations and aggregations for market microstructure analysis
-
 use std::collections::VecDeque;
 
 /// Volume-Weighted Average Price (VWAP) calculator

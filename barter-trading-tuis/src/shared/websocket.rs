@@ -1,7 +1,6 @@
 /// WebSocket client for connecting to the aggregated market data server
 ///
 /// Provides automatic reconnection, heartbeat, and event parsing
-
 use crate::shared::types::MarketEventMessage;
 use futures::{SinkExt, StreamExt};
 use std::time::Duration;
@@ -172,10 +171,8 @@ async fn run_websocket_loop(
                     match msg {
                         Ok(Message::Text(text)) => {
                             // Check if it's a welcome message
-                            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&text)
-                            {
-                                if json_val.get("type").and_then(|v| v.as_str())
-                                    == Some("welcome")
+                            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if json_val.get("type").and_then(|v| v.as_str()) == Some("welcome")
                                 {
                                     debug!("Received welcome message");
                                     continue;

@@ -4,7 +4,7 @@ use self::{
 };
 use crate::{
     ExchangeWsStream, NoInitialSnapshots,
-    exchange::{Connector, ExchangeServer, ExchangeSub, StreamSelector},
+    exchange::{Connector, ExchangeServer, ExchangeSub, PingInterval, StreamSelector},
     instrument::InstrumentData,
     subscriber::{WebSocketSubscriber, validator::WebSocketSubValidator},
     subscription::{Map, book::OrderBooksL1, trade::PublicTrades},
@@ -15,8 +15,15 @@ use barter_integration::{
     error::SocketError,
     protocol::websocket::{WebSocketSerdeParser, WsMessage},
 };
-use std::{fmt::Debug, marker::PhantomData};
+use std::{fmt::Debug, marker::PhantomData, time::Duration};
 use url::Url;
+
+/// Binance server [`PingInterval`] duration.
+///
+/// Binance WebSocket connections should receive periodic pings to stay alive.
+/// Sending pings every 30 seconds keeps the connection healthy.
+/// See: <https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#websocket-limits>
+pub const PING_INTERVAL_BINANCE: Duration = Duration::from_secs(30);
 
 /// OrderBook types common to both [`BinanceSpot`](spot::BinanceSpot) and
 /// [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
@@ -73,6 +80,16 @@ where
 
     fn url() -> Result<Url, SocketError> {
         Url::parse(Server::websocket_url()).map_err(SocketError::UrlParse)
+    }
+
+    fn ping_interval() -> Option<PingInterval> {
+        // Binance WebSocket connections benefit from periodic pings to keep the connection alive.
+        // This prevents silent disconnects that were causing stream failures.
+        Some(PingInterval {
+            interval: tokio::time::interval(PING_INTERVAL_BINANCE),
+            // Binance expects a pong response to ping frames; sending a ping frame triggers this
+            ping: || WsMessage::Ping(vec![].into()),
+        })
     }
 
     fn requests(exchange_subs: Vec<ExchangeSub<Self::Channel, Self::Market>>) -> Vec<WsMessage> {

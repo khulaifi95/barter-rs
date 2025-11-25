@@ -96,10 +96,13 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, OkxTrades)>
     for MarketIter<InstrumentKey, PublicTrade>
 {
     fn from((exchange, instrument, trades): (ExchangeId, InstrumentKey, OkxTrades)) -> Self {
+        eprintln!("[OKX TRADE DEBUG] Converting {} OKX trades to MarketEvents", trades.data.len());
         trades
             .data
             .into_iter()
             .map(|trade| {
+                eprintln!("[OKX TRADE DEBUG]   Trade: {} @ {} qty {} side {:?}",
+                    trade.id, trade.price, trade.amount, trade.side);
                 Ok(MarketEvent {
                     time_exchange: trade.time,
                     time_received: Utc::now(),
