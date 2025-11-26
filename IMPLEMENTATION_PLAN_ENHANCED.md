@@ -177,6 +177,7 @@ SOL  $-0.07 (-0.05%) BACKWRD
   - Defaults (tunable via env): Binance depth20@100ms; OKX books5@100ms (books@100ms if deeper needed); Bybit orderbook.50@20ms.
   - Effort: ~4–5h (server subs 2–3h; aggregation 1h; UI 30–60m; testing 30m).
   - Open choices: level counts per exchange (fast vs deep), update rates, aggregated vs per-venue view, configurable level counts.
+  - Current limitation: Only Binance/Bybit L2 are wired; OKX L2 requires upstream barter-data work (channels + transformer + subscription validation). BOOK will show `--` for OKX until that’s added.
 
 ### 2.1 Single Binary with View Modes
 

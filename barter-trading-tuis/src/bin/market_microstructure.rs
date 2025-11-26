@@ -203,9 +203,9 @@ fn render_ui(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot, 
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(28),
-            Constraint::Percentage(38),
-            Constraint::Percentage(34),
+            Constraint::Percentage(24), // Top row (reduced from 28%)
+            Constraint::Percentage(44), // Middle row - MARKET PULSE needs more space (increased from 38%)
+            Constraint::Percentage(32), // Bottom row (reduced from 34%)
         ])
         .split(area);
 
