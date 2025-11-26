@@ -24,7 +24,7 @@ pub use shared::aggregation::{calculate_vwap, VolumeWindow};
 
 // Aggregation engine (shared across all TUIs)
 pub use shared::state::{
-    AggregatedSnapshot, Aggregator, BasisMomentum, BasisState, BasisStats, BasisTrend,
-    CascadeLevel, CvdSummary, DivergenceSignal, FlowSignal, LiquidationCluster, OrderflowStats,
-    TickDirection, TickerSnapshot, WhaleRecord,
+    AggregatedSnapshot, Aggregator, BackfillResult, BasisMomentum, BasisState, BasisStats,
+    BasisTrend, CascadeLevel, CvdSummary, DivergenceSignal, FlowSignal, LiquidationCluster,
+    OrderflowStats, TickDirection, TickerSnapshot, TradingSession, VolTrend, WhaleRecord,
 };

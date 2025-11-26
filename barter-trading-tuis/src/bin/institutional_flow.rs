@@ -85,6 +85,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let aggregator = Arc::new(Mutex::new(Aggregator::new()));
     let connected = Arc::new(AtomicBool::new(false));
 
+    // Backfill tvVWAP and ATR from historical data on startup (silently)
+    {
+        let ticker_list: Vec<&str> = tickers().iter().map(|s| s.as_str()).collect();
+        let mut guard = aggregator.lock().await;
+        let _ = guard.backfill_all(&ticker_list).await;
+    }
+
     let ws_url = get_ws_url();
     let client =
         WebSocketClient::with_config(WebSocketConfig::new(ws_url).with_channel_buffer_size(50_000));
@@ -305,15 +312,46 @@ fn render_exchange_dominance_panel(f: &mut Frame, snapshot: &AggregatedSnapshot,
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta));
 
-    let mut totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    // Aggregate raw volume per exchange across all tickers, then recalculate %
+    let mut volume_by_exchange: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut total_volume = 0.0;
+
     for t in snapshot.tickers.values() {
+        let ticker_total = t.vol_5m.max(1.0); // Use 5m volume as proxy
         for (ex, pct) in &t.exchange_dominance {
-            *totals.entry(ex.clone()).or_insert(0.0) += *pct;
+            // Convert % back to approximate volume
+            let ex_vol = ticker_total * (*pct / 100.0);
+            *volume_by_exchange.entry(ex.clone()).or_insert(0.0) += ex_vol;
+            total_volume += ex_vol;
         }
     }
 
-    let mut exchanges: Vec<_> = totals.iter().collect();
-    exchanges.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+    // Convert back to percentages (now they'll sum to ~100%) and ensure BNC/BBT/OKX are visible if present
+    let mut exchanges: Vec<(String, f64)> = volume_by_exchange
+        .iter()
+        .map(|(ex, vol)| {
+            let pct = if total_volume > 0.0 {
+                (vol / total_volume) * 100.0
+            } else {
+                0.0
+            };
+            (ex.clone(), pct)
+        })
+        .collect();
+    exchanges.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    // Reorder to always show known exchanges first if they exist
+    let mut prioritized: Vec<(String, f64)> = Vec::new();
+    for key in ["binance", "bybit", "okx"] {
+        if let Some(pos) = exchanges.iter().position(|(ex, _)| ex.to_lowercase().contains(key)) {
+            prioritized.push(exchanges[pos].clone());
+        }
+    }
+    for item in exchanges.iter() {
+        if !prioritized.iter().any(|(ex, _)| ex == &item.0) {
+            prioritized.push(item.clone());
+        }
+    }
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -321,10 +359,20 @@ fn render_exchange_dominance_panel(f: &mut Frame, snapshot: &AggregatedSnapshot,
     let mut y = 0;
     for (exchange, pct) in exchanges.iter().take(inner.height as usize) {
         let bar_area = Rect::new(inner.x, inner.y + y, inner.width, 1);
-        let label = format!("{:>10}: {:>5.1}%", exchange, pct);
+        // Abbreviate exchange name
+        let ex_abbr = if exchange.to_lowercase().contains("binance") {
+            "Binance"
+        } else if exchange.to_lowercase().contains("bybit") {
+            "Bybit"
+        } else if exchange.to_lowercase().contains("okx") {
+            "OKX"
+        } else {
+            exchange.as_str()
+        };
+        let label = format!("{:>10}: {:>5.1}%", ex_abbr, pct);
         let gauge = Gauge::default()
             .gauge_style(Style::default().fg(Color::Blue).bg(Color::Black))
-            .ratio((**pct / 100.0).clamp(0.0, 1.0))
+            .ratio((pct / 100.0).clamp(0.0, 1.0))
             .label(label);
         f.render_widget(gauge, bar_area);
         y += 1;

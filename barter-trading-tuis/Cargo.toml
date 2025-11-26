@@ -35,6 +35,9 @@ futures = { workspace = true }
 # WebSocket
 tokio-tungstenite = { workspace = true }
 
+# HTTP Client for backfill
+reqwest = { version = "0.11", features = ["json"] }
+
 # SerDe
 serde = { workspace = true }
 serde_json = { workspace = true }

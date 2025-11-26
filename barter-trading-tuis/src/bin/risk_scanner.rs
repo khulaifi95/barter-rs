@@ -69,6 +69,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let aggregator = Arc::new(Mutex::new(Aggregator::new()));
     let connected = Arc::new(AtomicBool::new(false));
 
+    // Backfill tvVWAP and ATR from historical data on startup (silently)
+    {
+        let ticker_list: Vec<&str> = tickers().iter().map(|s| s.as_str()).collect();
+        let mut guard = aggregator.lock().await;
+        let _ = guard.backfill_all(&ticker_list).await;
+    }
+
     let ws_url = get_ws_url();
     let client =
         WebSocketClient::with_config(WebSocketConfig::new(ws_url).with_channel_buffer_size(50_000));

@@ -160,6 +160,24 @@ SOL  $-0.07 (-0.05%) BACKWRD
 
 **Priority: MEDIUM | Effort: MEDIUM | Impact: HIGH**
 
+### Verification & Requirements (before coding)
+- Health/observability: expose minimal metrics/logs (events/sec per exchange, active client count, reconnect/timeout counters) with acceptable thresholds.
+- Resource targets: cap sockets per exchange; monitor CPU/RSS for the unified process; define acceptable event-to-render lag.
+- Watchdog: on stalled feeds (timeout/idle), auto-reconnect and surface status in UI.
+- Backward compatibility: existing TUIs/binaries remain usable; unified TUI is additive; no protocol breakage.
+- Rollout: phased—build aggregator + new unified view, keep old TUIs intact; switch only after validation.
+- L2 Depth Plan (book imbalance): add after current stability work.
+  - Availability: Binance `depth20@100ms`, OKX `books5@100ms` (or `books@100ms` for deeper), Bybit `orderbook.50@20ms` (or `orderbook.200@200ms` slower).
+  - Rationale: for scalping/intraday, speed > extreme depth; top 20–50 levels capture actionable liquidity.
+  - Metrics: book imbalance within top N levels (per ticker; optional per venue), book flips, feed freshness.
+  - Display:
+    - TUI1 (Market Pulse): compact “Book: 63% BID” (or small bar) per ticker.
+    - Scalper: small panel with book imbalance/flips; optionally per venue.
+    - Risk Scanner: optional.
+  - Defaults (tunable via env): Binance depth20@100ms; OKX books5@100ms (books@100ms if deeper needed); Bybit orderbook.50@20ms.
+  - Effort: ~4–5h (server subs 2–3h; aggregation 1h; UI 30–60m; testing 30m).
+  - Open choices: level counts per exchange (fast vs deep), update rates, aggregated vs per-venue view, configurable level counts.
+
 ### 2.1 Single Binary with View Modes
 
 **Replace 3 binaries with 1:**
