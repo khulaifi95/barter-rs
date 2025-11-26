@@ -188,6 +188,103 @@ impl OrderBookL1Data {
     }
 }
 
+/// Order Book Level 2 (depth) event data
+///
+/// Contains multiple price levels for both bids and asks
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OrderBookL2Data {
+    /// Full orderbook snapshot
+    Snapshot(OrderBook),
+    /// Incremental update
+    Update(OrderBook),
+}
+
+/// Orderbook with bid and ask levels
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OrderBook {
+    /// Sequence number for ordering
+    #[serde(default)]
+    pub sequence: u64,
+    /// Last update time
+    #[serde(default)]
+    pub last_update_time: Option<DateTime<Utc>>,
+    /// Bid levels (price, amount) sorted by price descending
+    pub bids: Vec<Level>,
+    /// Ask levels (price, amount) sorted by price ascending
+    pub asks: Vec<Level>,
+}
+
+impl OrderBook {
+    /// Calculate the book imbalance ratio
+    /// Returns value from -1.0 (all asks) to +1.0 (all bids)
+    pub fn imbalance(&self, levels: usize) -> f64 {
+        let bid_vol: f64 = self.bids.iter().take(levels).map(|l| l.amount_f64()).sum();
+        let ask_vol: f64 = self.asks.iter().take(levels).map(|l| l.amount_f64()).sum();
+        let total = bid_vol + ask_vol;
+        if total > 0.0 {
+            (bid_vol - ask_vol) / total
+        } else {
+            0.0
+        }
+    }
+
+    /// Calculate the bid imbalance percentage (0-100%)
+    pub fn bid_imbalance_pct(&self, levels: usize) -> f64 {
+        let bid_vol: f64 = self.bids.iter().take(levels).map(|l| l.amount_f64()).sum();
+        let ask_vol: f64 = self.asks.iter().take(levels).map(|l| l.amount_f64()).sum();
+        let total = bid_vol + ask_vol;
+        if total > 0.0 {
+            (bid_vol / total) * 100.0
+        } else {
+            50.0
+        }
+    }
+
+    /// Get the best bid level
+    pub fn best_bid(&self) -> Option<&Level> {
+        self.bids.first()
+    }
+
+    /// Get the best ask level
+    pub fn best_ask(&self) -> Option<&Level> {
+        self.asks.first()
+    }
+
+    /// Calculate mid price
+    pub fn mid_price(&self) -> Option<f64> {
+        match (self.best_bid(), self.best_ask()) {
+            (Some(bid), Some(ask)) => Some((bid.price_f64() + ask.price_f64()) / 2.0),
+            _ => None,
+        }
+    }
+
+    /// Get total bid volume within N levels
+    pub fn bid_volume(&self, levels: usize) -> f64 {
+        self.bids.iter().take(levels).map(|l| l.amount_f64()).sum()
+    }
+
+    /// Get total ask volume within N levels
+    pub fn ask_volume(&self, levels: usize) -> f64 {
+        self.asks.iter().take(levels).map(|l| l.amount_f64()).sum()
+    }
+}
+
+impl OrderBookL2Data {
+    /// Get the underlying orderbook
+    pub fn book(&self) -> &OrderBook {
+        match self {
+            OrderBookL2Data::Snapshot(book) => book,
+            OrderBookL2Data::Update(book) => book,
+        }
+    }
+
+    /// Check if this is a snapshot
+    pub fn is_snapshot(&self) -> bool {
+        matches!(self, OrderBookL2Data::Snapshot(_))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

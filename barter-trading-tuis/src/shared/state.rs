@@ -429,6 +429,7 @@ pub struct TickerSnapshot {
     pub trades_5m: usize,
     pub vol_5m: f64,
     pub avg_trade_usd_5m: f64,
+    pub per_exchange_30s: HashMap<String, PerExchangeShortStats>,
     // OI with velocity (P1) - enhanced with per-exchange
     pub oi_total: f64,
     pub oi_delta_5m: f64,
@@ -466,6 +467,11 @@ pub struct TickerSnapshot {
     pub realized_vol_30m: Option<f64>,     // RV % over last 30 min (6 candles)
     pub realized_vol_1h: Option<f64>,      // RV % over last hour (12 candles)
     pub realized_vol_trend: VolTrend,      // EXPANDING, CONTRACTING, STABLE
+    // L2 Orderbook imbalance (per exchange and aggregated)
+    pub per_exchange_book_imbalance: HashMap<String, f64>, // Book imbalance by exchange (0-100%, 50% = balanced)
+    pub aggregated_book_imbalance: f64,                    // Combined book imbalance across all exchanges
+    pub book_flip_count: usize,                             // Number of imbalance flips in last 30s
+    pub book_freshness: HashMap<String, f64>,              // Seconds since last book update per exchange
 }
 
 #[derive(Clone, Debug, Default)]
@@ -574,6 +580,13 @@ pub struct BasisMomentum {
     pub delta_5m: f64,
     pub trend: BasisTrend,
     pub signal: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PerExchangeShortStats {
+    pub cvd_30s: f64,
+    pub total_30s: f64,
+    pub trades_30s: usize,
 }
 
 /// P1: Basis trend direction
@@ -724,6 +737,13 @@ impl Aggregator {
             "order_book_l1" => {
                 if let Ok(ob) = serde_json::from_value::<OrderBookL1Data>(event.data) {
                     state.push_orderbook(ob, is_spot, is_perp, event.time_exchange);
+                }
+            }
+            "order_book_l2" => {
+                use crate::shared::types::OrderBookL2Data;
+                if let Ok(ob_event) = serde_json::from_value::<OrderBookL2Data>(event.data) {
+                    let book = ob_event.book();
+                    state.push_orderbook_l2(book, &event.exchange, event.time_exchange);
                 }
             }
             _ => {}
@@ -925,6 +945,10 @@ struct TickerState {
     candles_5m: VecDeque<Candle5m>,
     current_candle: Option<Candle5m>,
     atr_state: AtrState,
+    // L2 Orderbook state per exchange
+    book_imbalance_by_exchange: HashMap<String, f64>,  // Current imbalance (0-100%, 50% = balanced)
+    book_last_update: HashMap<String, DateTime<Utc>>,  // Last update time per exchange
+    book_flip_history: VecDeque<(DateTime<Utc>, bool)>, // (time, was_bid_heavy) for flip detection
 }
 
 impl TickerState {
@@ -957,6 +981,9 @@ impl TickerState {
             candles_5m: VecDeque::with_capacity(15), // Keep 15 candles (14 for ATR + current)
             current_candle: None,
             atr_state: AtrState::default(),
+            book_imbalance_by_exchange: HashMap::new(),
+            book_last_update: HashMap::new(),
+            book_flip_history: VecDeque::new(),
         }
     }
 
@@ -1378,6 +1405,52 @@ impl TickerState {
         self.prune(time);
     }
 
+    /// Process L2 orderbook data for book imbalance tracking
+    fn push_orderbook_l2(
+        &mut self,
+        book: &crate::shared::types::OrderBook,
+        exchange: &str,
+        time: DateTime<Utc>,
+    ) {
+        // Calculate bid imbalance percentage (0-100%, 50% = balanced)
+        // Use top 20 levels for imbalance calculation
+        let imbalance_pct = book.bid_imbalance_pct(20);
+
+        // Check for flip (direction change)
+        let is_bid_heavy = imbalance_pct > 50.0;
+        if let Some((_, last_was_bid_heavy)) = self.book_flip_history.back() {
+            if *last_was_bid_heavy != is_bid_heavy {
+                // Direction changed - record the flip
+                self.book_flip_history.push_back((time, is_bid_heavy));
+            }
+        } else {
+            // First record
+            self.book_flip_history.push_back((time, is_bid_heavy));
+        }
+
+        // Prune old flip history (keep last 60 seconds)
+        let cutoff = time - ChronoDuration::seconds(60);
+        while let Some((flip_time, _)) = self.book_flip_history.front() {
+            if *flip_time < cutoff {
+                self.book_flip_history.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Store per-exchange imbalance
+        // Normalize exchange name to short form for display
+        let exchange_short = match exchange {
+            ex if ex.contains("Binance") => "BNC",
+            ex if ex.contains("Bybit") => "BBT",
+            ex if ex.contains("Okx") => "OKX",
+            _ => exchange,
+        };
+        self.book_imbalance_by_exchange
+            .insert(exchange_short.to_string(), imbalance_pct);
+        self.book_last_update.insert(exchange_short.to_string(), time);
+    }
+
     fn last_whale(&self, exchange: &str) -> Option<&str> {
         match &self.last_whale_exchange {
             Some(ex) if ex == exchange => self.last_whale_kind.as_deref(),
@@ -1547,6 +1620,7 @@ impl TickerState {
             cvd_velocity_1m,
             cvd_velocity_5m,
             cvd_velocity_15m,
+            per_exchange_30s: self.per_exchange_short_stats(30),
             oi_total,
             oi_delta_5m,
             oi_delta_15m,
@@ -1581,7 +1655,44 @@ impl TickerState {
             realized_vol_30m,
             realized_vol_1h,
             realized_vol_trend,
+            // L2 Orderbook imbalance
+            per_exchange_book_imbalance: self.book_imbalance_by_exchange.clone(),
+            aggregated_book_imbalance: self.aggregated_book_imbalance(),
+            book_flip_count: self.book_flip_count_30s(),
+            book_freshness: self.book_freshness_seconds(),
         }
+    }
+
+    /// Calculate aggregated book imbalance across all exchanges
+    fn aggregated_book_imbalance(&self) -> f64 {
+        if self.book_imbalance_by_exchange.is_empty() {
+            return 50.0; // Neutral
+        }
+        let sum: f64 = self.book_imbalance_by_exchange.values().sum();
+        sum / self.book_imbalance_by_exchange.len() as f64
+    }
+
+    /// Count book flips in the last 30 seconds
+    fn book_flip_count_30s(&self) -> usize {
+        let now = Utc::now();
+        let cutoff = now - ChronoDuration::seconds(30);
+        self.book_flip_history
+            .iter()
+            .filter(|(t, _)| *t >= cutoff)
+            .count()
+            .saturating_sub(1) // Don't count the initial state as a flip
+    }
+
+    /// Get seconds since last book update per exchange
+    fn book_freshness_seconds(&self) -> HashMap<String, f64> {
+        let now = Utc::now();
+        self.book_last_update
+            .iter()
+            .map(|(ex, last)| {
+                let age = (now - *last).num_milliseconds() as f64 / 1000.0;
+                (ex.clone(), age)
+            })
+            .collect()
     }
 
     /// Calculate realized volatility for a given number of candles
@@ -2052,6 +2163,42 @@ impl TickerState {
             }
         }
         totals
+    }
+
+    /// Per-exchange short-window stats (CVD/volume/trades) for scalper
+    fn per_exchange_short_stats(&self, window_secs: i64) -> HashMap<String, PerExchangeShortStats> {
+        let now = Utc::now();
+        let cutoff = now - ChronoDuration::seconds(window_secs);
+        let mut acc: HashMap<String, (f64, f64, usize)> = HashMap::new(); // exchange -> (buy_usd, sell_usd, trades)
+
+        for t in self.trades.iter().rev() {
+            if t.time < cutoff {
+                break;
+            }
+            if t.is_perp {
+                let entry = acc.entry(t.exchange.clone()).or_insert((0.0, 0.0, 0));
+                match t.side {
+                    Side::Buy => entry.0 += t.usd,
+                    Side::Sell => entry.1 += t.usd,
+                }
+                entry.2 += 1;
+            }
+        }
+
+        acc.into_iter()
+            .map(|(ex, (buy, sell, trades))| {
+                let total = buy + sell;
+                let cvd = buy - sell;
+                (
+                    ex,
+                    PerExchangeShortStats {
+                        cvd_30s: cvd,
+                        total_30s: total,
+                        trades_30s: trades,
+                    },
+                )
+            })
+            .collect()
     }
 
     fn cvd_divergence(&self) -> DivergenceSignal {

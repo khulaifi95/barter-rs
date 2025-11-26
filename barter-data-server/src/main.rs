@@ -59,6 +59,10 @@ impl From<MarketEvent<MarketDataInstrument, DataKind>> for MarketEventMessage {
                 "order_book_l1",
                 serde_json::to_value(ob).unwrap_or_default(),
             ),
+            DataKind::OrderBook(ob_event) => (
+                "order_book_l2",
+                serde_json::to_value(ob_event).unwrap_or_default(),
+            ),
             _ => ("other", serde_json::Value::Null),
         };
 
@@ -184,6 +188,7 @@ async fn main() {
                     let is_liquidation = matches!(&market_event.kind, DataKind::Liquidation(_));
                     let is_open_interest = matches!(&market_event.kind, DataKind::OpenInterest(_));
                     let is_trade = matches!(&market_event.kind, DataKind::Trade(_));
+                    let is_orderbook_l2 = matches!(&market_event.kind, DataKind::OrderBook(_));
 
                     // Extract notional value for trades
                     let trade_notional = if let DataKind::Trade(t) = &market_event.kind {
@@ -191,6 +196,16 @@ async fn main() {
                     } else {
                         None
                     };
+
+                    // Log L2 orderbook events at debug level (very high frequency)
+                    if is_orderbook_l2 {
+                        debug!(
+                            "L2_BOOK {} {}/{}",
+                            market_event.exchange,
+                            market_event.instrument.base,
+                            market_event.instrument.quote
+                        );
+                    }
 
                     let message = MarketEventMessage::from(market_event);
 
@@ -433,6 +448,9 @@ async fn init_market_streams() -> DynamicStreams<MarketDataInstrument> {
         vec![(Okx, "btc", "usdt", Perpetual, CumulativeVolumeDelta)],
         vec![(BinanceFuturesUsd, "btc", "usdt", Perpetual, OrderBooksL1)],
         vec![(BybitPerpetualsUsd, "btc", "usdt", Perpetual, OrderBooksL1)],
+        // BTC L2 Orderbook (separate WS connections due to high volume)
+        vec![(BinanceFuturesUsd, "btc", "usdt", Perpetual, OrderBooksL2)],
+        vec![(BybitPerpetualsUsd, "btc", "usdt", Perpetual, OrderBooksL2)],
         vec![(BinanceFuturesUsd, "btc", "usdt", Perpetual, PublicTrades)],
         vec![(BybitPerpetualsUsd, "btc", "usdt", Perpetual, PublicTrades)],
         vec![(Okx, "btc", "usdt", Perpetual, PublicTrades)],
@@ -459,6 +477,9 @@ async fn init_market_streams() -> DynamicStreams<MarketDataInstrument> {
         vec![(Okx, "eth", "usdt", Perpetual, CumulativeVolumeDelta)],
         vec![(BinanceFuturesUsd, "eth", "usdt", Perpetual, OrderBooksL1)],
         vec![(BybitPerpetualsUsd, "eth", "usdt", Perpetual, OrderBooksL1)],
+        // ETH L2 Orderbook
+        vec![(BinanceFuturesUsd, "eth", "usdt", Perpetual, OrderBooksL2)],
+        vec![(BybitPerpetualsUsd, "eth", "usdt", Perpetual, OrderBooksL2)],
         vec![(BinanceFuturesUsd, "eth", "usdt", Perpetual, PublicTrades)],
         vec![(BybitPerpetualsUsd, "eth", "usdt", Perpetual, PublicTrades)],
         vec![(Okx, "eth", "usdt", Perpetual, PublicTrades)],
@@ -485,6 +506,9 @@ async fn init_market_streams() -> DynamicStreams<MarketDataInstrument> {
         vec![(Okx, "sol", "usdt", Perpetual, CumulativeVolumeDelta)],
         vec![(BinanceFuturesUsd, "sol", "usdt", Perpetual, OrderBooksL1)],
         vec![(BybitPerpetualsUsd, "sol", "usdt", Perpetual, OrderBooksL1)],
+        // SOL L2 Orderbook
+        vec![(BinanceFuturesUsd, "sol", "usdt", Perpetual, OrderBooksL2)],
+        vec![(BybitPerpetualsUsd, "sol", "usdt", Perpetual, OrderBooksL2)],
         vec![(BinanceFuturesUsd, "sol", "usdt", Perpetual, PublicTrades)],
         vec![(BybitPerpetualsUsd, "sol", "usdt", Perpetual, PublicTrades)],
         vec![(Okx, "sol", "usdt", Perpetual, PublicTrades)],

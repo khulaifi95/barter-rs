@@ -801,6 +801,34 @@ fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggr
                 Span::styled(rv_label, Style::default().fg(rv_color)),
             ]));
 
+            // L2 Book Imbalance line (compact: "Book: 63% BID | BNC:65% BBT:58%")
+            let agg_imb = t.aggregated_book_imbalance;
+            let (book_label, book_color) = if agg_imb > 55.0 {
+                ("BID", Color::Green)
+            } else if agg_imb < 45.0 {
+                ("ASK", Color::Red)
+            } else {
+                ("BAL", Color::Yellow)
+            };
+
+            let bnc_imb = t.per_exchange_book_imbalance.get("BNC").copied().unwrap_or(50.0);
+            let bbt_imb = t.per_exchange_book_imbalance.get("BBT").copied().unwrap_or(50.0);
+
+            // Only show if we have book data
+            if !t.per_exchange_book_imbalance.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled(" Book: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{:.0}% {} ", agg_imb, book_label),
+                        Style::default().fg(book_color),
+                    ),
+                    Span::styled(
+                        format!("BNC:{:.0}% BBT:{:.0}%", bnc_imb, bbt_imb),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+
             // Spacer between tickers for readability
             lines.push(Line::from(Span::raw("")));
         }

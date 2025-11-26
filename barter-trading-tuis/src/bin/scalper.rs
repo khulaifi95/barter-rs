@@ -273,6 +273,7 @@ fn render_scalper_ui(
             Constraint::Length(6),  // Header: price + context + venue intel (4 lines)
             Constraint::Length(6),  // Delta velocity (compact with 1m)
             Constraint::Length(4),  // Imbalance + Tape speed (compact)
+            Constraint::Length(5),  // Per-venue strip
             Constraint::Min(5),     // Whale tape
             Constraint::Length(1),  // Footer
         ])
@@ -289,8 +290,9 @@ fn render_scalper_ui(
 
     render_imbalance_compact(f, metrics_row[0], snapshot, focused_ticker);
     render_tape_speed_compact(f, metrics_row[1], snapshot, focused_ticker);
-    render_whale_tape(f, chunks[3], snapshot, focused_ticker);
-    render_footer(f, chunks[4], focused_ticker);
+    render_per_exchange_strip(f, chunks[3], snapshot, focused_ticker);
+    render_whale_tape(f, chunks[4], snapshot, focused_ticker);
+    render_footer(f, chunks[5], focused_ticker);
 }
 
 fn render_header(
@@ -1054,6 +1056,130 @@ fn render_whale_tape(
     f.render_widget(paragraph, area);
 }
 
+fn render_per_exchange_strip(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    snapshot: &AggregatedSnapshot,
+    focused_ticker: &str,
+) {
+    let block = Block::default()
+        .title(" EXCHANGES (30s) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let mut lines = Vec::new();
+
+    if let Some(t) = snapshot.tickers.get(focused_ticker) {
+        // Header
+        lines.push(Line::from(vec![
+            Span::styled("     ", Style::default().fg(Color::DarkGray)),
+            Span::styled("OKX", Style::default().fg(Color::Yellow)),
+            Span::raw("     "),
+            Span::styled("BNC", Style::default().fg(Color::Cyan)),
+            Span::raw("     "),
+            Span::styled("BBT", Style::default().fg(Color::Magenta)),
+        ]));
+
+        // Helper to format stats per venue
+        let fmt_stats = |ex: &str| -> (String, String, String) {
+            let stats = t
+                .per_exchange_30s
+                .iter()
+                .find(|(k, _)| normalize_ex(k) == normalize_ex(ex))
+                .map(|(_, v)| v);
+            if let Some(v) = stats {
+                let buy = (v.total_30s + v.cvd_30s) / 2.0;
+                let imb = if v.total_30s > 0.0 {
+                    (buy / v.total_30s * 100.0).round()
+                } else {
+                    50.0
+                };
+                let tps = v.trades_30s as f64 / 30.0;
+                let avg = if v.trades_30s > 0 {
+                    v.total_30s / v.trades_30s as f64
+                } else {
+                    0.0
+                };
+                let (scaled, suffix) = scale_number(v.cvd_30s);
+                let cvd_str = format!("{:+.1}{}", scaled, suffix);
+                let imb_str = format!("{:>3.0}% {}", imb, if imb >= 50.0 { "BUY" } else { "SELL" });
+                let tape_str = format!("{:.0}t/s ${:.0}", tps, avg / 1000.0);
+                (cvd_str, imb_str, tape_str)
+            } else {
+                ("--".to_string(), "--".to_string(), "--".to_string())
+            }
+        };
+
+        // Line: CVD
+        let (cvd_okx, cvd_bnc, cvd_bbt) = (fmt_stats("Okx").0, fmt_stats("BinanceFuturesUsd").0, fmt_stats("BybitPerpetualsUsd").0);
+        lines.push(Line::from(vec![
+            Span::styled(" CVD: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:>10}   {:>10}   {:>10}", cvd_okx, cvd_bnc, cvd_bbt)),
+        ]));
+        // Line: Imbalance
+        let (imb_okx, imb_bnc, imb_bbt) = (fmt_stats("Okx").1, fmt_stats("BinanceFuturesUsd").1, fmt_stats("BybitPerpetualsUsd").1);
+        lines.push(Line::from(vec![
+            Span::styled(" IMB: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:>10}   {:>10}   {:>10}", imb_okx, imb_bnc, imb_bbt)),
+        ]));
+        // Line: Tape
+        let (tp_okx, tp_bnc, tp_bbt) = (fmt_stats("Okx").2, fmt_stats("BinanceFuturesUsd").2, fmt_stats("BybitPerpetualsUsd").2);
+        lines.push(Line::from(vec![
+            Span::styled(" TAPE:", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:>10}   {:>10}   {:>10}", tp_okx, tp_bnc, tp_bbt)),
+        ]));
+
+        // Line: L2 Book Imbalance (from orderbook data)
+        let book_okx = t.per_exchange_book_imbalance.get("OKX").copied().unwrap_or(50.0);
+        let book_bnc = t.per_exchange_book_imbalance.get("BNC").copied().unwrap_or(50.0);
+        let book_bbt = t.per_exchange_book_imbalance.get("BBT").copied().unwrap_or(50.0);
+
+        let fmt_book = |imb: f64| -> Span {
+            let (color, label) = if imb > 55.0 {
+                (Color::Green, "BID")
+            } else if imb < 45.0 {
+                (Color::Red, "ASK")
+            } else {
+                (Color::Yellow, "BAL")
+            };
+            Span::styled(format!("{:>5.0}%{} ", imb, label), Style::default().fg(color))
+        };
+
+        if !t.per_exchange_book_imbalance.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(" BOOK:", Style::default().fg(Color::DarkGray)),
+                Span::raw("   "),
+                fmt_book(book_okx),
+                Span::raw("       "),
+                fmt_book(book_bnc),
+                Span::raw("       "),
+                fmt_book(book_bbt),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Waiting for data...",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    f.render_widget(paragraph, area);
+}
+
+fn normalize_ex(name: &str) -> &str {
+    let lower = name.to_lowercase();
+    if lower.contains("binance") {
+        "binance"
+    } else if lower.contains("bybit") {
+        "bybit"
+    } else if lower.contains("okx") {
+        "okx"
+    } else {
+        name
+    }
+}
+
 fn render_footer(f: &mut ratatui::Frame, area: Rect, focused_ticker: &str) {
     let hotkeys = vec![
         Span::raw(" ["),
@@ -1083,7 +1209,7 @@ fn render_footer(f: &mut ratatui::Frame, area: Rect, focused_ticker: &str) {
                 Style::default().fg(Color::DarkGray)
             },
         ),
-        Span::raw("]OL  │  Refresh: 50ms  │  [q] Quit"),
+        Span::raw("]OL  |  Refresh: 50ms  |  [q] Quit"),
     ];
 
     let footer = Paragraph::new(Line::from(hotkeys));
