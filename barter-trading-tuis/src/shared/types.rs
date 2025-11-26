@@ -190,9 +190,9 @@ impl OrderBookL1Data {
 
 /// Order Book Level 2 (depth) event data
 ///
-/// Contains multiple price levels for both bids and asks
+/// Contains multiple price levels for both bids and asks.
+/// Matches barter-data's OrderBookEvent serialization format.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
 pub enum OrderBookL2Data {
     /// Full orderbook snapshot
     Snapshot(OrderBook),
@@ -200,27 +200,34 @@ pub enum OrderBookL2Data {
     Update(OrderBook),
 }
 
-/// Orderbook with bid and ask levels
+/// Wrapper for order book side with nested levels (matches barter-data format)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OrderBookSide {
+    /// The price levels for this side
+    pub levels: Vec<Level>,
+}
+
+/// Orderbook with bid and ask levels (matches barter-data's OrderBook serialization)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OrderBook {
     /// Sequence number for ordering
     #[serde(default)]
     pub sequence: u64,
-    /// Last update time
-    #[serde(default)]
-    pub last_update_time: Option<DateTime<Utc>>,
+    /// Engine timestamp (matches barter-data's time_engine field)
+    #[serde(default, alias = "last_update_time")]
+    pub time_engine: Option<DateTime<Utc>>,
     /// Bid levels (price, amount) sorted by price descending
-    pub bids: Vec<Level>,
+    pub bids: OrderBookSide,
     /// Ask levels (price, amount) sorted by price ascending
-    pub asks: Vec<Level>,
+    pub asks: OrderBookSide,
 }
 
 impl OrderBook {
     /// Calculate the book imbalance ratio
     /// Returns value from -1.0 (all asks) to +1.0 (all bids)
     pub fn imbalance(&self, levels: usize) -> f64 {
-        let bid_vol: f64 = self.bids.iter().take(levels).map(|l| l.amount_f64()).sum();
-        let ask_vol: f64 = self.asks.iter().take(levels).map(|l| l.amount_f64()).sum();
+        let bid_vol: f64 = self.bids.levels.iter().take(levels).map(|l| l.amount_f64()).sum();
+        let ask_vol: f64 = self.asks.levels.iter().take(levels).map(|l| l.amount_f64()).sum();
         let total = bid_vol + ask_vol;
         if total > 0.0 {
             (bid_vol - ask_vol) / total
@@ -231,8 +238,8 @@ impl OrderBook {
 
     /// Calculate the bid imbalance percentage (0-100%)
     pub fn bid_imbalance_pct(&self, levels: usize) -> f64 {
-        let bid_vol: f64 = self.bids.iter().take(levels).map(|l| l.amount_f64()).sum();
-        let ask_vol: f64 = self.asks.iter().take(levels).map(|l| l.amount_f64()).sum();
+        let bid_vol: f64 = self.bids.levels.iter().take(levels).map(|l| l.amount_f64()).sum();
+        let ask_vol: f64 = self.asks.levels.iter().take(levels).map(|l| l.amount_f64()).sum();
         let total = bid_vol + ask_vol;
         if total > 0.0 {
             (bid_vol / total) * 100.0
@@ -243,12 +250,12 @@ impl OrderBook {
 
     /// Get the best bid level
     pub fn best_bid(&self) -> Option<&Level> {
-        self.bids.first()
+        self.bids.levels.first()
     }
 
     /// Get the best ask level
     pub fn best_ask(&self) -> Option<&Level> {
-        self.asks.first()
+        self.asks.levels.first()
     }
 
     /// Calculate mid price
@@ -261,12 +268,12 @@ impl OrderBook {
 
     /// Get total bid volume within N levels
     pub fn bid_volume(&self, levels: usize) -> f64 {
-        self.bids.iter().take(levels).map(|l| l.amount_f64()).sum()
+        self.bids.levels.iter().take(levels).map(|l| l.amount_f64()).sum()
     }
 
     /// Get total ask volume within N levels
     pub fn ask_volume(&self, levels: usize) -> f64 {
-        self.asks.iter().take(levels).map(|l| l.amount_f64()).sum()
+        self.asks.levels.iter().take(levels).map(|l| l.amount_f64()).sum()
     }
 }
 

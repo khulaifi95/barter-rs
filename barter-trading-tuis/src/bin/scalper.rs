@@ -1130,19 +1130,25 @@ fn render_per_exchange_strip(
         ]));
 
         // Line: L2 Book Imbalance (from orderbook data)
-        let book_okx = t.per_exchange_book_imbalance.get("OKX").copied().unwrap_or(50.0);
-        let book_bnc = t.per_exchange_book_imbalance.get("BNC").copied().unwrap_or(50.0);
-        let book_bbt = t.per_exchange_book_imbalance.get("BBT").copied().unwrap_or(50.0);
+        // Show "--" for exchanges without L2 data (e.g., OKX)
+        let book_okx = t.per_exchange_book_imbalance.get("OKX").copied();
+        let book_bnc = t.per_exchange_book_imbalance.get("BNC").copied();
+        let book_bbt = t.per_exchange_book_imbalance.get("BBT").copied();
 
-        let fmt_book = |imb: f64| -> Span {
-            let (color, label) = if imb > 55.0 {
-                (Color::Green, "BID")
-            } else if imb < 45.0 {
-                (Color::Red, "ASK")
-            } else {
-                (Color::Yellow, "BAL")
-            };
-            Span::styled(format!("{:>5.0}%{} ", imb, label), Style::default().fg(color))
+        let fmt_book = |imb: Option<f64>| -> Span {
+            match imb {
+                Some(val) => {
+                    let (color, label) = if val > 55.0 {
+                        (Color::Green, "BID")
+                    } else if val < 45.0 {
+                        (Color::Red, "ASK")
+                    } else {
+                        (Color::Yellow, "BAL")
+                    };
+                    Span::styled(format!("{:>5.0}%{} ", val, label), Style::default().fg(color))
+                }
+                None => Span::styled("   --    ", Style::default().fg(Color::DarkGray)),
+            }
         };
 
         if !t.per_exchange_book_imbalance.is_empty() {

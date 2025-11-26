@@ -1,0 +1,335 @@
+================================================================================
+BARTER-DATA-SERVER: TRADE MESSAGE FLOW ANALYSIS
+Complete Routing & WebSocket Handling Documentation
+================================================================================
+
+PROBLEM STATEMENT
+================================================================================
+- Raw WebSocket captures show Bybit publicTrade messages arriving at network level
+- server_debug.log shows ZERO trade messages from any exchange (post ~02:00)
+- Historical logs (01:50-01:52) show "SPOT TRADE >=50k" entries were working
+- Liquidation events ARE arriving and logging correctly
+- Messages arrive at network layer but never surface in application
+
+SOLUTION: COMPLETE MESSAGE FLOW TRACE
+================================================================================
+
+1. NETWORK ENTRY POINT
+   Location: tokio_tungstenite WebSocket layer (external crate)
+   Input: Raw TCP packets from Bybit server
+   Output: WsMessage::Text(JSON string)
+   
+   Example:
+   {"topic":"publicTrade.BTCUSDT","type":"snapshot","ts":1234567890,"data":[...]}
+
+2. ASYNC POLLING LAYER
+   Location: barter-integration/src/stream/mod.rs:41-65
+   Function: ExchangeStream::poll_next()
+   
+   Process:
+   a) Checks buffered output (line 44-46)
+   b) Polls inner ws_stream for next message (line 49)
+   c) Calls Protocol::parse() on input (line 56)
+   d) Routes to transformer if parsed (line 69-75)
+   
+   CRITICAL: If parse returns None, message is skipped (line 64)
+   
+3. PROTOCOL PARSER
+   Location: WebSocketSerdeParser (external crate integration)
+   Function: Deserializes WsMessage::Text to Protocol::Message
+   
+   Process:
+   - Extracts JSON string from WsMessage
+   - Calls serde_json deserializer
+   - Returns deserialized Protocol::Message OR error/skip
+
+4. EXCHANGE-SPECIFIC DESERIALIZATION
+   Location: barter-data/src/exchange/bybit/trade.rs:23-40
+   Type: BybitTradeMessage deserializer
+   
+   CRITICAL DECISION POINT #1:
+   ```
+   match value.get("topic") {
+       Some(topic) if topic.is_string() => BybitTradeMessage::Payload(...)
+       _ => BybitTradeMessage::Ignore  ← SILENTLY DROPS MESSAGE
+   }
+   ```
+   
+   If "topic" field absent → Message becomes Ignore variant
+   → Early return later (transformer line 68)
+   → Message never reaches application
+
+5. TOPIC PARSING
+   Location: barter-data/src/exchange/bybit/message.rs:58-95
+   Function: de_message_subscription_id()
+   
+   Input: "publicTrade.BTCUSDT"
+   Output: SubscriptionId("publicTrade|BTCUSDT")
+   
+   Expected format: "<type>.<symbol>" (exactly 2 dot-separated parts)
+   Failure: Invalid format → Deserialization error
+
+6. MESSAGE ROUTING
+   Location: barter-data/src/transformer/stateless.rs:64-84
+   Function: StatelessTransformer::transform()
+   
+   CRITICAL DECISION POINT #2:
+   ```
+   match input.id() {
+       Some(subscription_id) => {
+           // Find in map and transform
+       }
+       None => return vec![]  ← SILENT DROP
+   }
+   ```
+   
+   For BybitTradeMessage::Ignore:
+   - id() returns None
+   - Function returns empty vec
+   - Message never reaches transformer output
+
+7. INSTRUMENT MAPPING
+   Location: barter-data/src/transformer/stateless.rs:72-82
+   
+   Lookup: instrument_map.find(&subscription_id)
+   
+   Success: Message routed to transformation
+   Failure: Returns error (NOT silent)
+   
+   Key insight: If subscription ID not registered, error IS logged
+   Silent drops only happen at None path
+
+8. MESSAGE TRANSFORMATION
+   Location: barter-data/src/exchange/bybit/trade.rs:81-111
+   Function: From<(ExchangeId, InstrumentKey, BybitTradeMessage)>
+   
+   ANOTHER CRITICAL POINT:
+   ```
+   match message {
+       BybitTradeMessage::Ignore => Self(vec![])
+       BybitTradeMessage::Payload(trades) => {
+           // Transform each trade to MarketEvent<PublicTrade>
+       }
+   }
+   ```
+
+9. APPLICATION LOGGING & BROADCAST
+   Location: barter-data-server/src/main.rs:124-237
+   
+   Entry point: Main event loop processes stream output
+   
+   For each MarketEvent:
+   a) Check if DataKind::Trade (line 133)
+   b) Calculate notional value (line 138)
+   c) Filter by instrument type (spot vs perpetual) (line 139-140)
+   d) Filter by notional threshold (line 141)
+   e) Log to server_debug.log (line 142-151)
+   f) Broadcast to clients (line 207)
+   
+   THIS IS WHERE TRADE ENTRIES APPEAR IN server_debug.log:
+   "SPOT TRADE >=50k BybitSpot btc/usdt @ 50000 qty 0.001 ..."
+
+CRITICAL FAILURE POINTS (WHERE MESSAGES ARE DROPPED)
+================================================================================
+
+Point 1: Deserialization Missing "topic" Field
+─────────────────────────────────────────────
+Location: barter-data/src/exchange/bybit/trade.rs:30-37
+Trigger: value.get("topic") returns None
+Result: BybitTradeMessage::Ignore
+Impact: Silent drop - no error logged
+Detection: Raw WebSocket capture missing "topic" field
+Fix: Update deserializer to check different field
+
+Point 2: Identifier Returns None
+──────────────────────────────────
+Location: barter-data/src/exchange/bybit/trade.rs:113-120
+Trigger: BybitTradeMessage::Ignore variant
+Result: id() returns None
+Impact: Transformer early return (line 68)
+Detection: Check if ANY Ignore messages reach transformer
+Fix: Never happens if Point 1 fixed
+
+Point 3: Subscription ID Parse Error
+──────────────────────────────────────
+Location: barter-data/src/exchange/bybit/message.rs:62-95
+Trigger: Topic format doesn't match "<type>.<symbol>"
+Result: Deserialization error
+Impact: Error variant in output (NOT silent)
+Detection: Check server_debug.log for parse errors
+Fix: Update format parsing logic
+
+Point 4: Subscription Not in Instrument Map
+─────────────────────────────────────────────
+Location: barter-data/src/transformer/stateless.rs:72
+Trigger: subscription_id not found in map
+Result: Error returned (unidentifiable)
+Impact: Error logged to debug (NOT silent)
+Detection: Check for "unidentifiable" errors in logs
+Fix: Verify subscription registered during init
+
+Point 5: Broadcast Channel Overflow
+──────────────────────────────────────
+Location: barter-data-server/src/main.rs:207-224
+Trigger: More messages than WS_BUFFER_SIZE
+Result: Some messages skipped, warning logged
+Impact: Message lost but warning generated
+Detection: Check for "Failed to broadcast" warnings
+Fix: Increase WS_BUFFER_SIZE env var
+
+ROOT CAUSE ANALYSIS
+================================================================================
+
+HYPOTHESIS (Most Likely):
+Trade messages from Bybit lack "topic" field at root level
+→ BybitTradeMessage::deserialize() returns Ignore
+→ Transformer::transform() early returns empty vec
+→ Message never reaches application logging
+→ server_debug.log shows zero trades
+
+EVIDENCE:
+1. Liquidation events ARE working (use same pattern)
+2. Early logs showed "SPOT TRADE >=50k" entries (proof system worked)
+3. Recent complete absence (not intermittent)
+4. Suggests Bybit API format change or subscription issue
+
+SUPPORTING FACTS:
+- Bybit publicTrade documented: https://bybit-exchange.github.io/docs/v5/websocket/public/trade
+- Expected format has "topic" field at root
+- If format changed, deserialization would silently drop all trades
+- No error logged (this is by design for message skipping)
+
+HOW TO VERIFY:
+1. Examine ws_capture.log for raw message structure
+2. Check if "topic" field present and value format
+3. Compare with working liquidation messages
+4. Verify Bybit API hasn't changed message schema
+
+COMPLETE MESSAGE PIPELINE
+================================================================================
+
+Network RX
+    ↓
+ExchangeStream::poll_next() [integration/stream/mod.rs:49]
+    ↓
+Protocol::parse(WsMessage) [WebSocketSerdeParser]
+    ↓
+BybitTradeMessage::deserialize() [exchange/bybit/trade.rs:23]
+    ├─ Check: value.get("topic").is_some() ← DECISION POINT
+    ├─ YES → BybitTradeMessage::Payload
+    └─ NO → BybitTradeMessage::Ignore ← DROPS HERE
+    ↓
+ExchangeStream buffer accumulation [integration/stream/mod.rs:69-75]
+    ↓
+StatelessTransformer::transform() [transformer/stateless.rs:64]
+    ├─ Extract: input.id() 
+    ├─ Result: Some(subscription_id) or None
+    ├─ If None → return vec![] ← SILENT DROP
+    └─ If Some → lookup in instrument_map
+    ↓
+Instrument lookup [transformer/stateless.rs:72]
+    ├─ Found → Transform to MarketEvent
+    └─ Not found → Error result
+    ↓
+MarketEvent<PublicTrade> conversion [exchange/bybit/trade.rs:81]
+    ↓
+barter-data-server main loop [main.rs:124]
+    ├─ Check: if DataKind::Trade
+    ├─ Calculate: notional = price * amount
+    ├─ Filter: is_spot && notional >= threshold
+    ├─ YES → Log: "SPOT TRADE >=50k ..." ← YOU ARE HERE
+    └─ Broadcast: tx.send(message)
+    ↓
+Connected TUI Clients
+    └─ Receive MarketEventMessage JSON
+
+KEY FILES & LINE NUMBERS
+================================================================================
+
+Entry Points:
+  - barter-integration/src/stream/mod.rs:49 (poll inner stream)
+  - barter-integration/src/stream/mod.rs:56 (parse message)
+
+Bybit Trade Processing:
+  - barter-data/src/exchange/bybit/trade.rs:23 (deserialize)
+  - barter-data/src/exchange/bybit/trade.rs:30 (topic check)
+  - barter-data/src/exchange/bybit/trade.rs:113 (id extraction)
+  - barter-data/src/exchange/bybit/message.rs:62 (topic parsing)
+
+Routing & Transformation:
+  - barter-data/src/transformer/stateless.rs:64 (transform)
+  - barter-data/src/transformer/stateless.rs:66 (id() check)
+  - barter-data/src/transformer/stateless.rs:72 (map lookup)
+
+Application Layer:
+  - barter-data-server/src/main.rs:130 (event handling)
+  - barter-data-server/src/main.rs:133 (trade check)
+  - barter-data-server/src/main.rs:142 (trade logging)
+  - barter-data-server/src/main.rs:207 (broadcast)
+
+Subscription Management:
+  - barter-data/src/subscriber/validator.rs:82 (subscription ACK parse)
+  - barter-data/src/exchange/bybit/subscription.rs:51 (response validate)
+
+DEBUGGING STRATEGY
+================================================================================
+
+Priority 1: Verify Raw WebSocket Format
+- Examine ws_capture.log for actual message structure
+- Search for "topic" field presence
+- Compare with Bybit API documentation
+
+Priority 2: Enable Debug Logging
+- Add eprintln! statements at each failure point
+- Rebuild and capture stderr output
+- Compare debug output flow with expected path
+
+Priority 3: Check Subscription State
+- Verify "validated exchange WebSocket subscriptions" in logs
+- Count subscription confirmation messages
+- Compare expected vs actual subscription IDs
+
+Priority 4: Manual Deserialization Test
+- Create minimal test to parse sample Bybit message
+- Verify "topic" field extraction works
+- Test subscription ID format conversion
+
+EXPECTED vs ACTUAL BEHAVIOR
+================================================================================
+
+EXPECTED (When Working):
+✓ Trade messages received at network layer
+✓ BybitTradeMessage::Payload variant created
+✓ Subscription ID extracted: "publicTrade|BTCUSDT"
+✓ Instrument found in map
+✓ MarketEvent<PublicTrade> created
+✓ Log: "SPOT TRADE >=50k BybitSpot btc/usdt @ X qty Y notional Z side B"
+✓ Broadcast to N clients
+
+ACTUAL (Current State):
+✗ Trade messages not appearing in server_debug.log
+✗ Liquidations ARE appearing (proves system works)
+✗ SPOT TRADE log entries present up to 01:52
+✗ SPOT TRADE entries absent from 02:17 onwards
+✗ No error messages about failed subscriptions
+✗ No parse errors in logs
+
+INTERPRETATION:
+The silent drop pattern (no error, just absence) indicates failure at
+deserialization level, not transformation or routing.
+
+NEXT STEPS
+================================================================================
+
+1. READ: ws_capture.log for actual message format
+2. CHECK: "topic" field presence in trade messages
+3. COMPARE: With liquidation message structure
+4. VERIFY: Bybit API docs for format changes
+5. ADD: Debug logging at trade.rs:30
+6. REBUILD: barter_data_server binary
+7. RUN: With stderr captured to file
+8. ANALYZE: Debug output against expected flow
+9. IDENTIFY: Which decision point is causing drop
+10. IMPLEMENT: Fix based on actual format found
+
+================================================================================
