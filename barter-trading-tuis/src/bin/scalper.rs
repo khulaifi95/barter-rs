@@ -47,31 +47,58 @@ struct SignalState {
     flow_start: HashMap<String, (FlowSignal, Instant)>,
 }
 
+/// Per-venue throttle state
+#[derive(Default, Clone)]
+struct VenueThrottle {
+    last_value: f64,
+    last_update: Option<Instant>,
+}
+
+impl VenueThrottle {
+    /// Returns throttled value: updates ONLY when interval_ms elapsed AND raw has data
+    /// If raw=0 (no data), keeps previous value (memory effect)
+    fn get_throttled(&mut self, raw: f64, interval_ms: u128) -> f64 {
+        let now = Instant::now();
+        let time_ok = self.last_update
+            .map(|t| now.duration_since(t).as_millis() >= interval_ms)
+            .unwrap_or(true);
+
+        // Only update if time elapsed AND raw has valid data (>0)
+        // This preserves last known value when data briefly disappears
+        if time_ok && raw > 0.0 {
+            self.last_value = raw;
+            self.last_update = Some(now);
+        }
+        self.last_value
+    }
+}
+
 /// Bar state tracker for throttled visual updates (reduces bar flickering)
 #[derive(Default)]
 struct BarState {
     last_pressure: f64,
     last_flow_imb: f64,
     last_update: Option<Instant>,
-    // L2 book throttling
-    last_l2_bnc: f64,
-    last_l2_bbt: f64,
-    last_l2_okx: f64,
-    last_l2_agg: f64,
-    last_l2_update: Option<Instant>,
+    // L2 book throttling - INDEPENDENT per venue
+    l2_bnc: VenueThrottle,
+    l2_bbt: VenueThrottle,
+    l2_okx: VenueThrottle,
+    l2_agg: VenueThrottle,
 }
 
+// Throttle settings: pure time-based, no value escape hatch (data too volatile)
+const L2_INTERVAL_MS: u128 = 1500;      // L2 book: ~0.67 updates/sec
+const BANNER_INTERVAL_MS: u128 = 1200;  // Pressure banner: ~0.83 updates/sec (slightly snappier)
+
 impl BarState {
-    /// Returns true if bars should update (>5% change OR >500ms elapsed) - higher threshold reduces flickering
+    /// Returns true if pressure banner should update (pure time gate)
     fn should_update(&mut self, pressure: f64, flow_imb: f64) -> bool {
         let now = Instant::now();
         let time_ok = self.last_update
-            .map(|t| now.duration_since(t).as_millis() >= 500)
+            .map(|t| now.duration_since(t).as_millis() >= BANNER_INTERVAL_MS)
             .unwrap_or(true);
-        let pressure_changed = (pressure - self.last_pressure).abs() > 5.0;
-        let flow_changed = (flow_imb - self.last_flow_imb).abs() > 5.0;
 
-        if time_ok || pressure_changed || flow_changed {
+        if time_ok {
             self.last_pressure = pressure;
             self.last_flow_imb = flow_imb;
             self.last_update = Some(now);
@@ -81,27 +108,14 @@ impl BarState {
         }
     }
 
-    /// Returns throttled L2 values (>3% change OR >300ms elapsed)
+    /// Returns throttled L2 values - EACH venue throttled independently (pure time gate)
     fn get_l2_throttled(&mut self, bnc: f64, bbt: f64, okx: f64, agg: f64) -> (f64, f64, f64, f64) {
-        let now = Instant::now();
-        let time_ok = self.last_l2_update
-            .map(|t| now.duration_since(t).as_millis() >= 300)
-            .unwrap_or(true);
-
-        let bnc_changed = (bnc - self.last_l2_bnc).abs() > 3.0;
-        let bbt_changed = (bbt - self.last_l2_bbt).abs() > 3.0;
-        let okx_changed = (okx - self.last_l2_okx).abs() > 3.0;
-        let agg_changed = (agg - self.last_l2_agg).abs() > 3.0;
-
-        if time_ok || bnc_changed || bbt_changed || okx_changed || agg_changed {
-            self.last_l2_bnc = bnc;
-            self.last_l2_bbt = bbt;
-            self.last_l2_okx = okx;
-            self.last_l2_agg = agg;
-            self.last_l2_update = Some(now);
-        }
-
-        (self.last_l2_bnc, self.last_l2_bbt, self.last_l2_okx, self.last_l2_agg)
+        (
+            self.l2_bnc.get_throttled(bnc, L2_INTERVAL_MS),
+            self.l2_bbt.get_throttled(bbt, L2_INTERVAL_MS),
+            self.l2_okx.get_throttled(okx, L2_INTERVAL_MS),
+            self.l2_agg.get_throttled(agg, L2_INTERVAL_MS),
+        )
     }
 }
 
@@ -1216,7 +1230,7 @@ fn render_per_exchange_strip(
         let book_bbt = t.per_exchange_book_imbalance.get("BBT").copied();
 
         let fmt_book = |imb: Option<f64>| -> Span {
-            match imb {
+            match imb.filter(|&v| v > 0.0) {
                 Some(val) => {
                     let (color, label) = if val > 55.0 {
                         (Color::Green, "BID")
@@ -1353,15 +1367,15 @@ fn render_header_compact_new(
         let basis = t.basis.as_ref().map(|b| b.basis_pct).unwrap_or(0.0);
         let tps = t.trade_speed;
 
-        // Get LEAD exchange (case-insensitive matching)
+        // Get LEAD exchange (keys are like "BNC-PERP", "BBT-SPOT", "OKX-PERP")
         let lead = t.exchange_dominance.iter()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(k, _)| k.clone());
-        let lead_short = lead.map(|ex| {
-            let ex_lower = ex.to_lowercase();
-            if ex_lower.contains("binance") { "BNC" }
-            else if ex_lower.contains("bybit") { "BBT" }
-            else if ex_lower.contains("okx") { "OKX" }
+        let lead_short = lead.as_ref().map(|ex| {
+            let ex_upper = ex.to_uppercase();
+            if ex_upper.starts_with("BNC") { "BNC" }
+            else if ex_upper.starts_with("BBT") { "BBT" }
+            else if ex_upper.starts_with("OKX") { "OKX" }
             else { "OTH" }
         }).unwrap_or("--");
 
@@ -1594,20 +1608,22 @@ fn render_l2_book_new(
     let mut lines = Vec::new();
 
     if let Some(t) = snapshot.tickers.get(focused_ticker) {
-        // Get raw values
+        // Get raw values (default 0 = no data flag)
         let raw_bnc = t.per_exchange_book_imbalance.get("BNC").copied().unwrap_or(0.0);
         let raw_bbt = t.per_exchange_book_imbalance.get("BBT").copied().unwrap_or(0.0);
         let raw_okx = t.per_exchange_book_imbalance.get("OKX").copied().unwrap_or(0.0);
         let raw_agg = t.aggregated_book_imbalance;
 
-        // Get throttled values (only updates on >3% change or >300ms)
+        // Get THROTTLED values - these are stable and "remember" last valid state
         let (bnc, bbt, okx, agg) = bar_state.get_l2_throttled(raw_bnc, raw_bbt, raw_okx, raw_agg);
 
-        // Per-venue book imbalance with bars
-        let venues = [("BNC", bnc, raw_bnc > 0.0), ("BBT", bbt, raw_bbt > 0.0), ("OKX", okx, raw_okx > 0.0)];
+        // Presence based on THROTTLED value (stable!), not raw
+        // Throttle starts at 0, so if data never arrived, shows "no L2"
+        // Once data arrives (>0), throttle holds that value even if raw briefly drops
+        let venues = [("BNC", bnc, bnc > 1.0), ("BBT", bbt, bbt > 1.0), ("OKX", okx, okx > 1.0)];
 
         for (label, imb, has_data) in venues {
-            if has_data && imb > 0.0 {
+            if has_data {  // has_data = throttled > 1.0, already implies valid
                 let dir = if imb > 55.0 { "BID" } else if imb < 45.0 { "ASK" } else { "BAL" };
                 let color = if imb > 55.0 { Color::Green } else if imb < 45.0 { Color::Red } else { Color::Yellow };
                 let bar_w: usize = 8;
@@ -1628,8 +1644,8 @@ fn render_l2_book_new(
             }
         }
 
-        // Aggregate (also throttled)
-        if agg > 0.0 {
+        // Aggregate (also throttled - use same threshold for consistency)
+        if agg > 1.0 {
             let dir = if agg > 55.0 { "BID" } else if agg < 45.0 { "ASK" } else { "BAL" };
             let color = if agg > 55.0 { Color::Green } else if agg < 45.0 { Color::Red } else { Color::Yellow };
             lines.push(Line::from(vec![
@@ -1721,10 +1737,10 @@ fn render_exchanges_table_new(
             Span::styled(format!("{:^12}", imb_bbt), imb_color(imb_bbt_raw)),
         ]));
 
-        // BOOK IMB row
-        let book_okx = t.per_exchange_book_imbalance.get("OKX").map(|v| format!("{:.0}%", v)).unwrap_or("--".to_string());
-        let book_bnc = t.per_exchange_book_imbalance.get("BNC").map(|v| format!("{:.0}%", v)).unwrap_or("--".to_string());
-        let book_bbt = t.per_exchange_book_imbalance.get("BBT").map(|v| format!("{:.0}%", v)).unwrap_or("--".to_string());
+        // BOOK IMB row (0.0 = no data)
+        let book_okx = t.per_exchange_book_imbalance.get("OKX").filter(|&&v| v > 0.0).map(|v| format!("{:.0}%", v)).unwrap_or("--".to_string());
+        let book_bnc = t.per_exchange_book_imbalance.get("BNC").filter(|&&v| v > 0.0).map(|v| format!("{:.0}%", v)).unwrap_or("--".to_string());
+        let book_bbt = t.per_exchange_book_imbalance.get("BBT").filter(|&&v| v > 0.0).map(|v| format!("{:.0}%", v)).unwrap_or("--".to_string());
 
         lines.push(Line::from(vec![
             Span::styled("BOOK IMB:   ", Style::default().fg(Color::Gray)),
@@ -1847,14 +1863,15 @@ fn render_footer_new(
             spans.push(Span::styled(format!("RV:{:.2}%{}", rv, trend), Style::default().fg(Color::Gray)));
         }
 
-        // LEAD
+        // LEAD (keys are like "BNC-PERP", "BBT-SPOT", "OKX-PERP")
         let lead = t.exchange_dominance.iter()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(k, _)| k.clone());
         if let Some(lead_ex) = lead {
-            let short = if lead_ex.contains("Binance") { "BNC" }
-                else if lead_ex.contains("Bybit") { "BBT" }
-                else if lead_ex.contains("Okx") { "OKX" }
+            let ex_upper = lead_ex.to_uppercase();
+            let short = if ex_upper.starts_with("BNC") { "BNC" }
+                else if ex_upper.starts_with("BBT") { "BBT" }
+                else if ex_upper.starts_with("OKX") { "OKX" }
                 else { "OTH" };
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(format!("LEAD:{}", short), Style::default().fg(Color::Yellow)));
