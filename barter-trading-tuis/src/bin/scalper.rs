@@ -1837,23 +1837,26 @@ fn render_volatility_new(
         }
         lines.push(Line::from(atr_spans));
 
-        // tvVWAP shown only if we have >=12 candles and deviation is present
+        // tvVWAP shown only if we have >=12 candles
         if t.candles_5m_len >= 12 {
             if let Some(vwap_dev) = t.tv_vwap_deviation {
-                let vwap_color = if vwap_dev > 0.5 { Color::Green } else if vwap_dev < -0.5 { Color::Red } else { Color::Yellow };
+                let vwap_color = if vwap_dev > 0.0 { Color::Green } else if vwap_dev < 0.0 { Color::Red } else { Color::Gray };
                 lines.push(Line::from(vec![
-                    Span::styled("vVWAP: ", Style::default().fg(Color::Gray)),
-                    Span::styled(format!("{:+.1}%", vwap_dev), Style::default().fg(vwap_color)),
+                    Span::styled("tvVWAP:", Style::default().fg(Color::Gray)),
+                    Span::raw(" "),
+                    Span::styled(format!("{:+.2}%", vwap_dev), Style::default().fg(vwap_color)),
                 ]));
             } else {
                 lines.push(Line::from(vec![
-                    Span::styled("vVWAP: ", Style::default().fg(Color::Gray)),
+                    Span::styled("tvVWAP:", Style::default().fg(Color::Gray)),
+                    Span::raw(" "),
                     Span::styled("--", Style::default().fg(Color::DarkGray)),
                 ]));
             }
         } else {
             lines.push(Line::from(vec![
-                Span::styled("vVWAP: ", Style::default().fg(Color::Gray)),
+                Span::styled("tvVWAP:", Style::default().fg(Color::Gray)),
+                Span::raw(" "),
                 Span::styled("warming", Style::default().fg(Color::DarkGray)),
             ]));
         }
