@@ -460,6 +460,7 @@ pub struct TickerSnapshot {
     // tvVWAP (TradingView style - HLC3 on 5m candles since 00:00 UTC)
     pub tv_vwap: Option<f64>,
     pub tv_vwap_deviation: Option<f64>,    // (price - tvVWAP) / tvVWAP * 100
+    pub candles_5m_len: usize,             // For guarding tvVWAP / RV display
     // ATR-14 (5m candles, EMA)
     pub atr_14: Option<f64>,               // ATR in price units
     pub atr_14_pct: Option<f64>,           // ATR as % of price
@@ -1650,6 +1651,7 @@ impl TickerState {
             vwap_daily_deviation,
             tv_vwap,
             tv_vwap_deviation,
+            candles_5m_len: self.candles_5m.len(),
             atr_14,
             atr_14_pct,
             realized_vol_30m,

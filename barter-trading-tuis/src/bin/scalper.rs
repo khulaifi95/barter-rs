@@ -31,6 +31,8 @@ use ratatui::{
     Terminal,
 };
 use tokio::sync::Mutex;
+use reqwest::Client;
+use serde_json::Value;
 
 /// Available tickers for focus mode
 const TICKERS: [&str; 3] = ["BTC", "ETH", "SOL"];
@@ -191,6 +193,17 @@ fn whale_threshold() -> f64 {
         .unwrap_or(500_000.0)
 }
 
+/// Fetch BitMEX 24h historical volatility index (.BVOL24H)
+async fn fetch_bvol24h(client: &Client) -> Result<f64, reqwest::Error> {
+    let url = "https://www.bitmex.com/api/v1/instrument?symbol=.BVOL24H";
+    let resp = client.get(url).send().await?.error_for_status()?;
+    let v: Value = resp.json().await?;
+    Ok(v.get(0)
+        .and_then(|o| o.get("lastPrice"))
+        .and_then(|p| p.as_f64())
+        .unwrap_or(0.0))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Setup panic hook to restore terminal on crash
@@ -217,6 +230,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         let mut guard = aggregator.lock().await;
         let _ = guard.backfill_all(&TICKERS).await;
+    }
+
+    // Background fetch for BitMEX BVOL24H (updates every 5 minutes)
+    let bvol24h = Arc::new(Mutex::new(None::<f64>));
+    {
+        let bvol = Arc::clone(&bvol24h);
+        tokio::spawn(async move {
+            let client = Client::new();
+            loop {
+                if let Ok(val) = fetch_bvol24h(&client).await {
+                    let mut lock = bvol.lock().await;
+                    *lock = Some(val);
+                }
+                tokio::time::sleep(Duration::from_secs(300)).await;
+            }
+        });
     }
 
     // WebSocket client with larger buffer for high-frequency mode
@@ -307,8 +336,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 None
             };
 
+            let bvol_val = {
+                let lock = bvol24h.lock().await;
+                *lock
+            };
+
             terminal.draw(|f| {
-                render_scalper_ui(f, f.area(), &snapshot, connected_now, focused_ticker, debounced_signals, &mut bar_state)
+                render_scalper_ui(
+                    f,
+                    f.area(),
+                    &snapshot,
+                    connected_now,
+                    focused_ticker,
+                    debounced_signals,
+                    &mut bar_state,
+                    bvol_val,
+                )
             })?;
             last_draw = Instant::now();
         }
@@ -336,6 +379,7 @@ fn render_scalper_ui(
     focused_ticker: &str,
     debounced_signals: Option<(Option<DivergenceSignal>, FlowSignal)>,
     bar_state: &mut BarState,
+    bvol24h: Option<f64>,
 ) {
     // TARGET LAYOUT (from mockup):
     // 1. Compact header: price + [LIVE] + t/s + Sprd + LEAD + Basis
@@ -382,7 +426,7 @@ fn render_scalper_ui(
         ])
         .split(chunks[3]);
 
-    render_volatility_new(f, vol_exch_row[0], snapshot, focused_ticker);
+    render_volatility_new(f, vol_exch_row[0], snapshot, focused_ticker, bvol24h);
     render_exchanges_table_new(f, vol_exch_row[1], snapshot, focused_ticker);
 
     render_whale_tape(f, chunks[4], snapshot, focused_ticker);
@@ -1362,8 +1406,6 @@ fn render_header_compact_new(
         let status_color = if connected { Color::Green } else { Color::Red };
 
         let spread_pct = t.latest_spread_pct.unwrap_or(0.0);
-        let vwap_dev = t.tv_vwap_deviation.unwrap_or(0.0);
-        let atr = t.atr_14.unwrap_or(0.0);
         let basis = t.basis.as_ref().map(|b| b.basis_pct).unwrap_or(0.0);
         let tps = t.trade_speed;
 
@@ -1760,6 +1802,7 @@ fn render_volatility_new(
     area: Rect,
     snapshot: &AggregatedSnapshot,
     focused_ticker: &str,
+    bvol24h: Option<f64>,
 ) {
     let block = Block::default()
         .title(" VOLATILITY ")
@@ -1773,7 +1816,6 @@ fn render_volatility_new(
 
     if let Some(t) = snapshot.tickers.get(focused_ticker) {
         let atr = t.atr_14.unwrap_or(0.0);
-        let vwap_dev = t.tv_vwap_deviation.unwrap_or(0.0);
         let price = t.latest_price.unwrap_or(1.0);
         let rv = if atr > 0.0 && price > 0.0 { (atr / price) * 100.0 } else { 0.0 };
         let trend = match t.realized_vol_trend {
@@ -1782,16 +1824,39 @@ fn render_volatility_new(
             VolTrend::Stable => "+STB",
         };
 
-        lines.push(Line::from(vec![
+        // ATR line with BVOL24H appended if available
+        let mut atr_spans = vec![
             Span::styled("ATR:   ", Style::default().fg(Color::Gray)),
             Span::styled(format!("${:.0}", atr), Style::default().fg(Color::White)),
-        ]));
+        ];
+        if let Some(bvol) = bvol24h {
+            atr_spans.push(Span::raw("   "));
+            atr_spans.push(Span::styled("BVOL24H:", Style::default().fg(Color::Gray)));
+            atr_spans.push(Span::raw(" "));
+            atr_spans.push(Span::styled(format!("{:.2}", bvol), Style::default().fg(Color::Yellow)));
+        }
+        lines.push(Line::from(atr_spans));
 
-        let vwap_color = if vwap_dev > 0.5 { Color::Green } else if vwap_dev < -0.5 { Color::Red } else { Color::Yellow };
-        lines.push(Line::from(vec![
-            Span::styled("vVWAP: ", Style::default().fg(Color::Gray)),
-            Span::styled(format!("{:+.1}%", vwap_dev), Style::default().fg(vwap_color)),
-        ]));
+        // tvVWAP shown only if we have >=12 candles and deviation is present
+        if t.candles_5m_len >= 12 {
+            if let Some(vwap_dev) = t.tv_vwap_deviation {
+                let vwap_color = if vwap_dev > 0.5 { Color::Green } else if vwap_dev < -0.5 { Color::Red } else { Color::Yellow };
+                lines.push(Line::from(vec![
+                    Span::styled("vVWAP: ", Style::default().fg(Color::Gray)),
+                    Span::styled(format!("{:+.1}%", vwap_dev), Style::default().fg(vwap_color)),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("vVWAP: ", Style::default().fg(Color::Gray)),
+                    Span::styled("--", Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("vVWAP: ", Style::default().fg(Color::Gray)),
+                Span::styled("warming", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
 
         lines.push(Line::from(vec![
             Span::styled("RV:    ", Style::default().fg(Color::Gray)),
