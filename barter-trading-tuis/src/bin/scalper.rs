@@ -81,6 +81,9 @@ struct BarState {
     last_pressure: f64,
     last_flow_imb: f64,
     last_update: Option<Instant>,
+    // tvVWAP throttling
+    last_tv_dev: Option<f64>,
+    last_tv_update: Option<Instant>,
     // L2 book throttling - INDEPENDENT per venue
     l2_bnc: VenueThrottle,
     l2_bbt: VenueThrottle,
@@ -91,6 +94,8 @@ struct BarState {
 // Throttle settings: pure time-based, no value escape hatch (data too volatile)
 const L2_INTERVAL_MS: u128 = 1500;      // L2 book: ~0.67 updates/sec
 const BANNER_INTERVAL_MS: u128 = 1200;  // Pressure banner: ~0.83 updates/sec (slightly snappier)
+const TVWAP_INTERVAL_MS: u128 = 1000;   // tvVWAP display gate
+const TVWAP_THRESHOLD: f64 = 0.05;      // Min change (in pct points) to refresh
 
 impl BarState {
     /// Returns true if pressure banner should update (pure time gate)
@@ -118,6 +123,28 @@ impl BarState {
             self.l2_okx.get_throttled(okx, L2_INTERVAL_MS),
             self.l2_agg.get_throttled(agg, L2_INTERVAL_MS),
         )
+    }
+
+    /// Throttle tvVWAP deviation display to reduce flicker
+    fn throttle_tvwav(&mut self, dev: Option<f64>) -> Option<f64> {
+        let now = Instant::now();
+        let time_ok = self
+            .last_tv_update
+            .map(|t| now.duration_since(t).as_millis() >= TVWAP_INTERVAL_MS)
+            .unwrap_or(true);
+
+        let change_ok = match (dev, self.last_tv_dev) {
+            (Some(cur), Some(prev)) => (cur - prev).abs() >= TVWAP_THRESHOLD,
+            (Some(_), None) => true,
+            _ => false,
+        };
+
+        if time_ok && change_ok {
+            self.last_tv_dev = dev;
+            self.last_tv_update = Some(now);
+        }
+
+        self.last_tv_dev
     }
 }
 
@@ -426,7 +453,7 @@ fn render_scalper_ui(
         ])
         .split(chunks[3]);
 
-    render_volatility_new(f, vol_exch_row[0], snapshot, focused_ticker, bvol24h);
+    render_volatility_new(f, vol_exch_row[0], snapshot, focused_ticker, bvol24h, bar_state);
     render_exchanges_table_new(f, vol_exch_row[1], snapshot, focused_ticker);
 
     render_whale_tape(f, chunks[4], snapshot, focused_ticker);
@@ -1803,6 +1830,7 @@ fn render_volatility_new(
     snapshot: &AggregatedSnapshot,
     focused_ticker: &str,
     bvol24h: Option<f64>,
+    bar_state: &mut BarState,
 ) {
     let block = Block::default()
         .title(" VOLATILITY ")
@@ -1837,9 +1865,10 @@ fn render_volatility_new(
         }
         lines.push(Line::from(atr_spans));
 
-        // tvVWAP shown only if we have >=12 candles
+        // tvVWAP shown only if we have >=12 candles; throttle to reduce flicker
         if t.candles_5m_len >= 12 {
-            if let Some(vwap_dev) = t.tv_vwap_deviation {
+            let throttled = bar_state.throttle_tvwav(t.tv_vwap_deviation);
+            if let Some(vwap_dev) = throttled {
                 let vwap_color = if vwap_dev > 0.0 { Color::Green } else if vwap_dev < 0.0 { Color::Red } else { Color::Gray };
                 lines.push(Line::from(vec![
                     Span::styled("tvVWAP:", Style::default().fg(Color::Gray)),
@@ -1861,9 +1890,15 @@ fn render_volatility_new(
             ]));
         }
 
+        // Realized volatility 30m/1h (match micro TUI)
+        let rv30 = t.realized_vol_30m.unwrap_or(0.0);
+        let rv1h = t.realized_vol_1h.unwrap_or(0.0);
         lines.push(Line::from(vec![
-            Span::styled("RV:    ", Style::default().fg(Color::Gray)),
-            Span::styled(format!("{:.2}% {}", rv, trend), Style::default().fg(Color::White)),
+            Span::styled("RV30/1h:", Style::default().fg(Color::Gray)),
+            Span::raw(" "),
+            Span::styled(format!("{:.2}%/{:.2}%", rv30, rv1h), Style::default().fg(Color::White)),
+            Span::raw(" "),
+            Span::styled(trend, Style::default().fg(Color::DarkGray)),
         ]));
     }
 
