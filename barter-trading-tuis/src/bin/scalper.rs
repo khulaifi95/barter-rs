@@ -1893,10 +1893,11 @@ fn render_volatility_new(
         // Realized volatility 30m/1h (match micro TUI)
         let rv30 = t.realized_vol_30m.unwrap_or(0.0);
         let rv1h = t.realized_vol_1h.unwrap_or(0.0);
+        let rv_color = if rv1h > rv30 { Color::Green } else if rv1h < rv30 { Color::Red } else { Color::Gray };
         lines.push(Line::from(vec![
             Span::styled("RV30/1h:", Style::default().fg(Color::Gray)),
             Span::raw(" "),
-            Span::styled(format!("{:.2}%/{:.2}%", rv30, rv1h), Style::default().fg(Color::White)),
+            Span::styled(format!("{:.2}%/{:.2}%", rv30, rv1h), Style::default().fg(rv_color)),
             Span::raw(" "),
             Span::styled(trend, Style::default().fg(Color::DarkGray)),
         ]));
