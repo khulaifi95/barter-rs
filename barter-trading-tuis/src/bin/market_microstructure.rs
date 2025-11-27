@@ -763,11 +763,18 @@ fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggr
                 .map(|d| if d > 0.0 { Color::Green } else if d < 0.0 { Color::Red } else { Color::Gray })
                 .unwrap_or(Color::Gray);
 
-            lines.push(Line::from(vec![
-                Span::styled(" tvVWAP: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{} ", tv_vwap_str), Style::default().fg(Color::Yellow)),
-                Span::styled(tv_dev_str, Style::default().fg(tv_dev_color)),
-            ]));
+            if t.candles_5m_len >= 12 {
+                lines.push(Line::from(vec![
+                    Span::styled(" tvVWAP: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{} ", tv_vwap_str), Style::default().fg(Color::Yellow)),
+                    Span::styled(tv_dev_str, Style::default().fg(tv_dev_color)),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(" tvVWAP: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("warming", Style::default().fg(Color::DarkGray)),
+                ]));
+            }
 
             // ATR + Volatility line (compact)
             let atr_str = t.atr_14
