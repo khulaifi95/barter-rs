@@ -1861,7 +1861,7 @@ fn render_volatility_new(
             atr_spans.push(Span::raw("   "));
             atr_spans.push(Span::styled("BVOL24H:", Style::default().fg(Color::Gray)));
             atr_spans.push(Span::raw(" "));
-            atr_spans.push(Span::styled(format!("{:.2}", bvol), Style::default().fg(Color::Yellow)));
+            atr_spans.push(Span::styled(format!("{:.2}", bvol), Style::default().fg(Color::LightYellow)));
         }
         lines.push(Line::from(atr_spans));
 
@@ -1899,7 +1899,7 @@ fn render_volatility_new(
             Span::raw(" "),
             Span::styled(format!("{:.2}%/{:.2}%", rv30, rv1h), Style::default().fg(rv_color)),
             Span::raw(" "),
-            Span::styled(trend, Style::default().fg(Color::DarkGray)),
+            Span::styled(trend, Style::default().fg(Color::Gray)),
         ]));
     }
 
