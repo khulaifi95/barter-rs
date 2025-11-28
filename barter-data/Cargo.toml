@@ -25,7 +25,7 @@ barter-macro = { workspace = true }
 tracing = { workspace = true }
 
 # Async
-tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 futures = { workspace = true }
 futures-util = { workspace = true }

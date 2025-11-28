@@ -2,18 +2,16 @@ use chrono::{DateTime, Utc};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{
-        Block, BorderType, Borders, Gauge, List, ListItem, Paragraph, Sparkline,
-    },
-    Frame, Terminal,
+    widgets::{Block, BorderType, Borders, Gauge, List, ListItem, Paragraph, Sparkline},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -166,7 +164,14 @@ impl OrderBookL1Stats {
         }
     }
 
-    fn update(&mut self, bid_price: f64, bid_quantity: f64, ask_price: f64, ask_quantity: f64, time: Option<DateTime<Utc>>) {
+    fn update(
+        &mut self,
+        bid_price: f64,
+        bid_quantity: f64,
+        ask_price: f64,
+        ask_quantity: f64,
+        time: Option<DateTime<Utc>>,
+    ) {
         self.bid_price = bid_price;
         self.bid_quantity = bid_quantity;
         self.ask_price = ask_price;
@@ -230,10 +235,7 @@ impl OpenInterestStats {
     }
 
     fn get_sparkline_data(&self) -> Vec<u64> {
-        self.history
-            .iter()
-            .map(|&v| (v / 1000.0) as u64)
-            .collect()
+        self.history.iter().map(|&v| (v / 1000.0) as u64).collect()
     }
 }
 
@@ -334,7 +336,15 @@ impl AppState {
         self.last_update = Utc::now();
     }
 
-    fn update_order_book_l1(&mut self, key: String, bid_price: f64, bid_quantity: f64, ask_price: f64, ask_quantity: f64, time: Option<DateTime<Utc>>) {
+    fn update_order_book_l1(
+        &mut self,
+        key: String,
+        bid_price: f64,
+        bid_quantity: f64,
+        ask_price: f64,
+        ask_quantity: f64,
+        time: Option<DateTime<Utc>>,
+    ) {
         self.order_book_l1
             .entry(key)
             .or_insert_with(OrderBookL1Stats::new)
@@ -389,9 +399,27 @@ async fn websocket_client(state: Arc<Mutex<AppState>>) -> Result<(), Box<dyn std
                     s.connected = true;
                 }
 
-                let (mut _write, mut read) = ws_stream.split();
+                let (mut write, mut read) = ws_stream.split();
 
-                while let Some(msg) = read.next().await {
+                // Spawn ping task to keep connection alive (prevents timeouts)
+                let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel::<()>(1);
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(30));
+                    loop {
+                        interval.tick().await;
+                        if write.send(Message::Ping(vec![].into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = ping_tx.send(()).await; // Notify main loop if ping fails
+                });
+
+                loop {
+                    tokio::select! {
+                        msg = read.next() => {
+                            let Some(msg) = msg else {
+                                break;
+                            };
                     match msg {
                         Ok(Message::Text(text)) => {
                             // First check if it's a welcome message
@@ -415,12 +443,25 @@ async fn websocket_client(state: Arc<Mutex<AppState>>) -> Result<(), Box<dyn std
                             }
                         }
                         Ok(Message::Close(_)) => {
+                            eprintln!("Server closed connection");
                             break;
                         }
-                        Err(_) => {
+                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+                            // Heartbeat messages - ignore (tungstenite handles automatically)
+                        }
+                        Err(e) => {
+                            // Log error but don't disconnect - let auto-reconnect handle it
+                            eprintln!("WebSocket error (will reconnect): {}", e);
                             break;
                         }
                         _ => {}
+                    }
+                        }
+                        _ = ping_rx.recv() => {
+                            // Ping task died, connection likely dead
+                            eprintln!("Ping task died, reconnecting...");
+                            break;
+                        }
                     }
                 }
 
@@ -462,14 +503,24 @@ async fn process_event(state: Arc<Mutex<AppState>>, event: MarketEventMessage) {
         }
         "open_interest" => {
             if let Ok(oi) = serde_json::from_value::<OpenInterestData>(event.data.clone()) {
-                let mut s = state.lock().await;
-                s.update_open_interest(key, oi.contracts);
+                // Only track perp/futures instruments to match panel capacity
+                if event.instrument.kind.to_lowercase().contains("perpetual")
+                    || event.instrument.kind.to_lowercase().contains("future")
+                {
+                    let mut s = state.lock().await;
+                    s.update_open_interest(key, oi.contracts);
+                }
             }
         }
         "cumulative_volume_delta" => {
             if let Ok(cvd) = serde_json::from_value::<CvdData>(event.data) {
-                let mut s = state.lock().await;
-                s.update_cvd(key, cvd.delta_base, cvd.delta_quote);
+                // Perp-only for CVD in the legacy view
+                if event.instrument.kind.to_lowercase().contains("perpetual")
+                    || event.instrument.kind.to_lowercase().contains("future")
+                {
+                    let mut s = state.lock().await;
+                    s.update_cvd(key, cvd.delta_base, cvd.delta_quote);
+                }
             }
         }
         "trade" => {
@@ -488,13 +539,42 @@ async fn process_event(state: Arc<Mutex<AppState>>, event: MarketEventMessage) {
         }
         "order_book_l1" => {
             if let Ok(ob) = serde_json::from_value::<OrderBookL1Data>(event.data.clone()) {
-                let bid_price = ob.best_bid.as_ref().map(|l| l.price.to_string().parse::<f64>().unwrap_or(0.0)).unwrap_or(0.0);
-                let bid_quantity = ob.best_bid.as_ref().map(|l| l.amount.to_string().parse::<f64>().unwrap_or(0.0)).unwrap_or(0.0);
-                let ask_price = ob.best_ask.as_ref().map(|l| l.price.to_string().parse::<f64>().unwrap_or(0.0)).unwrap_or(0.0);
-                let ask_quantity = ob.best_ask.as_ref().map(|l| l.amount.to_string().parse::<f64>().unwrap_or(0.0)).unwrap_or(0.0);
+                // Only show perp/futures order books in the legacy panel to avoid overcrowding
+                let kind = event.instrument.kind.to_lowercase();
+                if !kind.contains("perpetual") && !kind.contains("future") {
+                    return;
+                }
+
+                let bid_price = ob
+                    .best_bid
+                    .as_ref()
+                    .map(|l| l.price.to_string().parse::<f64>().unwrap_or(0.0))
+                    .unwrap_or(0.0);
+                let bid_quantity = ob
+                    .best_bid
+                    .as_ref()
+                    .map(|l| l.amount.to_string().parse::<f64>().unwrap_or(0.0))
+                    .unwrap_or(0.0);
+                let ask_price = ob
+                    .best_ask
+                    .as_ref()
+                    .map(|l| l.price.to_string().parse::<f64>().unwrap_or(0.0))
+                    .unwrap_or(0.0);
+                let ask_quantity = ob
+                    .best_ask
+                    .as_ref()
+                    .map(|l| l.amount.to_string().parse::<f64>().unwrap_or(0.0))
+                    .unwrap_or(0.0);
 
                 let mut s = state.lock().await;
-                s.update_order_book_l1(key, bid_price, bid_quantity, ask_price, ask_quantity, Some(ob.last_update_time));
+                s.update_order_book_l1(
+                    key,
+                    bid_price,
+                    bid_quantity,
+                    ask_price,
+                    ask_quantity,
+                    Some(ob.last_update_time),
+                );
             }
         }
         _ => {
@@ -615,10 +695,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
             .add_modifier(Modifier::BOLD),
     );
 
-    let help = Span::styled(
-        " [Q] Quit ",
-        Style::default().fg(Color::Rgb(128, 128, 128)),
-    );
+    let help = Span::styled(" [Q] Quit ", Style::default().fg(Color::Rgb(128, 128, 128)));
 
     let status_line = Line::from(vec![status, time, title, help]);
 
@@ -665,9 +742,7 @@ fn render_liquidations(f: &mut Frame, area: Rect, state: &AppState) {
             let line = Line::from(vec![
                 Span::styled(
                     format!(" {} ", liq.time.format("%H:%M:%S")),
-                    Style::default()
-                        .fg(Color::Rgb(128, 128, 150))
-                        .bg(bg_color),
+                    Style::default().fg(Color::Rgb(128, 128, 150)).bg(bg_color),
                 ),
                 Span::styled(
                     format!("{} ", symbol),
@@ -682,9 +757,7 @@ fn render_liquidations(f: &mut Frame, area: Rect, state: &AppState) {
                 ),
                 Span::styled(
                     format!("{:<10} ", liq.instrument),
-                    Style::default()
-                        .fg(Color::Rgb(200, 200, 220))
-                        .bg(bg_color),
+                    Style::default().fg(Color::Rgb(200, 200, 220)).bg(bg_color),
                 ),
                 Span::styled(
                     format!("${:>10.2} ", liq.price),
@@ -695,9 +768,7 @@ fn render_liquidations(f: &mut Frame, area: Rect, state: &AppState) {
                 ),
                 Span::styled(
                     format!(" Qty:{:.4} ", liq.quantity),
-                    Style::default()
-                        .fg(Color::Rgb(255, 105, 180))
-                        .bg(bg_color),
+                    Style::default().fg(Color::Rgb(255, 105, 180)).bg(bg_color),
                 ),
             ]);
 
@@ -738,10 +809,7 @@ fn render_liquidations(f: &mut Frame, area: Rect, state: &AppState) {
 
 fn render_open_interest(f: &mut Frame, area: Rect, state: &AppState) {
     let title = Line::from(vec![
-        Span::styled(
-            " 📊 ",
-            Style::default().fg(Color::Rgb(100, 149, 237)),
-        ),
+        Span::styled(" 📊 ", Style::default().fg(Color::Rgb(100, 149, 237))),
         Span::styled(
             "OPEN INTEREST",
             Style::default()
@@ -808,14 +876,12 @@ fn render_open_interest(f: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    format!(" {} ", key),
-                    Style::default()
-                        .fg(Color::Rgb(100, 200, 255))
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
+            Line::from(vec![Span::styled(
+                format!(" {} ", key),
+                Style::default()
+                    .fg(Color::Rgb(100, 200, 255))
+                    .add_modifier(Modifier::BOLD),
+            )]),
             Line::from(vec![
                 Span::styled(
                     format!("  Value: {:>14.0} ", stats.current),
@@ -867,10 +933,7 @@ fn render_open_interest(f: &mut Frame, area: Rect, state: &AppState) {
 
 fn render_cvd(f: &mut Frame, area: Rect, state: &AppState) {
     let title = Line::from(vec![
-        Span::styled(
-            " 💹 ",
-            Style::default().fg(Color::Rgb(255, 105, 180)),
-        ),
+        Span::styled(" 💹 ", Style::default().fg(Color::Rgb(255, 105, 180))),
         Span::styled(
             "CUMULATIVE VOLUME DELTA",
             Style::default()
@@ -960,7 +1023,10 @@ fn render_cvd(f: &mut Frame, area: Rect, state: &AppState) {
         // Delta values
         let delta_text = vec![
             Line::from(vec![
-                Span::styled("  Δ Base:  ", Style::default().fg(Color::Rgb(150, 150, 170))),
+                Span::styled(
+                    "  Δ Base:  ",
+                    Style::default().fg(Color::Rgb(150, 150, 170)),
+                ),
                 Span::styled(
                     format!("{:>12.4}", stats.delta_base),
                     Style::default()
@@ -1001,7 +1067,11 @@ fn render_cvd(f: &mut Frame, area: Rect, state: &AppState) {
             if gauge_area.y < inner.y + inner.height {
                 let gauge = Gauge::default()
                     .block(Block::default())
-                    .gauge_style(Style::default().fg(pressure_color).bg(Color::Rgb(30, 30, 40)))
+                    .gauge_style(
+                        Style::default()
+                            .fg(pressure_color)
+                            .bg(Color::Rgb(30, 30, 40)),
+                    )
                     .ratio(stats.buy_pressure / 100.0)
                     .label(Span::styled(
                         format!(" Buy Pressure: {:.1}% ", stats.buy_pressure),
@@ -1113,9 +1183,7 @@ fn render_trades(f: &mut Frame, area: Rect, state: &AppState) {
             let line = Line::from(vec![
                 Span::styled(
                     format!(" {} ", trade.time.format("%H:%M:%S")),
-                    Style::default()
-                        .fg(Color::Rgb(128, 128, 150))
-                        .bg(bg_color),
+                    Style::default().fg(Color::Rgb(128, 128, 150)).bg(bg_color),
                 ),
                 Span::styled(
                     format!("{} ", symbol),
@@ -1130,9 +1198,7 @@ fn render_trades(f: &mut Frame, area: Rect, state: &AppState) {
                 ),
                 Span::styled(
                     format!("{:<10} ", trade.instrument),
-                    Style::default()
-                        .fg(Color::Rgb(200, 200, 220))
-                        .bg(bg_color),
+                    Style::default().fg(Color::Rgb(200, 200, 220)).bg(bg_color),
                 ),
                 Span::styled(
                     format!("${:>10.2} ", trade.price),
@@ -1143,9 +1209,7 @@ fn render_trades(f: &mut Frame, area: Rect, state: &AppState) {
                 ),
                 Span::styled(
                     format!(" Qty:{:.4} ", trade.quantity),
-                    Style::default()
-                        .fg(Color::Rgb(100, 200, 255))
-                        .bg(bg_color),
+                    Style::default().fg(Color::Rgb(100, 200, 255)).bg(bg_color),
                 ),
             ]);
 
@@ -1229,14 +1293,12 @@ fn render_order_book_l1(f: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    format!(" {} ", key),
-                    Style::default()
-                        .fg(Color::Rgb(100, 255, 218))
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
+            Line::from(vec![Span::styled(
+                format!(" {} ", key),
+                Style::default()
+                    .fg(Color::Rgb(100, 255, 218))
+                    .add_modifier(Modifier::BOLD),
+            )]),
             Line::from(vec![
                 Span::styled(
                     format!("  Bid: ${:>10.2} ", stats.bid_price),

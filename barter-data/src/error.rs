@@ -49,6 +49,20 @@ impl DataError {
     pub fn is_terminal(&self) -> bool {
         match self {
             DataError::InvalidSequence { .. } => true,
+            DataError::Socket(error_msg) => {
+                // Socket termination errors require reconnection
+                // Check for keywords that indicate the connection is closed/terminated
+                // Use case-insensitive matching for robustness
+                let error_lower = error_msg.to_lowercase();
+                error_lower.contains("terminated")
+                    || error_lower.contains("connectionclosed")
+                    || error_lower.contains("alreadyclosed")
+                    || error_lower.contains("sendafterclosing")
+                    // IO errors often indicate network disconnection
+                    || error_lower.contains("io(")
+                    // Read timeout indicates silent stream death - requires reconnection
+                    || error_lower.contains("timeout")
+            }
             _ => false,
         }
     }
@@ -81,9 +95,29 @@ mod tests {
                 expected: true,
             },
             TestCase {
-                // TC1: is not terminal w/ DataError::Socket
+                // TC1: is not terminal w/ DataError::Socket (non-termination error)
                 input: DataError::from(SocketError::Sink),
                 expected: false,
+            },
+            TestCase {
+                // TC2: is terminal w/ DataError::Socket containing "Terminated"
+                input: DataError::Socket("ExchangeStream terminated with closing frame".to_string()),
+                expected: true,
+            },
+            TestCase {
+                // TC3: is terminal w/ DataError::Socket containing "ConnectionClosed"
+                input: DataError::Socket("WebSocket error: ConnectionClosed".to_string()),
+                expected: true,
+            },
+            TestCase {
+                // TC4: is terminal w/ DataError::Socket containing "Io("
+                input: DataError::Socket("WebSocket error: Io(Kind(UnexpectedEof))".to_string()),
+                expected: true,
+            },
+            TestCase {
+                // TC5: is terminal w/ DataError::Socket containing "timeout"
+                input: DataError::Socket("WebSocket read timeout: no data received for 120 seconds".to_string()),
+                expected: true,
             },
         ];
 

@@ -66,6 +66,9 @@ pub enum SocketError {
 
     #[error("consumed error message from execution: {0}")]
     Exchange(String),
+
+    #[error("WebSocket read timeout: no data received for {0} seconds")]
+    ReadTimeout(u64),
 }
 
 impl From<reqwest::Error> for SocketError {

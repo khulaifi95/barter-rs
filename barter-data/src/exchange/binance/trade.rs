@@ -80,6 +80,9 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, BinanceTrade)>
     for MarketIter<InstrumentKey, PublicTrade>
 {
     fn from((exchange_id, instrument, trade): (ExchangeId, InstrumentKey, BinanceTrade)) -> Self {
+        eprintln!("[BINANCE TRADE DEBUG] Converting Binance trade to MarketEvent");
+        eprintln!("[BINANCE TRADE DEBUG]   Trade: {} @ {} qty {} side {:?}",
+            trade.subscription_id, trade.price, trade.amount, trade.side);
         Self(vec![Ok(MarketEvent {
             time_exchange: trade.time,
             time_received: Utc::now(),

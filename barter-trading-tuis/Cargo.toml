@@ -1,0 +1,57 @@
+[package]
+name = "barter-trading-tuis"
+version = "0.1.0"
+edition = "2021"
+authors = ["JustAStream <justastream.code@gmail.com>"]
+license = "MIT"
+description = "Institutional-grade trading terminals with advanced market microstructure analytics"
+
+# Three separate TUI binaries
+[[bin]]
+name = "market-microstructure"
+path = "src/bin/market_microstructure.rs"
+
+[[bin]]
+name = "institutional-flow"
+path = "src/bin/institutional_flow.rs"
+
+[[bin]]
+name = "risk-scanner"
+path = "src/bin/risk_scanner.rs"
+
+[[bin]]
+name = "scalper"
+path = "src/bin/scalper.rs"
+
+[dependencies]
+# TUI Framework
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Async Runtime
+tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread", "net", "time"] }
+futures = { workspace = true }
+
+# WebSocket
+tokio-tungstenite = { workspace = true }
+
+# HTTP Client for backfill
+reqwest = { version = "0.11", features = ["json"] }
+
+# SerDe
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time & Date
+chrono = { workspace = true }
+
+# Math
+rust_decimal = "1.36"
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lib]
+name = "barter_trading_tuis"
+path = "src/lib.rs"

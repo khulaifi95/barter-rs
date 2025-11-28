@@ -5,6 +5,7 @@ members = [
     "barter-data",
     "barter-data-server",
     "barter-data-tui",
+    "barter-trading-tuis",
     "barter-execution",
     "barter-integration",
     "barter-macro",
