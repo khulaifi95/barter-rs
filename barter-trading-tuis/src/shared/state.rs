@@ -21,7 +21,19 @@ use std::sync::OnceLock;
 // SMA's equal weighting of 70-minute-old data causes unacceptable lag during rapid moves.
 // Future consideration: If EMA proves too noisy, revisit SMA or use shorter period (ATR-10).
 
-/// 5-minute candle for ATR calculation
+/// 1-minute candle from Binance kline stream (authoritative source)
+#[derive(Clone, Debug)]
+pub struct Candle1m {
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    pub start_time: DateTime<Utc>,
+    pub is_complete: bool,
+}
+
+/// 5-minute candle for ATR calculation (aggregated from 1m candles)
 #[derive(Clone, Debug)]
 struct Candle5m {
     open: f64,
@@ -282,8 +294,69 @@ pub async fn fetch_binance_5m_candles(symbol: &str) -> Result<Vec<Candle5m>, Str
     Ok(candles)
 }
 
+/// Fetch 1m candles from Binance futures API (authoritative source for tvVWAP/ATR/RV)
+pub async fn fetch_binance_1m_candles(symbol: &str) -> Result<Vec<Candle1m>, String> {
+    // Calculate start time: 00:00 UTC today
+    let now = Utc::now();
+    let start_of_day = now
+        .with_hour(0)
+        .and_then(|t| t.with_minute(0))
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(now);
+    let start_ms = start_of_day.timestamp_millis();
+
+    // Fetch from start of day (for tvVWAP) plus some warmup for ATR
+    // 1m candles: fetch last 300 (5 hours) for ATR warmup and RV calculation
+    let warmup_start_ms = start_ms - (60 * 60 * 1000); // 1 hour before midnight
+
+    let url = format!(
+        "https://fapi.binance.com/fapi/v1/klines?symbol={}&interval=1m&startTime={}&limit=1000",
+        symbol, warmup_start_ms
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP error: {}", response.status()));
+    }
+
+    let klines: Vec<BinanceKline> = response
+        .json()
+        .await
+        .map_err(|e| format!("JSON parse failed: {}", e))?;
+
+    let candles: Vec<Candle1m> = klines
+        .into_iter()
+        .filter_map(|k| {
+            let open_time_ms = k.0;
+            let close_time_ms = k.6;
+            let start_time = DateTime::from_timestamp_millis(open_time_ms)?;
+            // Mark candle as complete if close time has passed
+            let is_complete = close_time_ms < now.timestamp_millis();
+            Some(Candle1m {
+                open: k.1.parse().ok()?,
+                high: k.2.parse().ok()?,
+                low: k.3.parse().ok()?,
+                close: k.4.parse().ok()?,
+                volume: k.5.parse().ok()?,
+                start_time,
+                is_complete,
+            })
+        })
+        .collect();
+
+    Ok(candles)
+}
+
 /// Map ticker to Binance futures symbol
-fn ticker_to_binance_symbol(ticker: &str) -> &'static str {
+pub fn ticker_to_binance_symbol(ticker: &str) -> &'static str {
     match ticker {
         "BTC" => "BTCUSDT",
         "ETH" => "ETHUSDT",
@@ -671,6 +744,45 @@ impl Aggregator {
         }
     }
 
+    /// Backfill tvVWAP, ATR, and RV from authoritative Binance 1m klines
+    /// This is the preferred backfill method - use this for accurate metrics
+    pub async fn backfill_1m_klines(&mut self, tickers: &[&str]) -> HashMap<String, BackfillResult> {
+        let mut results = HashMap::new();
+
+        for ticker in tickers {
+            let symbol = ticker_to_binance_symbol(ticker);
+
+            // Ensure ticker state exists
+            let state = self
+                .tickers
+                .entry(ticker.to_string())
+                .or_insert_with(|| TickerState::new(ticker.to_string()));
+
+            match fetch_binance_1m_candles(symbol).await {
+                Ok(candles) => {
+                    let result = state.backfill_from_1m_candles(candles);
+                    results.insert(ticker.to_string(), result);
+                }
+                Err(e) => {
+                    eprintln!("[backfill-1m] {} failed: {}", ticker, e);
+                    results.insert(ticker.to_string(), BackfillResult::default());
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Push a 1m candle update from Binance kline WebSocket
+    pub fn push_1m_candle(&mut self, ticker: &str, candle: Candle1m) {
+        let state = self
+            .tickers
+            .entry(ticker.to_string())
+            .or_insert_with(|| TickerState::new(ticker.to_string()));
+
+        state.push_1m_candle(candle);
+    }
+
     pub fn process_event(&mut self, event: MarketEventMessage) {
         let ticker = event.instrument.base.to_uppercase();
         let kind = event.instrument.kind.to_lowercase();
@@ -940,12 +1052,22 @@ struct TickerState {
     vwap_daily: VwapState,
     vwap_session: VwapState,
     current_session: Option<TradingSession>,
-    // tvVWAP state (HLC3 on 5m candles - TradingView style)
+    // tvVWAP state (HLC3 on 5m candles - TradingView style) - DEPRECATED: kept for fallback
     tv_vwap: VwapState,
-    // ATR-14 state (5m candles, EMA)
+    // ATR-14 state (5m candles, EMA) - DEPRECATED: kept for fallback
     candles_5m: VecDeque<Candle5m>,
     current_candle: Option<Candle5m>,
     atr_state: AtrState,
+
+    // === KLINE-BASED METRICS (authoritative, from Binance 1m klines) ===
+    // 1m candle buffer from Binance kline stream (keep 300 = 5 hours)
+    candles_1m: VecDeque<Candle1m>,
+    // tvVWAP computed from 1m klines (authoritative)
+    kline_tv_vwap: VwapState,
+    // ATR-14 computed from 1m klines (14 minutes lookback)
+    kline_atr_state: AtrState,
+    // Flag to indicate kline data is available and should be used
+    use_kline_metrics: bool,
     // L2 Orderbook state per exchange
     book_imbalance_by_exchange: HashMap<String, f64>,  // Current imbalance (0-100%, 50% = balanced)
     book_last_update: HashMap<String, DateTime<Utc>>,  // Last update time per exchange
@@ -982,6 +1104,11 @@ impl TickerState {
             candles_5m: VecDeque::with_capacity(15), // Keep 15 candles (14 for ATR + current)
             current_candle: None,
             atr_state: AtrState::default(),
+            // Kline-based metrics (authoritative)
+            candles_1m: VecDeque::with_capacity(300), // Keep 300 1m candles (5 hours)
+            kline_tv_vwap: VwapState::default(),
+            kline_atr_state: AtrState::default(),
+            use_kline_metrics: false, // Will be set to true once kline data is available
             book_imbalance_by_exchange: HashMap::new(),
             book_last_update: HashMap::new(),
             book_flip_history: VecDeque::new(),
@@ -1012,14 +1139,20 @@ impl TickerState {
         for candle in candles {
             let candle_date = candle.start_time.date_naive();
 
-            // Only add to tvVWAP if candle is from today
-            if candle_date == today {
+            // Skip incomplete candles (candle end time = start + 5 minutes)
+            let candle_end = candle.start_time + ChronoDuration::minutes(5);
+            let is_complete = candle_end <= now;
+
+            // Only add to tvVWAP if candle is from today AND complete
+            if candle_date == today && is_complete {
                 let hlc3 = (candle.high + candle.low + candle.close) / 3.0;
                 self.tv_vwap.add_trade(hlc3, candle.volume);
             }
 
-            // Collect candles for ATR (use recent candles regardless of day)
-            candles_for_atr.push(candle);
+            // Collect candles for ATR (use recent completed candles regardless of day)
+            if is_complete {
+                candles_for_atr.push(candle);
+            }
         }
 
         // Pre-warm ATR with the last 14+ candles
@@ -1052,6 +1185,182 @@ impl TickerState {
                 None
             },
         }
+    }
+
+    /// Backfill tvVWAP, ATR, and RV from authoritative Binance 1m klines
+    /// This is the preferred method - results will not drift from exchange data
+    pub fn backfill_from_1m_candles(&mut self, candles: Vec<Candle1m>) -> BackfillResult {
+        if candles.is_empty() {
+            return BackfillResult::default();
+        }
+
+        let now = Utc::now();
+        let today = now.date_naive();
+
+        // Reset kline-based tvVWAP for today
+        self.kline_tv_vwap.reset(now);
+
+        // Reset kline-based ATR state
+        self.kline_atr_state = AtrState::default();
+
+        // Clear existing 1m candle buffer
+        self.candles_1m.clear();
+
+        let mut complete_candles: Vec<Candle1m> = Vec::new();
+
+        for candle in candles {
+            // Only process complete candles
+            if !candle.is_complete {
+                continue;
+            }
+
+            let candle_date = candle.start_time.date_naive();
+
+            // Add to tvVWAP if candle is from today
+            if candle_date == today {
+                let hlc3 = (candle.high + candle.low + candle.close) / 3.0;
+                self.kline_tv_vwap.add_trade(hlc3, candle.volume);
+            }
+
+            complete_candles.push(candle);
+        }
+
+        // Sort by time
+        complete_candles.sort_by_key(|c| c.start_time);
+
+        // Update ATR from 1m candles (convert to Candle5m-like for ATR update)
+        for candle in complete_candles.iter() {
+            // Create a temporary Candle5m for ATR calculation
+            let candle_5m = Candle5m {
+                open: candle.open,
+                high: candle.high,
+                low: candle.low,
+                close: candle.close,
+                volume: candle.volume,
+                start_time: candle.start_time,
+            };
+            self.kline_atr_state.update(&candle_5m);
+        }
+
+        // Store recent candles (keep last 300 for RV calculation)
+        let recent_candles: Vec<Candle1m> = complete_candles
+            .into_iter()
+            .rev()
+            .take(300)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        self.candles_1m = VecDeque::from(recent_candles);
+
+        // Mark kline metrics as available
+        self.use_kline_metrics = true;
+
+        BackfillResult {
+            candles_loaded: self.candles_1m.len(),
+            tv_vwap: self.kline_tv_vwap.vwap(),
+            atr_14: if self.kline_atr_state.initialized || self.kline_atr_state.tr_count >= 5 {
+                Some(self.kline_atr_state.value())
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Process a single 1m kline update from WebSocket stream
+    pub fn push_1m_candle(&mut self, candle: Candle1m) {
+        // Only process complete candles for tvVWAP/ATR
+        if !candle.is_complete {
+            return;
+        }
+
+        let now = Utc::now();
+        let today = now.date_naive();
+        let candle_date = candle.start_time.date_naive();
+
+        // Check if tvVWAP needs daily reset (new day at 00:00 UTC)
+        let needs_reset = match self.kline_tv_vwap.last_reset {
+            Some(last) => candle.start_time.date_naive() != last.date_naive(),
+            None => true,
+        };
+        if needs_reset {
+            self.kline_tv_vwap.reset(candle.start_time);
+        }
+
+        // Add to tvVWAP if candle is from today
+        if candle_date == today {
+            let hlc3 = (candle.high + candle.low + candle.close) / 3.0;
+            self.kline_tv_vwap.add_trade(hlc3, candle.volume);
+        }
+
+        // Update ATR
+        let candle_5m = Candle5m {
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close,
+            volume: candle.volume,
+            start_time: candle.start_time,
+        };
+        self.kline_atr_state.update(&candle_5m);
+
+        // Add to buffer (avoid duplicates by checking start_time)
+        if self.candles_1m.back().map(|c| c.start_time) != Some(candle.start_time) {
+            self.candles_1m.push_back(candle);
+            // Keep buffer size manageable
+            while self.candles_1m.len() > 300 {
+                self.candles_1m.pop_front();
+            }
+        }
+
+        // Mark kline metrics as available
+        self.use_kline_metrics = true;
+    }
+
+    /// Calculate RV from 1m klines for a given window (in minutes)
+    fn calculate_rv_from_1m(&self, minutes: usize) -> Option<f64> {
+        if self.candles_1m.len() < minutes {
+            return None;
+        }
+
+        // Get the last N candles
+        let candles: Vec<&Candle1m> = self.candles_1m.iter().rev().take(minutes).collect();
+        if candles.len() < 3 {
+            return None;
+        }
+
+        // Calculate close-to-close returns
+        let mut returns = Vec::with_capacity(candles.len() - 1);
+        for i in 0..candles.len() - 1 {
+            let current = candles[i].close;
+            let prev = candles[i + 1].close;
+            if prev > 0.0 {
+                returns.push((current - prev) / prev);
+            }
+        }
+
+        if returns.is_empty() {
+            return None;
+        }
+
+        // Calculate standard deviation
+        let mean: f64 = returns.iter().sum::<f64>() / returns.len() as f64;
+        let variance: f64 = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+        let std_dev = variance.sqrt();
+
+        // Return as percentage
+        Some(std_dev * 100.0)
+    }
+
+    /// Get RV30 (30-minute realized volatility from 1m candles)
+    pub fn rv_30m_from_klines(&self) -> Option<f64> {
+        self.calculate_rv_from_1m(30)
+    }
+
+    /// Get RV60 (60-minute realized volatility from 1m candles)
+    pub fn rv_1h_from_klines(&self) -> Option<f64> {
+        self.calculate_rv_from_1m(60)
     }
 
     fn push_trade(
@@ -1172,7 +1481,14 @@ impl TickerState {
         // Update VWAP and ATR (perps only for consistency)
         if is_perp {
             self.update_vwap(trade.price, normalized_amount, time);
-            self.update_candle(trade.price, normalized_amount, time);
+            // Only update trade-based candles if kline metrics are NOT available (fallback only)
+            // When kline metrics are active, tvVWAP/ATR/RV come from authoritative 1m klines
+            if !self.use_kline_metrics {
+                let is_binance = exchange.to_lowercase().contains("binance");
+                if is_binance {
+                    self.update_candle(trade.price, normalized_amount, time);
+                }
+            }
         }
 
         self.prune(time);
@@ -1565,15 +1881,27 @@ impl TickerState {
             _ => None,
         };
 
-        // tvVWAP (TradingView style - HLC3 on 5m candles)
-        let tv_vwap = self.tv_vwap.vwap();
+        // tvVWAP (TradingView style - HLC3 on candles)
+        // Prefer kline-based metrics (authoritative) when available
+        let tv_vwap = if self.use_kline_metrics {
+            self.kline_tv_vwap.vwap()
+        } else {
+            self.tv_vwap.vwap()
+        };
         let tv_vwap_deviation = match (self.latest_price(), tv_vwap) {
             (Some(price), Some(vwap)) if vwap > 0.0 => Some((price - vwap) / vwap * 100.0),
             _ => None,
         };
 
-        // ATR-14 (5m candles, EMA)
-        let atr_14 = if self.atr_state.initialized || self.atr_state.tr_count >= 5 {
+        // ATR-14 (candles, EMA)
+        // Prefer kline-based ATR (1m candles, 14-minute lookback) when available
+        let atr_14 = if self.use_kline_metrics {
+            if self.kline_atr_state.initialized || self.kline_atr_state.tr_count >= 5 {
+                Some(self.kline_atr_state.value())
+            } else {
+                None
+            }
+        } else if self.atr_state.initialized || self.atr_state.tr_count >= 5 {
             Some(self.atr_state.value())
         } else {
             None
@@ -1583,8 +1911,28 @@ impl TickerState {
             _ => None,
         };
 
-        // Realized Volatility (30m and 1h) - standard deviation of 5m returns
-        let (realized_vol_30m, realized_vol_1h, realized_vol_trend) = self.calculate_realized_volatility();
+        // Realized Volatility (30m and 1h)
+        // Prefer kline-based RV (1m candles) when available
+        let (realized_vol_30m, realized_vol_1h, realized_vol_trend) = if self.use_kline_metrics {
+            let rv_30m = self.rv_30m_from_klines();
+            let rv_1h = self.rv_1h_from_klines();
+            let trend = match (rv_30m, rv_1h) {
+                (Some(r30), Some(r60)) if r60 > 0.0 => {
+                    let ratio = r30 / r60;
+                    if ratio > 1.2 {
+                        VolTrend::Expanding
+                    } else if ratio < 0.8 {
+                        VolTrend::Contracting
+                    } else {
+                        VolTrend::Stable
+                    }
+                }
+                _ => VolTrend::Stable,
+            };
+            (rv_30m, rv_1h, trend)
+        } else {
+            self.calculate_realized_volatility()
+        };
 
         TickerSnapshot {
             ticker: self.ticker.clone(),
@@ -1651,7 +1999,12 @@ impl TickerState {
             vwap_daily_deviation,
             tv_vwap,
             tv_vwap_deviation,
-            candles_5m_len: self.candles_5m.len(),
+            // For UI gating: when using klines, report 1m buffer length; otherwise 5m buffer
+            candles_5m_len: if self.use_kline_metrics {
+                self.candles_1m.len()
+            } else {
+                self.candles_5m.len()
+            },
             atr_14,
             atr_14_pct,
             realized_vol_30m,

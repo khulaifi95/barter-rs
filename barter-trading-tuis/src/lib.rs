@@ -27,4 +27,6 @@ pub use shared::state::{
     AggregatedSnapshot, Aggregator, BackfillResult, BasisMomentum, BasisState, BasisStats,
     BasisTrend, CascadeLevel, CvdSummary, DivergenceSignal, FlowSignal, LiquidationCluster,
     OrderflowStats, TickDirection, TickerSnapshot, TradingSession, VolTrend, WhaleRecord,
+    // 1m kline support (authoritative source for tvVWAP/ATR/RV)
+    Candle1m, fetch_binance_1m_candles, ticker_to_binance_symbol,
 };
