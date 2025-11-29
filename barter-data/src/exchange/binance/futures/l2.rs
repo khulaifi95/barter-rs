@@ -54,7 +54,7 @@ impl SnapshotFetcher<BinanceFuturesUsd, OrderBooksL2>
             // Construct initial OrderBook snapshot GET url
             let market = sub.id();
             let snapshot_url = format!(
-                "{}?symbol={}&limit=100",
+                "{}?symbol={}&limit=1000",
                 HTTP_BOOK_L2_SNAPSHOT_URL_BINANCE_FUTURES_USD,
                 market.as_ref(),
             );

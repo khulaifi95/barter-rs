@@ -30,10 +30,10 @@ impl BybitChannel {
     /// See docs: <https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook>
     pub const ORDER_BOOK_L1: Self = Self("orderbook.1");
 
-    /// [`Bybit`] OrderBook Level2 channel name (20ms delta updates).
+    /// [`Bybit`] OrderBook Level2 channel name (100ms delta updates, 200 levels).
     ///
     /// See docs: <https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook>
-    pub const ORDER_BOOK_L2: Self = Self("orderbook.50");
+    pub const ORDER_BOOK_L2: Self = Self("orderbook.200");
 
     /// [`Bybit`] tickers channel name, used to stream open interest updates.
     ///

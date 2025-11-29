@@ -1730,8 +1730,9 @@ impl TickerState {
         time: DateTime<Utc>,
     ) {
         // Calculate bid imbalance percentage (0-100%, 50% = balanced)
-        // Use top 20 levels for imbalance calculation
-        let imbalance_pct = book.bid_imbalance_pct(20);
+        // Use all available levels for imbalance calculation
+        let levels_available = book.bids.levels.len().min(book.asks.levels.len());
+        let imbalance_pct = book.bid_imbalance_pct(levels_available);
 
         // Check for flip (direction change)
         let is_bid_heavy = imbalance_pct > 50.0;
