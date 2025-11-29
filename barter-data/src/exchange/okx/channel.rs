@@ -2,8 +2,12 @@ use super::Okx;
 use crate::{
     Identifier,
     subscription::{
-        Subscription, cvd::CumulativeVolumeDeltas, liquidation::Liquidations,
-        open_interest::OpenInterests, trade::PublicTrades,
+        Subscription,
+        book::OrderBooksL2,
+        cvd::CumulativeVolumeDeltas,
+        liquidation::Liquidations,
+        open_interest::OpenInterests,
+        trade::PublicTrades,
     },
 };
 use serde::Serialize;
@@ -30,6 +34,11 @@ impl OkxChannel {
     ///
     /// See docs: <https://www.okx.com/docs-v5/en/#websocket-api-public-channel-open-interest-channel>
     pub const OPEN_INTEREST: Self = Self("open-interest");
+
+    /// [`Okx`] OrderBook Level2 channel (400 levels, 100ms push).
+    ///
+    /// See docs: <https://www.okx.com/docs-v5/en/#websocket-api-public-channel-order-book-channel>
+    pub const ORDER_BOOK_L2: Self = Self("books");
 }
 
 impl<Instrument> Identifier<OkxChannel> for Subscription<Okx, Instrument, PublicTrades> {
@@ -53,6 +62,12 @@ impl<Instrument> Identifier<OkxChannel> for Subscription<Okx, Instrument, Cumula
 impl<Instrument> Identifier<OkxChannel> for Subscription<Okx, Instrument, OpenInterests> {
     fn id(&self) -> OkxChannel {
         OkxChannel::OPEN_INTEREST
+    }
+}
+
+impl<Instrument> Identifier<OkxChannel> for Subscription<Okx, Instrument, OrderBooksL2> {
+    fn id(&self) -> OkxChannel {
+        OkxChannel::ORDER_BOOK_L2
     }
 }
 
