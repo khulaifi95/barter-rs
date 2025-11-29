@@ -23,6 +23,10 @@ path = "src/bin/risk_scanner.rs"
 name = "scalper"
 path = "src/bin/scalper.rs"
 
+[[bin]]
+name = "scalper-v2"
+path = "src/bin/scalper_v2.rs"
+
 [dependencies]
 # TUI Framework
 ratatui = "0.29"
