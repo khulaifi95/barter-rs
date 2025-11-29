@@ -75,7 +75,7 @@ where
             "{}|{market}",
             BybitChannel::ORDER_BOOK_L1.0,
         ))),
-        (Some("orderbook"), Some("50"), Some(market)) => Ok(SubscriptionId::from(format!(
+        (Some("orderbook"), Some("200"), Some(market)) => Ok(SubscriptionId::from(format!(
             "{}|{market}",
             BybitChannel::ORDER_BOOK_L2.0,
         ))),
