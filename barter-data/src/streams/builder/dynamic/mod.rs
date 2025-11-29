@@ -126,6 +126,7 @@ where
         Subscription<Kraken, Instrument, PublicTrades>: Identifier<KrakenMarket>,
         Subscription<Kraken, Instrument, OrderBooksL1>: Identifier<KrakenMarket>,
         Subscription<Okx, Instrument, PublicTrades>: Identifier<OkxMarket>,
+        Subscription<Okx, Instrument, OrderBooksL2>: Identifier<OkxMarket>,
         Subscription<Okx, Instrument, Liquidations>: Identifier<OkxMarket>,
         Subscription<Okx, Instrument, OpenInterests>: Identifier<OkxMarket>,
         Subscription<Okx, Instrument, CumulativeVolumeDeltas>: Identifier<OkxMarket>,
@@ -781,6 +782,22 @@ where
                                         .map(|stream| {
                                             tokio::spawn(stream.forward_to(
                                                 txs.cvds.get(&exchange).unwrap().clone(),
+                                            ))
+                                        })
+                                    }
+                                    (ExchangeId::Okx, SubKind::OrderBooksL2) => {
+                                        init_market_stream(
+                                            STREAM_RECONNECTION_POLICY,
+                                            subs.into_iter()
+                                                .map(|sub| {
+                                                    Subscription::new(Okx, sub.instrument, OrderBooksL2)
+                                                })
+                                                .collect(),
+                                        )
+                                        .await
+                                        .map(|stream| {
+                                            tokio::spawn(stream.forward_to(
+                                                txs.l2s.get(&exchange).unwrap().clone(),
                                             ))
                                         })
                                     }
