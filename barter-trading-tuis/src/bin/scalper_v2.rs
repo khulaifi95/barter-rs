@@ -19,6 +19,8 @@ use std::{
 use barter_trading_tuis::{
     AggregatedSnapshot, Aggregator, Candle1m, ConnectionStatus, DivergenceSignal, FlowSignal,
     Side, VolTrend, WebSocketClient, WebSocketConfig, ticker_to_binance_symbol,
+    // Trad markets (ES/NQ) correlation
+    IbkrConnectionStatus, TradMarketState, render_trad_markets_panel, spawn_ibkr_feed,
 };
 use rustls::crypto::ring::default_provider;
 use crossterm::{
@@ -320,6 +322,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
+    // Trad markets (ES/NQ) correlation state
+    let trad_state = Arc::new(Mutex::new(TradMarketState::new()));
+    let (ibkr_status_tx, ibkr_status_rx) = tokio::sync::watch::channel(IbkrConnectionStatus::Disconnected);
+    {
+        let state = Arc::clone(&trad_state);
+        spawn_ibkr_feed(state, ibkr_status_tx);
+    }
+
     for &ticker in &TICKERS {
         let agg = Arc::clone(&aggregator);
         tokio::spawn(async move { run_binance_kline_stream(ticker, agg).await; });
@@ -334,8 +344,45 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     {
         let agg = Arc::clone(&aggregator);
+        let trad = Arc::clone(&trad_state);
         tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await { agg.lock().await.process_event(event); }
+            let mut last_latency_log = Instant::now();
+            let mut latency_samples: Vec<i64> = Vec::new();
+
+            while let Some(event) = event_rx.recv().await {
+                // Measure latency: exchange timestamp vs now
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let exchange_ms = event.time_exchange.timestamp_millis();
+                let latency_ms = now_ms - exchange_ms;
+
+                // Sample latency for BTC trades from Binance
+                if event.kind == "trade"
+                    && event.instrument.base.to_lowercase() == "btc"
+                    && event.exchange.to_lowercase().contains("binance")
+                {
+                    latency_samples.push(latency_ms);
+
+                    // Log every 5 seconds
+                    if last_latency_log.elapsed() >= Duration::from_secs(5) && !latency_samples.is_empty() {
+                        let avg = latency_samples.iter().sum::<i64>() / latency_samples.len() as i64;
+                        let max = *latency_samples.iter().max().unwrap_or(&0);
+                        let min = *latency_samples.iter().min().unwrap_or(&0);
+                        eprintln!("[LATENCY] BTC Binance trades: avg={}ms min={}ms max={}ms samples={}",
+                            avg, min, max, latency_samples.len());
+                        latency_samples.clear();
+                        last_latency_log = Instant::now();
+                    }
+                }
+
+                // Feed BTC trades to trad_state for ES/BTC correlation
+                if event.kind == "trade" && event.instrument.base.to_lowercase() == "btc" {
+                    if let Ok(trade) = serde_json::from_value::<barter_trading_tuis::TradeData>(event.data.clone()) {
+                        let ts = event.time_exchange.timestamp_millis();
+                        trad.lock().await.update_btc_trade(trade.price, trade.amount, ts);
+                    }
+                }
+                agg.lock().await.process_event(event);
+            }
         });
     }
 
@@ -383,8 +430,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             let bvol = *bvol24h.lock().await;
 
+            // Get trad markets signals
+            let trad_signals = trad_state.lock().await.get_signals();
+            let ibkr_status = *ibkr_status_rx.borrow();
+
             terminal.draw(|f| {
-                render_ui(f, f.area(), &snapshot, connected_now, ticker, debounced, &mut bar_state, bvol);
+                render_ui(f, f.area(), &snapshot, connected_now, ticker, debounced, &mut bar_state, bvol, &trad_signals, ibkr_status);
             })?;
             last_draw = Instant::now();
         }
@@ -409,17 +460,19 @@ fn render_ui(
     debounced: Option<(Option<DivergenceSignal>, FlowSignal)>,
     bar_state: &mut BarState,
     bvol24h: Option<f64>,
+    trad_signals: &barter_trading_tuis::CorrelationSignals,
+    ibkr_status: IbkrConnectionStatus,
 ) {
-    // Layout: Header | Signal | Flow+Book | Exchanges+Vol | Whales | Footer
+    // Layout: Header | Signal | Flow+Book | Exchanges+Vol | Whales+TradMarkets | Footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Header with full context
-            Constraint::Length(4),  // BIG SIGNAL
-            Constraint::Length(8),  // Flow + Book (side by side)
-            Constraint::Length(6),  // Exchanges + Volatility (need 4 lines: header + CVD + FLOW + spacing)
-            Constraint::Min(3),     // Whale tape
-            Constraint::Length(1),  // Footer
+            Constraint::Length(3),   // Header with full context
+            Constraint::Length(4),   // BIG SIGNAL
+            Constraint::Length(8),   // Flow + Book (side by side)
+            Constraint::Length(5),   // Exchanges + Volatility (compressed)
+            Constraint::Min(16),     // Whales + Trad Markets (side by side, needs height)
+            Constraint::Length(1),   // Footer
         ])
         .split(area);
 
@@ -442,7 +495,14 @@ fn render_ui(
     render_exchanges(f, exch_vol[0], snapshot, ticker);
     render_volatility(f, exch_vol[1], snapshot, ticker);
 
-    render_whales(f, chunks[4], snapshot, ticker);
+    // Whales (left 40%) + Trad Markets (right 60%)
+    let whale_trad = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(chunks[4]);
+    render_whales(f, whale_trad[0], snapshot, ticker);
+    render_trad_markets_panel(f, whale_trad[1], trad_signals, ibkr_status);
+
     render_footer(f, chunks[5], ticker);
 }
 
