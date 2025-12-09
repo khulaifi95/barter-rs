@@ -22,6 +22,12 @@ pub use shared::websocket::{WebSocketClient, WebSocketConfig};
 
 pub use shared::aggregation::{calculate_vwap, VolumeWindow};
 
+// Traditional markets (ES/NQ) correlation module
+pub use shared::trad_markets::{
+    CorrelationSignals, IbkrConnectionStatus, TradMarketState,
+    render_trad_markets_panel, spawn_ibkr_feed,
+};
+
 // Aggregation engine (shared across all TUIs)
 pub use shared::state::{
     AggregatedSnapshot, Aggregator, BackfillResult, BasisMomentum, BasisState, BasisStats,

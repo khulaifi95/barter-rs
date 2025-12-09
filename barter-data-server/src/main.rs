@@ -93,11 +93,12 @@ async fn main() {
     info!("Starting barter-data WebSocket server");
 
     // Create broadcast channel for market events
-    // Configurable buffer size via WS_BUFFER_SIZE env var (default: 10,000)
+    // Configurable buffer size via WS_BUFFER_SIZE env var (default: 100,000)
+    // NOTE: Increased from 10k to 100k to reduce backpressure with high-frequency L2 data
     let buffer_size = std::env::var("WS_BUFFER_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(10_000);
+        .unwrap_or(100_000);
 
     info!("WebSocket broadcast buffer size: {}", buffer_size);
     let (tx, _rx) = broadcast::channel::<MarketEventMessage>(buffer_size);
@@ -210,9 +211,10 @@ async fn main() {
                     let message = MarketEventMessage::from(market_event);
 
                     // Debug: log broadcast attempt for all event types
+                    // NOTE: Changed from info! to debug! to avoid blocking hot path
                     if is_trade {
                         let receivers = tx.receiver_count();
-                        info!(
+                        debug!(
                             "TRADE→{} clients: {} {} {}/{} ${:.0}",
                             receivers,
                             message.exchange,
