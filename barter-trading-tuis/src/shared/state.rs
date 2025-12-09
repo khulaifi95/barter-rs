@@ -368,7 +368,7 @@ pub fn ticker_to_binance_symbol(ticker: &str) -> &'static str {
 // Default constants (overridable via environment variables)
 const TRADE_RETENTION_SECS: i64 = 15 * 60;
 const LIQ_RETENTION_SECS: i64 = 10 * 60;
-const CVD_RETENTION_SECS: i64 = 5 * 60;
+const CVD_RETENTION_SECS: i64 = 15 * 60; // Extended to 15m to match UI panels
 const PRICE_RETENTION_SECS: i64 = 15 * 60;
 
 /// Get whale detection threshold from WHALE_THRESHOLD env var (default: $500,000)
@@ -464,6 +464,12 @@ pub struct TickerSnapshot {
     pub latest_spread_pct: Option<f64>,
     pub spot_mid: Option<f64>,
     pub perp_mid: Option<f64>,
+    /// Binance perp last trade price - consistent reference across all TUIs
+    pub binance_perp_last: Option<f64>,
+    /// Fair value: 30s volume-weighted mid across all perp exchanges
+    pub fair_value: Option<f64>,
+    /// Fair value deviation in basis points: (binance_last - FV) / FV * 10000
+    pub fair_value_deviation_bps: Option<f64>,
     pub basis: Option<BasisStats>,
     // Multi-timeframe orderflow (P0: 5s/15s/30s for scalper, 1m/5m for swing)
     pub orderflow_5s: OrderflowStats,
@@ -511,6 +517,10 @@ pub struct TickerSnapshot {
     pub oi_per_exchange: HashMap<String, f64>,
     pub oi_delta_per_exchange_5m: HashMap<String, f64>,
     pub oi_delta_per_exchange_15m: HashMap<String, f64>,
+    /// OI freshness: seconds since last OI update (max across all exchanges)
+    pub oi_freshness_secs: f64,
+    /// OI freshness per exchange: seconds since last OI update
+    pub oi_freshness_per_exchange: HashMap<String, f64>,
     // Exchange health (seconds since last data)
     pub exchange_health: HashMap<String, f64>,
     pub tick_direction: TickDirection,
@@ -844,7 +854,9 @@ impl Aggregator {
             }
             "open_interest" => {
                 if let Ok(oi) = serde_json::from_value::<OpenInterestData>(event.data) {
-                    state.push_oi(&event.exchange, oi.contracts);
+                    // Use exchange time from OI data if available, fallback to event time
+                    let oi_time = oi.time.unwrap_or(event.time_exchange);
+                    state.push_oi(&event.exchange, oi.contracts, oi_time);
                 }
             }
             "order_book_l1" => {
@@ -1036,10 +1048,14 @@ struct TickerState {
     oi_by_exchange: HashMap<String, f64>,
     oi_history: VecDeque<OiRecord>,
     oi_history_by_exchange: HashMap<String, VecDeque<OiRecord>>,
+    // OI last update timestamp per exchange (for freshness tracking)
+    oi_last_update: HashMap<String, DateTime<Utc>>,
     // P1: Basis history for momentum tracking
     basis_history: VecDeque<BasisRecord>,
     spot_mid: Option<f64>,
     perp_mid: Option<f64>,
+    // Binance perp last trade price - consistent reference for all TUIs
+    binance_perp_last: Option<f64>,
     spread_pct: Option<f64>,
     best_bid: Option<(f64, f64)>,
     best_ask: Option<(f64, f64)>,
@@ -1086,9 +1102,11 @@ impl TickerState {
             oi_by_exchange: HashMap::new(),
             oi_history: VecDeque::new(),
             oi_history_by_exchange: HashMap::new(),
+            oi_last_update: HashMap::new(),
             basis_history: VecDeque::new(),
             spot_mid: None,
             perp_mid: None,
+            binance_perp_last: None,
             spread_pct: None,
             best_bid: None,
             best_ask: None,
@@ -1467,6 +1485,11 @@ impl TickerState {
         }
         if is_perp {
             self.perp_mid = Some(trade.price);
+            // Track Binance perp last price specifically for consistent TUI display
+            // Guard: only set if price > 0 to prevent 0.000 display in headers
+            if exchange.to_lowercase().contains("binance") && trade.price > 0.0 {
+                self.binance_perp_last = Some(trade.price);
+            }
         }
 
         // Update CVD history based on trades (perps only), windowed
@@ -1609,7 +1632,7 @@ impl TickerState {
         }
     }
 
-    fn push_oi(&mut self, exchange: &str, contracts: f64) {
+    fn push_oi(&mut self, exchange: &str, contracts: f64, exchange_time: DateTime<Utc>) {
         // NORMALIZE: OKX reports raw contracts, not base currency
         // OKX contract sizes: BTC=0.01, ETH=0.1, SOL=1
         // Binance and Bybit report in base currency already
@@ -1627,6 +1650,10 @@ impl TickerState {
 
         // P1: Track OI time-series for velocity calculation
         let now = Utc::now();
+
+        // Track OI timestamp per exchange for freshness calculation
+        // Use current time (when we received it), not exchange time, for accurate freshness
+        self.oi_last_update.insert(exchange.to_string(), now);
         let total: f64 = self.oi_by_exchange.values().copied().sum();
         self.oi_history.push_back(OiRecord { time: now, total });
 
@@ -1858,6 +1885,7 @@ impl TickerState {
         let (oi_delta_15m, _) = self.oi_velocity(900);
         let oi_per_exchange = self.oi_by_exchange.clone();
         let (oi_delta_per_exchange_5m, oi_delta_per_exchange_15m) = self.oi_delta_per_exchange();
+        let (oi_freshness_secs, oi_freshness_per_exchange) = self.oi_freshness();
         // P0: Multi-timeframe tick direction (30s, 1m, 5m)
         let tick_direction_30s = self.tick_direction(30);
         let tick_direction = self.tick_direction(60);
@@ -1941,6 +1969,9 @@ impl TickerState {
             latest_spread_pct: self.spread_pct,
             spot_mid: self.spot_mid,
             perp_mid: self.perp_mid,
+            binance_perp_last: self.binance_perp_last,
+            fair_value: self.fair_value_30s(),
+            fair_value_deviation_bps: self.fair_value_deviation_bps(),
             basis,
             orderflow_5s,
             orderflow_15s,
@@ -1978,6 +2009,8 @@ impl TickerState {
             oi_per_exchange,
             oi_delta_per_exchange_5m,
             oi_delta_per_exchange_15m,
+            oi_freshness_secs,
+            oi_freshness_per_exchange,
             exchange_health: HashMap::new(), // TODO: populate from aggregator
             tick_direction,
             tick_direction_5m,
@@ -2119,6 +2152,49 @@ impl TickerState {
             Some(*p)
         } else {
             self.perp_mid.or(self.spot_mid)
+        }
+    }
+
+    /// Calculate fair value as 30s volume-weighted mid across all perp exchanges
+    fn fair_value_30s(&self) -> Option<f64> {
+        // Use last trade's exchange time as reference to avoid clock skew
+        let now = self
+            .trades
+            .back()
+            .map(|t| t.time)
+            .unwrap_or_else(Utc::now);
+        let cutoff = now - ChronoDuration::seconds(30);
+
+        let mut sum_pv = 0.0;  // sum of price * volume
+        let mut sum_v = 0.0;   // sum of volume
+
+        for t in self.trades.iter().rev() {
+            if t.time < cutoff {
+                break;
+            }
+            if t.is_perp {
+                sum_pv += t.price * t.usd;
+                sum_v += t.usd;
+            }
+        }
+
+        if sum_v > 0.0 {
+            Some(sum_pv / sum_v)
+        } else {
+            None
+        }
+    }
+
+    /// Calculate FV deviation in basis points: (binance_last - FV) / FV * 10000
+    /// Returns None if either price is missing or <= 0 to prevent garbage FV display
+    fn fair_value_deviation_bps(&self) -> Option<f64> {
+        let bnc_price = self.binance_perp_last?;
+        let fv = self.fair_value_30s()?;
+        // Guard: both prices must be positive to compute meaningful FV deviation
+        if bnc_price > 0.0 && fv > 0.0 {
+            Some((bnc_price - fv) / fv * 10000.0)
+        } else {
+            None
         }
     }
 
@@ -2523,7 +2599,12 @@ impl TickerState {
 
     /// Per-exchange short-window stats (CVD/volume/trades) for scalper
     fn per_exchange_short_stats(&self, window_secs: i64) -> HashMap<String, PerExchangeShortStats> {
-        let now = Utc::now();
+        // FIX: Use most recent trade's exchange time as reference instead of Utc::now()
+        // This avoids clock skew between local system time and exchange server time
+        // which was causing "--" to show when system clock is ahead of exchanges
+        let now = self.trades.back()
+            .map(|t| t.time)
+            .unwrap_or_else(Utc::now);
         let cutoff = now - ChronoDuration::seconds(window_secs);
         let mut acc: HashMap<String, (f64, f64, usize)> = HashMap::new(); // exchange -> (buy_usd, sell_usd, trades)
 
@@ -2718,6 +2799,27 @@ impl TickerState {
         }
 
         (delta_5m, delta_15m)
+    }
+
+    /// Calculate OI freshness (seconds since last update) per exchange
+    /// Returns (min_freshness, per_exchange_freshness)
+    /// min_freshness = most recent OI update across all exchanges (for header display)
+    fn oi_freshness(&self) -> (f64, HashMap<String, f64>) {
+        let now = Utc::now();
+        let mut per_exchange: HashMap<String, f64> = HashMap::new();
+        let mut min_freshness: f64 = 999.0; // Start high, find minimum
+
+        for (exchange, last_update) in &self.oi_last_update {
+            let age_secs = (now - *last_update).num_milliseconds() as f64 / 1000.0;
+            let abbrev = abbreviate_exchange(exchange);
+            per_exchange.insert(abbrev.to_string(), age_secs);
+            if age_secs < min_freshness {
+                min_freshness = age_secs; // Track most recent (smallest age)
+            }
+        }
+
+        // If no OI data yet, min_freshness stays at 999.0 to indicate stale
+        (min_freshness, per_exchange)
     }
 
     /// P1: Flow signal detection based on price/CVD relationship
