@@ -640,7 +640,7 @@ fn binance_open_interest_poller(
         (
             client,
             url,
-            interval(std::time::Duration::from_secs(10)),
+            interval(std::time::Duration::from_secs(5)), // Poll every 5s for fresher OI data
             instrument,
         ),
         move |(client, url, mut timer, instrument)| async move {

@@ -437,8 +437,8 @@ fn render_exchange_intelligence(f: &mut ratatui::Frame, area: Rect, snapshot: &A
 
         let total_oi: f64 = oi_by_exch.values().copied().sum();
 
-        // Get BTC price to convert OI delta from BTC to USD
-        let btc_price = t.latest_price.unwrap_or(87000.0);
+        // Get BTC price to convert OI delta from BTC to USD (use Binance for consistency)
+        let btc_price = t.binance_perp_last.or(t.latest_price).unwrap_or(87000.0);
 
         // Use the correct total delta (same as MARKET PULSE) and distribute by share
         // This avoids the oi_delta_per_exchange bug where HashMap overwrites on duplicate abbreviated keys
@@ -467,8 +467,9 @@ fn render_exchange_intelligence(f: &mut ratatui::Frame, area: Rect, snapshot: &A
             let color_15m = if delta_15m_usd > 0.0 { Color::Green } else if delta_15m_usd < 0.0 { Color::Red } else { Color::Gray };
             let arrow = if delta_5m_usd > 0.0 { "↑" } else if delta_5m_usd < 0.0 { "↓" } else { "→" };
 
-            let health = t.exchange_health.get(exch).copied().unwrap_or(0.5);
-            let health_color = if health < 1.0 { Color::Green } else if health < 5.0 { Color::Yellow } else { Color::Red };
+            // Use OI freshness for dot color (green < 5s, yellow 5-15s, red > 15s)
+            let oi_age = t.oi_freshness_per_exchange.get(exch).copied().unwrap_or(999.0);
+            let oi_freshness_color = if oi_age < 5.0 { Color::Green } else if oi_age < 15.0 { Color::Yellow } else { Color::Red };
 
             lines.push(Line::from(vec![
                 Span::styled(format!("  {:3}", exch), Style::default().fg(Color::Cyan)),
@@ -477,7 +478,7 @@ fn render_exchange_intelligence(f: &mut ratatui::Frame, area: Rect, snapshot: &A
                 Span::styled("/", Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{:<7} ", format_delta(delta_15m_usd)), Style::default().fg(color_15m)),
                 Span::styled(arrow, Style::default().fg(color_5m)),
-                Span::styled(" ●", Style::default().fg(health_color)),
+                Span::styled(" ●", Style::default().fg(oi_freshness_color)),
             ]));
         }
 
@@ -618,12 +619,15 @@ fn abbreviate_exchange_for_display(name: &str) -> &'static str {
 
 /// Format delta value with K/M suffix
 fn format_delta(value: f64) -> String {
-    if value.abs() >= 1_000_000.0 {
+    let abs = value.abs();
+    if abs >= 1_000_000.0 {
         format!("{:+.1}M", value / 1_000_000.0)
-    } else if value.abs() >= 1_000.0 {
+    } else if abs >= 1_000.0 {
         format!("{:+.1}K", value / 1_000.0)
-    } else {
+    } else if abs >= 1.0 {
         format!("{:+.0}", value)
+    } else {
+        "~0".to_string()  // Avoid showing +0 or -0 for tiny values
     }
 }
 
@@ -726,9 +730,10 @@ fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggr
 
     for ticker in tickers() {
         if let Some(t) = snapshot.tickers.get(ticker) {
-            // Ticker header with price and health indicator
+            // Ticker header with price and health indicator (use Binance for consistency)
             let price_str = t
-                .latest_price
+                .binance_perp_last
+                .or(t.latest_price)
                 .map(|p| {
                     if p >= 1000.0 {
                         format!("${:.1}K", p / 1000.0)
@@ -780,8 +785,8 @@ fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggr
                 Span::raw(format!("{:.0}{}(5m)", v5m, s5m)),
             ]));
 
-            // OI with per-exchange breakdown - convert from contracts to USD
-            let ticker_price = t.latest_price.unwrap_or(1.0);
+            // OI with per-exchange breakdown - convert from contracts to USD (use Binance for consistency)
+            let ticker_price = t.binance_perp_last.or(t.latest_price).unwrap_or(1.0);
             let oi_delta_usd = t.oi_delta_5m * ticker_price;
             let (oi_arrow, oi_color) = if oi_delta_usd > 100_000.0 {
                 ("↑", Color::Green)

@@ -213,7 +213,8 @@ fn render_risk_metrics(f: &mut Frame, snapshot: &AggregatedSnapshot, area: Rect)
         ]));
 
         if let Some(level) = &t.next_cascade_level {
-            let pct = if let Some(price) = t.latest_price {
+            // Use Binance perp price for consistent percentage calculation
+            let pct = if let Some(price) = t.binance_perp_last.or(t.latest_price) {
                 ((level.price - price) / price) * 100.0
             } else {
                 0.0
@@ -240,7 +241,8 @@ fn render_risk_metrics(f: &mut Frame, snapshot: &AggregatedSnapshot, area: Rect)
         }
 
         if let Some(level) = &t.protection_level {
-            let pct = if let Some(price) = t.latest_price {
+            // Use Binance perp price for consistent percentage calculation
+            let pct = if let Some(price) = t.binance_perp_last.or(t.latest_price) {
                 ((level.price - price) / price) * 100.0
             } else {
                 0.0

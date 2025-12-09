@@ -558,11 +558,13 @@ fn render_header(
     focused_ticker: &str,
 ) {
     let (price_str, delta_str, freshness_str) = if let Some(t) = snapshot.tickers.get(focused_ticker) {
-        let price = t.latest_price.unwrap_or(0.0);
-        let price_fmt = if price >= 1000.0 {
-            format!("${:.2}", price)
-        } else {
-            format!("${:.4}", price)
+        // Use Binance perp last price for consistent reference (falls back to latest_price)
+        // Guard: show "--" if no valid price to prevent 0.000 display
+        let price_opt = t.binance_perp_last.or(t.latest_price).filter(|&p| p > 0.0);
+        let price_fmt = match price_opt {
+            Some(p) if p >= 1000.0 => format!("${:.2}", p),
+            Some(p) => format!("${:.4}", p),
+            None => "--".to_string(),
         };
 
         // Calculate 30s price change
@@ -649,11 +651,13 @@ fn render_header_extended(
     let mut lines = Vec::new();
 
     if let Some(t) = snapshot.tickers.get(focused_ticker) {
-        let price = t.latest_price.unwrap_or(0.0);
-        let price_str = if price >= 1000.0 {
-            format!("${:.2}", price)
-        } else {
-            format!("${:.4}", price)
+        // Use Binance perp last price for consistent reference
+        // Guard: show "--" if no valid price to prevent 0.000 display
+        let price_opt = t.binance_perp_last.or(t.latest_price).filter(|&p| p > 0.0);
+        let price_str = match price_opt {
+            Some(p) if p >= 1000.0 => format!("${:.2}", p),
+            Some(p) => format!("${:.4}", p),
+            None => "--".to_string(),
         };
 
         // Status
@@ -1227,7 +1231,7 @@ fn render_whale_tape(
 ) {
     let threshold_k = whale_threshold() / 1000.0;
     let block = Block::default()
-        .title(format!(" WHALE TAPE (>${:.0}K, 30s) ", threshold_k))
+        .title(format!(" WHALE TAPE (>${:.0}K, 90s) ", threshold_k))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
@@ -1236,9 +1240,9 @@ fn render_whale_tape(
 
     if let Some(t) = snapshot.tickers.get(focused_ticker) {
         let now = chrono::Utc::now();
-        let cutoff = now - chrono::Duration::seconds(30);
+        let cutoff = now - chrono::Duration::seconds(90);
 
-        // Filter whales to last 30s
+        // Filter whales to last 90s
         let recent_whales: Vec<_> = t
             .whales
             .iter()
@@ -1248,7 +1252,7 @@ fn render_whale_tape(
 
         if recent_whales.is_empty() {
             lines.push(Line::from(Span::styled(
-                "No whale trades in last 30s",
+                "No whale trades in last 90s",
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
@@ -1491,6 +1495,22 @@ fn scale_number(v: f64) -> (f64, &'static str) {
     }
 }
 
+/// Format delta value - show actual small values instead of -0
+fn format_delta_value(v: f64) -> String {
+    let abs = v.abs();
+    if abs >= 1_000_000_000.0 {
+        format!("{:+.1}B", v / 1_000_000_000.0)
+    } else if abs >= 1_000_000.0 {
+        format!("{:+.1}M", v / 1_000_000.0)
+    } else if abs >= 1_000.0 {
+        format!("{:+.0}K", v / 1_000.0)
+    } else if abs >= 1.0 {
+        format!("{:+.0}", v)
+    } else {
+        "~0".to_string()
+    }
+}
+
 // ============================================================================
 // NEW RENDER FUNCTIONS FOR TARGET LAYOUT
 // ============================================================================
@@ -1512,11 +1532,13 @@ fn render_header_compact_new(
     f.render_widget(block, area);
 
     if let Some(t) = snapshot.tickers.get(focused_ticker) {
-        let price = t.latest_price.unwrap_or(0.0);
-        let price_str = if price >= 1000.0 {
-            format!("${:.2}", price)
-        } else {
-            format!("${:.4}", price)
+        // Use Binance perp last price for consistent reference
+        // Guard: show "--" if no valid price to prevent 0.000 display
+        let price_opt = t.binance_perp_last.or(t.latest_price).filter(|&p| p > 0.0);
+        let price_str = match price_opt {
+            Some(p) if p >= 1000.0 => format!("${:.2}", p),
+            Some(p) => format!("${:.4}", p),
+            None => "--".to_string(),
         };
 
         let status = if connected { "LIVE" } else { "DISC" };
@@ -1525,6 +1547,18 @@ fn render_header_compact_new(
         let spread_pct = t.latest_spread_pct.unwrap_or(0.0);
         let basis = t.basis.as_ref().map(|b| b.basis_pct).unwrap_or(0.0);
         let tps = t.trade_speed;
+
+        // Fair value deviation (bps) if available
+        let fv_span = t.fair_value_deviation_bps.map(|bps| {
+            let color = if bps > 5.0 {
+                Color::Red
+            } else if bps < -5.0 {
+                Color::Green
+            } else {
+                Color::Yellow
+            };
+            Span::styled(format!("FV:{:+.0}bps", bps), Style::default().fg(color))
+        });
 
         // Get LEAD exchange (keys are like "BNC-PERP", "BBT-SPOT", "OKX-PERP")
         let lead = t.exchange_dominance.iter()
@@ -1538,31 +1572,47 @@ fn render_header_compact_new(
             else { "OTH" }
         }).unwrap_or("--");
 
-        // OI direction and percentage (5m context)
-        let oi_vel = t.oi_velocity;
-        let oi_arrow = if oi_vel > 0.3 { "↑" } else if oi_vel < -0.3 { "↓" } else { "→" };
-        let oi_color = if oi_vel > 0.3 { Color::Green } else if oi_vel < -0.3 { Color::Red } else { Color::Gray };
-        // Calculate OI change % from delta and total
-        let oi_pct = if t.oi_total > 0.0 { (t.oi_delta_5m / t.oi_total) * 100.0 } else { 0.0 };
+        // OI: show raw delta + freshness (matching scalper-v2 format)
+        let oi_delta = t.oi_delta_5m;
+        let oi_arrow = if oi_delta > 100.0 { "↑" } else if oi_delta < -100.0 { "↓" } else { "→" };
+        let oi_color = if oi_delta > 100.0 { Color::Green } else if oi_delta < -100.0 { Color::Red } else { Color::Gray };
+        // Format delta with K/M suffix
+        let oi_delta_str = if oi_delta.abs() >= 1_000_000.0 {
+            format!("{:+.1}M", oi_delta / 1_000_000.0)
+        } else if oi_delta.abs() >= 1_000.0 {
+            format!("{:+.0}K", oi_delta / 1_000.0)
+        } else {
+            format!("{:+.0}", oi_delta)
+        };
+        // Freshness color: green < 5s, yellow 5-15s, red > 15s
+        let oi_age = t.oi_freshness_secs;
+        let oi_age_color = if oi_age < 5.0 { Color::Green } else if oi_age < 15.0 { Color::Yellow } else { Color::Red };
+        let oi_age_str = if oi_age > 99.0 { "??s".to_string() } else { format!("{:.0}s", oi_age) };
 
-        let line = Line::from(vec![
-            Span::styled(price_str, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::raw("  "),
-            Span::styled(format!("[{}]", status), Style::default().fg(status_color)),
-            Span::raw("  "),
-            Span::styled(format!("{:.0}t/s", tps), Style::default().fg(Color::Cyan)),
-            Span::raw("  "),
-            Span::styled(format!("Sprd:{:.2}%", spread_pct), Style::default().fg(Color::Gray)),
-            Span::raw("  "),
-            Span::styled(format!("LEAD:{}", lead_short), Style::default().fg(Color::Yellow)),
-            Span::raw("  "),
-            Span::styled(format!("OI:{}{:+.1}%", oi_arrow, oi_pct), Style::default().fg(oi_color)),
-            Span::raw("  "),
-            Span::styled(
-                format!("Basis:{:+.2}%", basis),
-                Style::default().fg(if basis > 0.02 { Color::Green } else if basis < -0.02 { Color::Red } else { Color::Yellow }),
-            ),
-        ]);
+        let mut spans: Vec<Span> = Vec::new();
+        spans.push(Span::styled(price_str, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        spans.push(Span::raw("  "));
+        if let Some(s) = fv_span {
+            spans.push(s);
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(format!("[{}]", status), Style::default().fg(status_color)));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(format!("{:.0}t/s", tps), Style::default().fg(Color::Cyan)));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(format!("Sprd:{:.2}%", spread_pct), Style::default().fg(Color::Gray)));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(format!("LEAD:{}", lead_short), Style::default().fg(Color::Yellow)));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(format!("OI:{}{} ", oi_arrow, oi_delta_str), Style::default().fg(oi_color)));
+        spans.push(Span::styled(oi_age_str, Style::default().fg(oi_age_color)));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("Basis:{:+.2}%", basis),
+            Style::default().fg(if basis > 0.02 { Color::Green } else if basis < -0.02 { Color::Red } else { Color::Yellow }),
+        ));
+
+        let line = Line::from(spans);
 
         let para = Paragraph::new(line);
         f.render_widget(para, inner);
@@ -1651,26 +1701,26 @@ fn render_delta_velocity_new(
             Span::styled(accel, Style::default().fg(Color::Gray)),
         ]));
 
-        // Multi-TF CVD
-        let (d5, s5) = scale_number(t.cvd_5s);
-        let (d15, s15) = scale_number(t.cvd_15s);
-        let (d30, s30) = scale_number(t.cvd_30s);
-        let (d1m, s1m) = scale_number(t.cvd_1m_total);
+        // Multi-TF CVD - use format_delta_value to avoid -0 display
+        let d5_str = format_delta_value(t.cvd_5s);
+        let d15_str = format_delta_value(t.cvd_15s);
+        let d30_str = format_delta_value(t.cvd_30s);
+        let d1m_str = format_delta_value(t.cvd_1m_total);
 
         lines.push(Line::from(vec![
             Span::styled("5s: ", Style::default().fg(Color::Gray)),
-            Span::styled(format!("{:>+6.0}{}", d5, s5), Style::default().fg(if t.cvd_5s > 0.0 { Color::Green } else { Color::Red })),
+            Span::styled(format!("{:>8}", d5_str), Style::default().fg(if t.cvd_5s > 0.0 { Color::Green } else if t.cvd_5s < 0.0 { Color::Red } else { Color::Gray })),
             Span::raw("   "),
             Span::styled("15s: ", Style::default().fg(Color::Gray)),
-            Span::styled(format!("{:>+6.0}{}", d15, s15), Style::default().fg(if t.cvd_15s > 0.0 { Color::Green } else { Color::Red })),
+            Span::styled(format!("{:>8}", d15_str), Style::default().fg(if t.cvd_15s > 0.0 { Color::Green } else if t.cvd_15s < 0.0 { Color::Red } else { Color::Gray })),
         ]));
 
         lines.push(Line::from(vec![
             Span::styled("30s:", Style::default().fg(Color::Gray)),
-            Span::styled(format!("{:>+6.0}{}", d30, s30), Style::default().fg(if t.cvd_30s > 0.0 { Color::Green } else { Color::Red })),
+            Span::styled(format!("{:>8}", d30_str), Style::default().fg(if t.cvd_30s > 0.0 { Color::Green } else if t.cvd_30s < 0.0 { Color::Red } else { Color::Gray })),
             Span::raw("   "),
             Span::styled("1m: ", Style::default().fg(Color::Gray)),
-            Span::styled(format!("{:>+6.0}{}", d1m, s1m), Style::default().fg(if t.cvd_1m_total > 0.0 { Color::Green } else { Color::Red })),
+            Span::styled(format!("{:>8}", d1m_str), Style::default().fg(if t.cvd_1m_total > 0.0 { Color::Green } else if t.cvd_1m_total < 0.0 { Color::Red } else { Color::Gray })),
         ]));
 
         // Confirmation count
@@ -1934,7 +1984,8 @@ fn render_volatility_new(
 
     if let Some(t) = snapshot.tickers.get(focused_ticker) {
         let atr = t.atr_14.unwrap_or(0.0);
-        let price = t.latest_price.unwrap_or(1.0);
+        // Use Binance perp price for consistent RV calculation
+        let price = t.binance_perp_last.or(t.latest_price).unwrap_or(1.0);
         let rv = if atr > 0.0 && price > 0.0 { (atr / price) * 100.0 } else { 0.0 };
         let trend = match t.realized_vol_trend {
             VolTrend::Expanding => "+EXP",
@@ -2046,7 +2097,8 @@ fn render_footer_new(
 
         // RV
         if let Some(atr) = t.atr_14 {
-            let price = t.latest_price.unwrap_or(1.0);
+            // Use Binance perp price for consistent RV calculation
+            let price = t.binance_perp_last.or(t.latest_price).unwrap_or(1.0);
             let rv = (atr / price) * 100.0;
             let trend = match t.realized_vol_trend {
                 VolTrend::Expanding => "+EXP",
