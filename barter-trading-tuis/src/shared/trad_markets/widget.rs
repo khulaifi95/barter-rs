@@ -1,4 +1,4 @@
-//! Ratatui widget for TRAD MARKETS panel - Vertical stacked layout for fast scanning
+//! Ratatui widget for TRAD MARKETS panel - Clean card-based layout
 
 use ratatui::{
     layout::Rect,
@@ -11,15 +11,16 @@ use ratatui::{
 use super::feed::IbkrConnectionStatus;
 use super::state::CorrelationSignals;
 
-// Colors matching scalper_v2 palette
+// Colors - lighter for better readability
 const C_BUY: Color = Color::Rgb(100, 220, 100);
 const C_SELL: Color = Color::Rgb(220, 100, 100);
 const C_NEUTRAL: Color = Color::Rgb(180, 180, 100);
-const C_DIM: Color = Color::Rgb(120, 120, 120);
+const C_DIM: Color = Color::Rgb(100, 100, 100);
+const C_TEXT: Color = Color::Rgb(180, 180, 180);      // Default text - light gray
 const C_BRIGHT: Color = Color::Rgb(220, 220, 220);
 const C_ACCENT: Color = Color::Rgb(100, 180, 220);
 
-/// Render the TRAD MARKETS panel - vertical stacked for fast 1-2s decisions
+/// Render the TRAD MARKETS panel - clean card-based layout
 pub fn render_trad_markets_panel(
     f: &mut Frame,
     area: Rect,
@@ -42,232 +43,246 @@ pub fn render_trad_markets_panel(
     // If disconnected and no data, show placeholder
     if ibkr_status != IbkrConnectionStatus::Connected && signals.es_price <= 0.0 {
         let placeholder = vec![
-            Line::from(Span::styled("Waiting for ibkr-bridge...", Style::default().fg(C_DIM))),
-            Line::from(Span::styled("python -m ibkr_bridge --dry-run", Style::default().fg(C_DIM))),
+            Line::from(Span::styled("Waiting for ibkr-bridge...", Style::default().fg(C_TEXT))),
         ];
         f.render_widget(Paragraph::new(placeholder), inner);
         return;
     }
 
-    // Calculate bar width (use most of available space)
-    let bar_width = (inner.width as usize).saturating_sub(10).max(20);
-
     let mut lines = Vec::new();
 
-    // === ES PRICE ===
+    // === ROW 1: ES and NQ prices on same line ===
     let es_color = if signals.es_return >= 0.0 { C_BUY } else { C_SELL };
     let es_arrow = if signals.es_return >= 0.0 { "▲" } else { "▼" };
-    let es_price_str = if signals.es_price > 0.0 { format!("{:.2}", signals.es_price) } else { "--".to_string() };
-
-    lines.push(Line::from(vec![
-        Span::styled("ES  ", Style::default().fg(C_DIM)),
-        Span::styled(&es_price_str, Style::default().fg(C_BRIGHT).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" {}{:+.2}%", es_arrow, signals.es_return * 100.0), Style::default().fg(es_color)),
-    ]));
-
-    // === NQ PRICE ===
     let nq_color = if signals.nq_return >= 0.0 { C_BUY } else { C_SELL };
     let nq_arrow = if signals.nq_return >= 0.0 { "▲" } else { "▼" };
-    let nq_price_str = if signals.nq_price > 0.0 { format!("{:.2}", signals.nq_price) } else { "--".to_string() };
 
     lines.push(Line::from(vec![
-        Span::styled("NQ  ", Style::default().fg(C_DIM)),
-        Span::styled(&nq_price_str, Style::default().fg(C_BRIGHT).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" {}{:+.2}%", nq_arrow, signals.nq_return * 100.0), Style::default().fg(nq_color)),
+        Span::styled("ES  ", Style::default().fg(C_TEXT)),
+        Span::styled(format!("{:.2}", signals.es_price), Style::default().fg(C_BRIGHT).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {}{:.2}%", es_arrow, (signals.es_return * 100.0).abs()), Style::default().fg(es_color)),
+        Span::styled("   NQ  ", Style::default().fg(C_TEXT)),
+        Span::styled(format!("{:.2}", signals.nq_price), Style::default().fg(C_BRIGHT).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {}{:.2}%", nq_arrow, (signals.nq_return * 100.0).abs()), Style::default().fg(nq_color)),
     ]));
 
-    // === BLANK LINE ===
     lines.push(Line::from(""));
 
-    // === BTC/ES SPREAD (label + value + status) ===
-    // Color by DIRECTION: negative=red, near-zero=dim, positive=green
-    let btc_es_spread_pct = signals.btc_es_spread * 100.0;
-    let btc_spread_color = if btc_es_spread_pct < -0.05 { C_SELL }      // Negative = red (lagging)
-                           else if btc_es_spread_pct > 0.05 { C_BUY }   // Positive = green (leading)
-                           else { C_DIM };                              // Near zero = dim (neutral)
-    let btc_spread_label = if btc_es_spread_pct < -0.1 { "LAG" }
-                           else if btc_es_spread_pct > 0.1 { "LEAD" }
-                           else { "=" };
-
-    lines.push(Line::from(vec![
-        Span::styled("BTC/ES  ", Style::default().fg(C_DIM)),
-        Span::styled(format!("{:+.2}%", btc_es_spread_pct), Style::default().fg(btc_spread_color).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  {}", btc_spread_label), Style::default().fg(btc_spread_color)),
-    ]));
-
-    // === BTC/ES BAR ===
-    let btc_bar = render_spread_bar(btc_es_spread_pct, bar_width);
-    lines.push(Line::from(vec![
-        Span::styled("-1% ", Style::default().fg(C_DIM)),
-        Span::styled(btc_bar, Style::default().fg(btc_spread_color)),
-        Span::styled(" +1%", Style::default().fg(C_DIM)),
-    ]));
-
-    // === BLANK LINE ===
-    lines.push(Line::from(""));
-
-    // === NQ/ES SPREAD (label + value + status) ===
-    // Color by DIRECTION: negative=red, near-zero=dim, positive=green
-    let nq_es_spread_pct = signals.nq_es_spread * 100.0;
-    let nq_spread_color = if nq_es_spread_pct < -0.05 { C_SELL }      // Negative = red
-                          else if nq_es_spread_pct > 0.05 { C_BUY }   // Positive = green
-                          else { C_DIM };                              // Near zero = dim
-    let nq_spread_label = if nq_es_spread_pct.abs() < 0.10 { "SYNC" } else { "MIX" };
-
-    lines.push(Line::from(vec![
-        Span::styled("NQ/ES   ", Style::default().fg(C_DIM)),
-        Span::styled(format!("{:+.2}%", nq_es_spread_pct), Style::default().fg(nq_spread_color).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  {}", nq_spread_label), Style::default().fg(nq_spread_color)),
-    ]));
-
-    // === NQ/ES BAR ===
-    let nq_bar = render_spread_bar(nq_es_spread_pct, bar_width);
-    lines.push(Line::from(vec![
-        Span::styled("-1% ", Style::default().fg(C_DIM)),
-        Span::styled(nq_bar, Style::default().fg(nq_spread_color)),
-        Span::styled(" +1%", Style::default().fg(C_DIM)),
-    ]));
-
-    // === BLANK LINE ===
-    lines.push(Line::from(""));
-
-    // === DIVERGENCE ===
-    // Color by SIGNAL STATE: extreme=red, caution=yellow, normal=dim (no signal)
-    let div_z = signals.divergence_z.unwrap_or(0.0);
-    let div_color = match signals.divergence_z {
-        Some(z) if z.abs() > 1.5 => C_SELL,     // Signal zone = red
-        Some(z) if z.abs() > 1.0 => C_NEUTRAL,  // Caution = yellow
-        Some(_) => C_DIM,                        // Normal = dim (no signal)
-        None => C_DIM,                           // No data = dim
+    // === ROW 2-3: 60s comparisons ===
+    let btc_es_pct = signals.btc_es_spread * 100.0;
+    let (es_btc_sym, es_btc_color) = if btc_es_pct < -0.05 {
+        (">", C_BUY)   // ES winning
+    } else if btc_es_pct > 0.05 {
+        ("<", C_SELL)  // BTC winning
+    } else {
+        ("=", C_TEXT)  // SYNC
     };
 
     lines.push(Line::from(vec![
-        Span::styled("DIV     ", Style::default().fg(C_DIM)),
-        Span::styled(
-            signals.divergence_z.map(|z| format!("{:+.1}σ", z)).unwrap_or("--".to_string()),
-            Style::default().fg(div_color).add_modifier(Modifier::BOLD)
-        ),
-        Span::styled(if div_z.abs() > 1.5 { "  ⚠ SIGNAL" } else { "" }, Style::default().fg(C_NEUTRAL)),
+        Span::styled("60s: ", Style::default().fg(C_TEXT)),
+        Span::styled(format!("ES {} BTC  ", es_btc_sym), Style::default().fg(es_btc_color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:+.2}%", btc_es_pct.abs()), Style::default().fg(es_btc_color)),
     ]));
 
-    // === DIV GAUGE ===
-    let div_gauge = render_divergence_gauge(div_z, bar_width);
+    let nq_es_pct = signals.nq_es_spread * 100.0;
+    let (es_nq_sym, es_nq_color) = if nq_es_pct < -0.05 {
+        (">", C_NEUTRAL)  // ES winning
+    } else if nq_es_pct > 0.05 {
+        ("<", C_NEUTRAL)  // NQ winning
+    } else {
+        ("=", C_TEXT)     // SYNC
+    };
+    let sync_label = if nq_es_pct.abs() < 0.05 { "  (SYNC)" } else { "" };
+
     lines.push(Line::from(vec![
-        Span::styled("-2σ ", Style::default().fg(C_DIM)),
-        Span::styled(div_gauge, Style::default().fg(div_color)),
-        Span::styled(" +2σ", Style::default().fg(C_DIM)),
+        Span::styled("     ", Style::default().fg(C_TEXT)),
+        Span::styled(format!("ES {} NQ   ", es_nq_sym), Style::default().fg(es_nq_color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:+.2}%", nq_es_pct.abs()), Style::default().fg(es_nq_color)),
+        Span::styled(sync_label, Style::default().fg(C_TEXT)),
     ]));
 
-    // === BLANK LINE ===
     lines.push(Line::from(""));
 
-    // === CORRELATION ===
-    let es_btc_color = match signals.es_btc_corr {
-        Some(c) if c > 0.50 => C_BUY,
-        Some(c) if c > 0.30 => C_NEUTRAL,
-        Some(_) => C_SELL,
-        None => C_DIM,
-    };
-    let es_nq_color = match signals.es_nq_corr {
-        Some(c) if c > 0.85 => C_BUY,
-        Some(c) if c > 0.70 => C_NEUTRAL,
-        Some(_) => C_SELL,
-        None => C_DIM,
+    // === ROW 4: Three cards - ES/NQ, ES/BTC, LEAD ===
+    let corr_es_nq = signals.es_nq_corr.unwrap_or(0.0);
+    let corr_es_btc = signals.es_btc_corr.unwrap_or(0.0);
+
+    // Correlation labels and colors
+    let (es_nq_label, es_nq_color) = if corr_es_nq > 0.70 {
+        ("SYNC", C_BUY)
+    } else if corr_es_nq > 0.40 {
+        ("weak", C_TEXT)
+    } else {
+        ("noise", C_TEXT)
     };
 
-    lines.push(Line::from(vec![
-        Span::styled("CORR    ", Style::default().fg(C_DIM)),
-        Span::styled("ES/BTC:", Style::default().fg(C_DIM)),
-        Span::styled(
-            signals.es_btc_corr.map(|c| format!("{:.2}", c)).unwrap_or("--".to_string()),
-            Style::default().fg(es_btc_color).add_modifier(Modifier::BOLD)
-        ),
-        Span::styled("  ES/NQ:", Style::default().fg(C_DIM)),
-        Span::styled(
-            signals.es_nq_corr.map(|c| format!("{:.2}", c)).unwrap_or("--".to_string()),
-            Style::default().fg(es_nq_color).add_modifier(Modifier::BOLD)
-        ),
-    ]));
+    let (es_btc_label, es_btc_color) = if corr_es_btc > 0.50 {
+        ("SYNC", C_BUY)
+    } else if corr_es_btc > 0.25 {
+        ("weak", C_TEXT)
+    } else {
+        ("noise", C_TEXT)
+    };
 
-    // === LEAD/LAG ===
-    let lead_text = if signals.lead_lag_secs > 0 {
-        format!("ES→BTC ~{}s", signals.lead_lag_secs)
+    // Values - use light gray for readability, green only for strong correlation
+    let es_nq_val_color = if corr_es_nq > 0.70 { C_BUY } else { C_BRIGHT };
+    let es_btc_val_color = if corr_es_btc > 0.50 { C_BUY } else { C_BRIGHT };
+
+    // Card values
+    let es_nq_val = signals.es_nq_corr.map(|c| format!("{:.2}", c)).unwrap_or("--".to_string());
+    let es_btc_val = signals.es_btc_corr.map(|c| format!("{:.2}", c)).unwrap_or("--".to_string());
+    let lead_val = if signals.lead_lag_secs > 0 {
+        "ES".to_string()
     } else if signals.lead_lag_secs < 0 {
-        format!("BTC→ES ~{}s", -signals.lead_lag_secs)
+        "BTC".to_string()
     } else {
         "SYNC".to_string()
     };
+    let lead_time = if signals.lead_lag_secs != 0 {
+        format!("+{}s", signals.lead_lag_secs.abs())
+    } else {
+        "".to_string()
+    };
 
+    // All boxes same width: 10 chars inner content
+    // Box structure: │ + 10 chars + │ = 12 chars total per box
+    // 3 boxes + 2 gaps of 2 spaces = 12+2+12+2+12 = 40 chars total
+
+    // Card top borders (10 dashes = 10 inner width)
     lines.push(Line::from(vec![
-        Span::styled("LEAD    ", Style::default().fg(C_DIM)),
-        Span::styled(&lead_text, Style::default().fg(C_ACCENT)),
+        Span::styled("┌──────────┐  ", Style::default().fg(C_DIM)),
+        Span::styled("┌──────────┐  ", Style::default().fg(C_DIM)),
+        Span::styled("┌──────────┐", Style::default().fg(C_DIM)),
     ]));
 
-    // === BLANK LINE ===
+    // Card titles - centered in 10 char width
+    lines.push(Line::from(vec![
+        Span::styled("│", Style::default().fg(C_DIM)),
+        Span::styled(format!("{:^10}", "ES/NQ"), Style::default().fg(C_TEXT)),
+        Span::styled("│  ", Style::default().fg(C_DIM)),
+        Span::styled("│", Style::default().fg(C_DIM)),
+        Span::styled(format!("{:^10}", "ES/BTC"), Style::default().fg(C_TEXT)),
+        Span::styled("│  ", Style::default().fg(C_DIM)),
+        Span::styled("│", Style::default().fg(C_DIM)),
+        Span::styled(format!("{:^10}", "LEAD"), Style::default().fg(C_TEXT)),
+        Span::styled("│", Style::default().fg(C_DIM)),
+    ]));
+
+    // Card values - centered in 10 char width
+    lines.push(Line::from(vec![
+        Span::styled("│", Style::default().fg(C_DIM)),
+        Span::styled(format!("{:^10}", es_nq_val), Style::default().fg(es_nq_val_color).add_modifier(Modifier::BOLD)),
+        Span::styled("│  ", Style::default().fg(C_DIM)),
+        Span::styled("│", Style::default().fg(C_DIM)),
+        Span::styled(format!("{:^10}", es_btc_val), Style::default().fg(es_btc_val_color).add_modifier(Modifier::BOLD)),
+        Span::styled("│  ", Style::default().fg(C_DIM)),
+        Span::styled("│", Style::default().fg(C_DIM)),
+        Span::styled(format!("{:^10}", lead_val), Style::default().fg(C_BRIGHT).add_modifier(Modifier::BOLD)),
+        Span::styled("│", Style::default().fg(C_DIM)),
+    ]));
+
+    // Card labels - centered in 10 char width
+    lines.push(Line::from(vec![
+        Span::styled("│", Style::default().fg(C_DIM)),
+        Span::styled(format!("{:^10}", es_nq_label), Style::default().fg(es_nq_color)),
+        Span::styled("│  ", Style::default().fg(C_DIM)),
+        Span::styled("│", Style::default().fg(C_DIM)),
+        Span::styled(format!("{:^10}", es_btc_label), Style::default().fg(es_btc_color)),
+        Span::styled("│  ", Style::default().fg(C_DIM)),
+        Span::styled("│", Style::default().fg(C_DIM)),
+        Span::styled(format!("{:^10}", lead_time), Style::default().fg(C_ACCENT)),
+        Span::styled("│", Style::default().fg(C_DIM)),
+    ]));
+
+    // Card bottom borders
+    lines.push(Line::from(vec![
+        Span::styled("└──────────┘  ", Style::default().fg(C_DIM)),
+        Span::styled("└──────────┘  ", Style::default().fg(C_DIM)),
+        Span::styled("└──────────┘", Style::default().fg(C_DIM)),
+    ]));
+
     lines.push(Line::from(""));
 
-    // === SIGNAL LINE ===
-    // Signal is based on divergence z-score + EQ sync
-    // If no z-score yet, show neutral (data is still available above)
-    let (signal_text, action_color) = match signals.divergence_z {
-        Some(z) if z < -1.5 && signals.eq_sync => ("⚡ BTC LAG → LONG BTC", C_BUY),
-        Some(z) if z > 1.5 && signals.eq_sync => ("⚡ BTC LEAD → SHORT BTC", C_SELL),
-        Some(z) if z.abs() > 1.5 => ("⚠ DIVERGENCE → WAIT", C_NEUTRAL),
-        Some(_) => ("○ NEUTRAL", C_DIM),
-        None => ("○ DIV WARMING...", C_DIM),  // Only divergence warming, other data shown
+    // === ROW 5: DIVERGENCE with gradient bar ===
+    let div_z = signals.divergence_z.unwrap_or(0.0);
+
+    lines.push(Line::from(vec![
+        Span::styled("DIVERGENCE", Style::default().fg(C_TEXT)),
+    ]));
+
+    // Divergence gauge - match box width (3 boxes * 12 + 2 gaps * 2 = 40, minus labels)
+    // Total 40 chars: "-2σ " (4) + bar (32) + " +2σ" (4) = 40
+    let bar_width = 32;
+    let div_spans = render_divergence_gauge_colored(div_z, bar_width);
+
+    let mut gauge_line = vec![Span::styled("-2σ ", Style::default().fg(C_TEXT))];
+    gauge_line.extend(div_spans);
+    gauge_line.push(Span::styled(" +2σ", Style::default().fg(C_TEXT)));
+    lines.push(Line::from(gauge_line));
+
+    lines.push(Line::from(""));
+
+    // === ROW 6: Action signal with interpretation ===
+    let (signal_icon, signal_text, action_text) = match signals.divergence_z {
+        Some(z) if z < -1.5 => ("▲", format!("{:+.1}σ BTC < ES", z), "→ WAIT"),
+        Some(z) if z > 1.5 => ("▲", format!("{:+.1}σ BTC > ES", z), "→ WAIT"),
+        Some(z) => ("○", format!("{:+.1}σ NEUTRAL", z), ""),
+        None => ("○", "WARMING...".to_string(), ""),
+    };
+
+    // Signal color based on strength
+    let signal_color = match signals.divergence_z {
+        Some(z) if z.abs() > 1.5 => C_NEUTRAL,
+        _ => C_TEXT,
     };
 
     lines.push(Line::from(vec![
-        Span::styled(signal_text, Style::default().fg(action_color).add_modifier(Modifier::BOLD)),
+        Span::styled(signal_icon, Style::default().fg(signal_color)),
+        Span::styled(" ", Style::default()),
+        Span::styled(&signal_text, Style::default().fg(signal_color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {}", action_text), Style::default().fg(C_TEXT)),
     ]));
 
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Render spread bar: deviation from center (-1% to +1%)
-/// Bar fills FROM CENTER to the current value position
-fn render_spread_bar(spread_pct: f64, width: usize) -> String {
+/// Render divergence gauge with color gradient (red on left, green on right)
+fn render_divergence_gauge_colored(z: f64, width: usize) -> Vec<Span<'static>> {
     if width < 5 {
-        return "".to_string();
-    }
-
-    let normalized = ((spread_pct / 1.0) + 1.0) / 2.0; // Map -1%..+1% to 0..1
-    let position = (normalized * width as f64).clamp(0.0, (width - 1) as f64) as usize;
-    let center = width / 2;
-
-    let mut bar = String::new();
-    for i in 0..width {
-        if i == center {
-            bar.push('│');
-        } else if position < center && i >= position && i < center {
-            // Fill from position to center (left side)
-            bar.push('█');
-        } else if position > center && i > center && i <= position {
-            // Fill from center to position (right side)
-            bar.push('█');
-        } else {
-            bar.push('░');
-        }
-    }
-    bar
-}
-
-/// Render divergence gauge: position marker on -2σ to +2σ scale
-fn render_divergence_gauge(z: f64, width: usize) -> String {
-    if width < 5 {
-        return "".to_string();
+        return vec![];
     }
 
     let normalized = ((z / 2.0) + 1.0) / 2.0; // Map -2σ..+2σ to 0..1
     let position = (normalized * width as f64).clamp(0.0, (width - 1) as f64) as usize;
+    let center = width / 2;
 
-    let mut gauge = String::new();
+    let mut spans = Vec::new();
+
     for i in 0..width {
-        if i == position {
-            gauge.push('●');
+        let ch = if i == position { "●" } else { "─" };
+
+        // Color gradient: red on left, yellow in center, green on right
+        let color = if i < center / 2 {
+            C_SELL  // Strong red (far left)
+        } else if i < center {
+            Color::Rgb(200, 150, 100)  // Orange-ish (left of center)
+        } else if i == center {
+            C_NEUTRAL  // Yellow (center)
+        } else if i < center + center / 2 {
+            Color::Rgb(150, 200, 100)  // Yellow-green (right of center)
         } else {
-            gauge.push('═');
-        }
+            C_BUY  // Strong green (far right)
+        };
+
+        // Make the marker brighter
+        let style = if i == position {
+            Style::default().fg(C_BRIGHT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(color)
+        };
+
+        spans.push(Span::styled(ch.to_string(), style));
     }
-    gauge
+
+    spans
 }

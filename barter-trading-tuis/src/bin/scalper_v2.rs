@@ -278,7 +278,7 @@ async fn run_binance_kline_stream(ticker: &str, agg: Arc<Mutex<Aggregator>>) {
                     }
                 }
             }
-            Err(e) => eprintln!("[kline] {} error: {}", ticker, e),
+            Err(_e) => { /* Silent reconnect - kline connection will retry */ }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -362,13 +362,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 {
                     latency_samples.push(latency_ms);
 
-                    // Log every 5 seconds
+                    // Latency tracking (silent - no console output)
                     if last_latency_log.elapsed() >= Duration::from_secs(5) && !latency_samples.is_empty() {
-                        let avg = latency_samples.iter().sum::<i64>() / latency_samples.len() as i64;
-                        let max = *latency_samples.iter().max().unwrap_or(&0);
-                        let min = *latency_samples.iter().min().unwrap_or(&0);
-                        eprintln!("[LATENCY] BTC Binance trades: avg={}ms min={}ms max={}ms samples={}",
-                            avg, min, max, latency_samples.len());
+                        // Stats available but not printed to avoid TUI noise
+                        // let avg = latency_samples.iter().sum::<i64>() / latency_samples.len() as i64;
                         latency_samples.clear();
                         last_latency_log = Instant::now();
                     }
@@ -495,10 +492,10 @@ fn render_ui(
     render_exchanges(f, exch_vol[0], snapshot, ticker);
     render_volatility(f, exch_vol[1], snapshot, ticker);
 
-    // Whales (left 40%) + Trad Markets (right 60%)
+    // Whales (left 45%) + Trad Markets (right 55%)
     let whale_trad = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(chunks[4]);
     render_whales(f, whale_trad[0], snapshot, ticker);
     render_trad_markets_panel(f, whale_trad[1], trad_signals, ibkr_status);

@@ -12,15 +12,42 @@ use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::broadcast,
-    time::interval,
+    time::{interval, Duration},
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
+
+// L2 throttling per exchange (OKX is noisier, needs higher throttle)
+const L2_THROTTLE_BINANCE_MS: u64 = 100;
+const L2_THROTTLE_BYBIT_MS: u64 = 100;
+const L2_THROTTLE_OKX_MS: u64 = 150;
+
+/// Get L2 throttle interval for a given exchange
+fn get_l2_throttle_ms(exchange: &str) -> u64 {
+    if exchange.contains("Okx") {
+        std::env::var("L2_THROTTLE_OKX_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(L2_THROTTLE_OKX_MS)
+    } else if exchange.contains("Bybit") {
+        std::env::var("L2_THROTTLE_BYBIT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(L2_THROTTLE_BYBIT_MS)
+    } else {
+        std::env::var("L2_THROTTLE_BINANCE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(L2_THROTTLE_BINANCE_MS)
+    }
+}
 
 /// Market event wrapper for JSON serialization
 #[derive(Debug, Clone, Serialize)]
@@ -92,17 +119,28 @@ async fn main() {
 
     info!("Starting barter-data WebSocket server");
 
-    // Create broadcast channel for market events
-    // Configurable buffer size via WS_BUFFER_SIZE env var (default: 100,000)
-    // NOTE: Increased from 10k to 100k to reduce backpressure with high-frequency L2 data
-    let buffer_size = std::env::var("WS_BUFFER_SIZE")
+    // Separate channels for trades (hot path) and L2 (high volume, lower priority)
+    let trades_buffer = std::env::var("WS_TRADES_BUFFER")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(100_000);
+        .unwrap_or(10_000);
+    let l2_buffer = std::env::var("WS_L2_BUFFER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50_000);
 
-    info!("WebSocket broadcast buffer size: {}", buffer_size);
-    let (tx, _rx) = broadcast::channel::<MarketEventMessage>(buffer_size);
-    let tx = Arc::new(tx);
+    info!(
+        "Trade channel buffer: {}, L2 channel buffer: {}",
+        trades_buffer, l2_buffer
+    );
+
+    // Trades channel: trades, liquidations, OI, CVD, L1 (hot path - NO L2)
+    let (tx_trades, _) = broadcast::channel::<MarketEventMessage>(trades_buffer);
+    let tx_trades = Arc::new(tx_trades);
+
+    // L2 channel: orderbook L2 only (high volume, can lag without affecting trades)
+    let (tx_l2, _) = broadcast::channel::<MarketEventMessage>(l2_buffer);
+    let tx_l2 = Arc::new(tx_l2);
 
     // Start WebSocket server
     // Configurable via WS_ADDR env var (default: 0.0.0.0:9001)
@@ -110,9 +148,10 @@ async fn main() {
     let server_addr = server_addr_str
         .parse::<SocketAddr>()
         .unwrap_or_else(|_| "0.0.0.0:9001".parse().unwrap());
-    let tx_clone = tx.clone();
+    let tx_trades_clone = tx_trades.clone();
+    let tx_l2_clone = tx_l2.clone();
     tokio::spawn(async move {
-        start_websocket_server(server_addr, tx_clone).await;
+        start_websocket_server(server_addr, tx_trades_clone, tx_l2_clone).await;
     });
 
     info!("WebSocket server listening on ws://{}", server_addr);
@@ -128,6 +167,10 @@ async fn main() {
     );
 
     futures::pin_mut!(combined_stream);
+
+    // Throttle state: per-instrument last broadcast time (L2 and Binance L1)
+    let mut l2_last_broadcast: HashMap<String, Instant> = HashMap::new();
+    let mut l1_last_broadcast: HashMap<String, Instant> = HashMap::new();
 
     // Process market events and broadcast to clients
     while let Some(event) = combined_stream.next().await {
@@ -190,6 +233,10 @@ async fn main() {
                     let is_open_interest = matches!(&market_event.kind, DataKind::OpenInterest(_));
                     let is_trade = matches!(&market_event.kind, DataKind::Trade(_));
                     let is_orderbook_l2 = matches!(&market_event.kind, DataKind::OrderBook(_));
+                    let is_orderbook_l1 = matches!(
+                        &market_event.kind,
+                        DataKind::OrderBookL1(_)
+                    );
 
                     // Extract notional value for trades
                     let trade_notional = if let DataKind::Trade(t) = &market_event.kind {
@@ -198,7 +245,7 @@ async fn main() {
                         None
                     };
 
-                    // Log L2 orderbook events at debug level (very high frequency)
+                    // L2 orderbook events: apply per-exchange throttle and route to L2 channel
                     if is_orderbook_l2 {
                         debug!(
                             "L2_BOOK {} {}/{}",
@@ -206,14 +253,65 @@ async fn main() {
                             market_event.instrument.base,
                             market_event.instrument.quote
                         );
+
+                        // Per-exchange throttling
+                        let key = format!(
+                            "{}:{}:{}",
+                            market_event.exchange,
+                            market_event.instrument.base,
+                            market_event.instrument.quote
+                        );
+                        let exchange_str = format!("{:?}", market_event.exchange);
+                        let throttle_ms = get_l2_throttle_ms(&exchange_str);
+                        let now = Instant::now();
+
+                        let should_skip = if let Some(prev) = l2_last_broadcast.get(&key) {
+                            now.duration_since(*prev) < Duration::from_millis(throttle_ms)
+                        } else {
+                            false
+                        };
+
+                        if should_skip {
+                            continue; // Skip throttled L2
+                        }
+                        l2_last_broadcast.insert(key, now);
+
+                        // Send to L2 channel (separate from trades)
+                        let message = MarketEventMessage::from(market_event);
+                        let _ = tx_l2.send(message); // Ignore errors if no receivers
+                        continue; // Don't fall through to trade channel
                     }
 
                     let message = MarketEventMessage::from(market_event);
 
+                    // Binance L1: apply light throttle (~100ms per instrument) to reduce flood
+                    if is_orderbook_l1 {
+                        let exchange_name = &message.exchange;
+                        if exchange_name.contains("Binance") {
+                            let key = format!(
+                                "{}:{}:{}",
+                                exchange_name,
+                                message.instrument.base,
+                                message.instrument.quote
+                            );
+                            let throttle_ms = 50; // ~20 updates/sec per instrument
+                            let now = Instant::now();
+                            let should_skip = if let Some(prev) = l1_last_broadcast.get(&key) {
+                                now.duration_since(*prev) < Duration::from_millis(throttle_ms)
+                            } else {
+                                false
+                            };
+                            if should_skip {
+                                continue; // Skip throttled Binance L1 update
+                            }
+                            l1_last_broadcast.insert(key, now);
+                        }
+                    }
+
                     // Debug: log broadcast attempt for all event types
                     // NOTE: Changed from info! to debug! to avoid blocking hot path
                     if is_trade {
-                        let receivers = tx.receiver_count();
+                        let receivers = tx_trades.receiver_count();
                         debug!(
                             "TRADE→{} clients: {} {} {}/{} ${:.0}",
                             receivers,
@@ -225,7 +323,7 @@ async fn main() {
                         );
                     }
                     if is_liquidation {
-                        let receivers = tx.receiver_count();
+                        let receivers = tx_trades.receiver_count();
                         info!(
                             "BROADCASTING liquidation to {} clients: {} {}/{}",
                             receivers,
@@ -235,7 +333,7 @@ async fn main() {
                         );
                     }
                     if is_open_interest {
-                        let receivers = tx.receiver_count();
+                        let receivers = tx_trades.receiver_count();
                         info!(
                             "BROADCASTING open_interest to {} clients: {} {}/{}",
                             receivers,
@@ -245,8 +343,8 @@ async fn main() {
                         );
                     }
 
-                    // Broadcast to all connected clients (ignore errors if no receivers)
-                    match tx.send(message) {
+                    // Broadcast to trade channel (hot path - NO L2 here)
+                    match tx_trades.send(message) {
                         Ok(count) => {
                             if is_trade {
                                 debug!("Trade sent to {} receivers", count);
@@ -286,7 +384,11 @@ async fn main() {
 }
 
 /// Start WebSocket server that broadcasts market events to connected clients
-async fn start_websocket_server(addr: SocketAddr, tx: Arc<broadcast::Sender<MarketEventMessage>>) {
+async fn start_websocket_server(
+    addr: SocketAddr,
+    tx_trades: Arc<broadcast::Sender<MarketEventMessage>>,
+    tx_l2: Arc<broadcast::Sender<MarketEventMessage>>,
+) {
     let listener = TcpListener::bind(&addr)
         .await
         .expect("Failed to bind WebSocket server");
@@ -295,8 +397,9 @@ async fn start_websocket_server(addr: SocketAddr, tx: Arc<broadcast::Sender<Mark
 
     while let Ok((stream, peer_addr)) = listener.accept().await {
         info!("New WebSocket connection from {}", peer_addr);
-        let tx = tx.clone();
-        tokio::spawn(handle_client(stream, peer_addr, tx));
+        let tx_trades = tx_trades.clone();
+        let tx_l2 = tx_l2.clone();
+        tokio::spawn(handle_client(stream, peer_addr, tx_trades, tx_l2));
     }
 }
 
@@ -304,7 +407,8 @@ async fn start_websocket_server(addr: SocketAddr, tx: Arc<broadcast::Sender<Mark
 async fn handle_client(
     stream: TcpStream,
     peer_addr: SocketAddr,
-    tx: Arc<broadcast::Sender<MarketEventMessage>>,
+    tx_trades: Arc<broadcast::Sender<MarketEventMessage>>,
+    tx_l2: Arc<broadcast::Sender<MarketEventMessage>>,
 ) {
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
@@ -317,7 +421,8 @@ async fn handle_client(
     info!("WebSocket handshake completed for {}", peer_addr);
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-    let mut rx = tx.subscribe();
+    let mut rx_trades = tx_trades.subscribe();
+    let mut rx_l2 = tx_l2.subscribe();
 
     // Send welcome message
     let welcome = serde_json::json!({
@@ -330,26 +435,56 @@ async fn handle_client(
     }
 
     // Spawn task to send market events to this client
+    // Uses biased select! to prioritize trades over L2
     let mut send_task = tokio::spawn(async move {
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        if ws_sender.send(Message::Text(json.into())).await.is_err() {
+            // Biased select: trades always checked first (hot path priority)
+            tokio::select! {
+                biased;
+
+                // PRIORITY 1: Trades, liquidations, OI, CVD, L1 (hot path)
+                result = rx_trades.recv() => {
+                    match result {
+                        Ok(event) => {
+                            if let Ok(json) = serde_json::to_string(&event) {
+                                if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Trade lag is concerning - log at warn level
+                            warn!("Client {} trade channel lagged, skipped {} messages", peer_addr, skipped);
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            info!("Trade channel closed for {}", peer_addr);
                             break;
                         }
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    // Client fell behind - this is NORMAL under high load
-                    // Just log and continue, don't disconnect
-                    warn!("Client {} lagged, skipped {} messages", peer_addr, skipped);
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    // Channel closed, exit gracefully
-                    info!("Broadcast channel closed for {}", peer_addr);
-                    break;
+
+                // PRIORITY 2: L2 orderbook (lower priority, can lag)
+                result = rx_l2.recv() => {
+                    match result {
+                        Ok(event) => {
+                            if let Ok(json) = serde_json::to_string(&event) {
+                                if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // L2 lag is OK - just log at debug level
+                            debug!("Client {} L2 channel lagged, skipped {} messages", peer_addr, skipped);
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // L2 channel closed but trades still work
+                            debug!("L2 channel closed for {}", peer_addr);
+                            // Don't break - continue receiving trades
+                        }
+                    }
                 }
             }
         }
