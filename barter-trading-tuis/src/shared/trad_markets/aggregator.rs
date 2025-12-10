@@ -1,9 +1,12 @@
 //! 5-second micro-bar aggregation from live ticks
 //!
 //! Aggregates tick data into OHLCV bars for correlation calculations.
+//! Uses tick timestamps (not wall clock) for bar boundaries to support backfill.
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+
+/// Bar duration in milliseconds (5 seconds)
+const BAR_DURATION_MS: i64 = 5000;
 
 /// A single 5-second OHLCV bar
 #[derive(Debug, Clone)]
@@ -17,45 +20,52 @@ pub struct MicroBar {
 }
 
 /// Aggregates ticks into 5-second OHLC bars
+/// Uses tick timestamps for bar boundaries (supports backfill)
 pub struct MicroBarAggregator {
-    bar_duration: Duration,
-    current_bar_start: Option<Instant>,
+    /// Start timestamp of current bar (aligned to 5s boundary)
+    current_bar_start_ts: Option<i64>,
     open: f64,
     high: f64,
     low: f64,
     close: f64,
     volume: f64,
-    last_ts: i64,
+    bar_ts: i64,
 }
 
 impl MicroBarAggregator {
     pub fn new() -> Self {
         Self {
-            bar_duration: Duration::from_secs(5),
-            current_bar_start: None,
+            current_bar_start_ts: None,
             open: 0.0,
             high: f64::MIN,
             low: f64::MAX,
             close: 0.0,
             volume: 0.0,
-            last_ts: 0,
+            bar_ts: 0,
         }
     }
 
+    /// Align timestamp to 5-second boundary
+    #[inline]
+    fn align_to_bar(ts: i64) -> i64 {
+        (ts / BAR_DURATION_MS) * BAR_DURATION_MS
+    }
+
     /// Returns Some(bar) when a 5-second bar completes
+    /// Uses tick timestamp (ts) for bar boundaries, not wall clock
     pub fn update(&mut self, price: f64, size: f64, ts: i64) -> Option<MicroBar> {
-        // Guard: ignore invalid prices
-        if price <= 0.0 {
+        // Guard: ignore invalid prices or timestamps
+        if price <= 0.0 || ts <= 0 {
             return None;
         }
 
-        let now = Instant::now();
-        self.last_ts = ts;
+        let tick_bar_start = Self::align_to_bar(ts);
 
-        match self.current_bar_start {
+        match self.current_bar_start_ts {
             None => {
                 // Start first bar
-                self.current_bar_start = Some(now);
+                self.current_bar_start_ts = Some(tick_bar_start);
+                self.bar_ts = ts;
                 self.open = price;
                 self.high = price;
                 self.low = price;
@@ -63,10 +73,10 @@ impl MicroBarAggregator {
                 self.volume = size;
                 None
             }
-            Some(start) if now.duration_since(start) >= self.bar_duration => {
-                // Bar complete - emit and start new
+            Some(bar_start) if tick_bar_start > bar_start => {
+                // Tick belongs to a new bar - emit completed bar
                 let bar = MicroBar {
-                    ts,
+                    ts: self.bar_ts,
                     open: self.open,
                     high: self.high,
                     low: self.low,
@@ -75,7 +85,8 @@ impl MicroBarAggregator {
                 };
 
                 // Reset for new bar
-                self.current_bar_start = Some(now);
+                self.current_bar_start_ts = Some(tick_bar_start);
+                self.bar_ts = ts;
                 self.open = price;
                 self.high = price;
                 self.low = price;
@@ -85,7 +96,8 @@ impl MicroBarAggregator {
                 Some(bar)
             }
             Some(_) => {
-                // Update current bar
+                // Update current bar (same 5s window)
+                self.bar_ts = ts; // Keep latest ts
                 self.high = self.high.max(price);
                 self.low = self.low.min(price);
                 self.close = price;
@@ -102,7 +114,7 @@ impl MicroBarAggregator {
 
     /// Check if we have received any data
     pub fn has_data(&self) -> bool {
-        self.current_bar_start.is_some()
+        self.current_bar_start_ts.is_some()
     }
 }
 
@@ -207,5 +219,50 @@ mod tests {
 
         assert_eq!(buffer.len(), 3);
         assert_eq!(buffer.last_close(), Some(4.0));
+    }
+
+    #[test]
+    fn test_aggregator_uses_tick_timestamps() {
+        let mut agg = MicroBarAggregator::new();
+
+        // Simulate backfill: 500 ticks arriving in burst but with historical timestamps
+        // Timestamps span 6 minutes (360 seconds = 72 bars worth)
+        let base_ts: i64 = 1700000000000; // Some epoch ms
+        let mut bars_produced = 0;
+
+        for i in 0..500 {
+            // Ticks spread over 360 seconds (every ~720ms in tick-time)
+            let ts = base_ts + (i * 720);
+            let price = 5000.0 + (i as f64 * 0.1);
+
+            if agg.update(price, 1.0, ts).is_some() {
+                bars_produced += 1;
+            }
+        }
+
+        // With 500 ticks over 360 seconds, we should get ~72 bars (360/5)
+        // Minus 1 because last bar is incomplete
+        assert!(bars_produced >= 70, "Expected ~70+ bars from backfill, got {}", bars_produced);
+    }
+
+    #[test]
+    fn test_aggregator_bar_alignment() {
+        let mut agg = MicroBarAggregator::new();
+
+        // First tick at ts=1000
+        assert!(agg.update(100.0, 1.0, 1000).is_none());
+
+        // Tick at 4999ms (same 5s window: 0-4999)
+        assert!(agg.update(101.0, 1.0, 4999).is_none());
+
+        // Tick at 5000ms (new window: 5000-9999) - should emit bar
+        let bar = agg.update(102.0, 1.0, 5000);
+        assert!(bar.is_some(), "Should emit bar when crossing 5s boundary");
+
+        let bar = bar.unwrap();
+        assert_eq!(bar.open, 100.0);
+        assert_eq!(bar.close, 101.0);
+        assert_eq!(bar.high, 101.0);
+        assert_eq!(bar.low, 100.0);
     }
 }
