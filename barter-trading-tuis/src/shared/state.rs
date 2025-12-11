@@ -375,10 +375,12 @@ const PRICE_RETENTION_SECS: i64 = 15 * 60;
 fn whale_threshold() -> f64 {
     static WHALE_THRESHOLD: OnceLock<f64> = OnceLock::new();
     *WHALE_THRESHOLD.get_or_init(|| {
-        std::env::var("WHALE_THRESHOLD")
+        let configured: f64 = std::env::var("WHALE_THRESHOLD")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(500_000.0)
+            .unwrap_or(500_000.0);
+        // Always enforce a minimum of $500K to keep whale definitions consistent
+        configured.max(500_000.0)
     })
 }
 
@@ -1461,12 +1463,23 @@ impl TickerState {
 
             // Push into per-exchange buffer; cap per exchange so one venue can't drown others
             let cap_per_exchange = (max_whales() / 3).max(50).min(max_whales());
+            let hard_cap = cap_per_exchange * 3; // Safety: 3x soft cap to prevent unbounded growth
+            let retention_secs = 300_i64; // Keep whales for 5 minutes
+
             let deque = self
                 .whales_by_exchange
                 .entry(exchange.to_string())
                 .or_insert_with(VecDeque::new);
             deque.push_front(record.clone());
-            while deque.len() > cap_per_exchange {
+
+            // Time-based retention: remove whales older than 5 minutes
+            let cutoff = Utc::now() - ChronoDuration::seconds(retention_secs);
+            while deque.back().map(|w| w.time < cutoff).unwrap_or(false) {
+                deque.pop_back();
+            }
+
+            // Hard cap safety: prevent unbounded growth even within retention window
+            while deque.len() > hard_cap {
                 deque.pop_back();
             }
 
@@ -1861,7 +1874,8 @@ impl TickerState {
         let vwap_1m = self.vwap(60);
         let vwap_5m = self.vwap(300);
         // Per-exchange fairness: ensure all exchanges represented in whale display
-        let whales: Vec<WhaleRecord> = self.fair_whale_selection(20);
+        // Show more recent whales while keeping cross-exchange fairness
+        let whales: Vec<WhaleRecord> = self.fair_whale_selection(40);
         let (clusters, cascade_risk, next_level, protection_level) = self.liquidation_clusters();
         let liq_rate_per_min = self.liquidation_rate_per_min();
         let liq_bucket = self.liquidation_bucket_size();
@@ -2563,7 +2577,13 @@ impl TickerState {
 
     /// Rolling CVD total over a window (seconds)
     fn cvd_total(&self, window_secs: i64) -> f64 {
-        let now = Utc::now();
+        // Use freshest trade time if recent to avoid clock skew; otherwise fall back to Utc::now()
+        let now = self
+            .trades
+            .back()
+            .map(|t| t.time)
+            .filter(|&t| (Utc::now() - t).num_seconds() < 5)
+            .unwrap_or_else(Utc::now);
         let cutoff = now - ChronoDuration::seconds(window_secs);
         self.trades
             .iter()
@@ -2599,11 +2619,13 @@ impl TickerState {
 
     /// Per-exchange short-window stats (CVD/volume/trades) for scalper
     fn per_exchange_short_stats(&self, window_secs: i64) -> HashMap<String, PerExchangeShortStats> {
-        // FIX: Use most recent trade's exchange time as reference instead of Utc::now()
-        // This avoids clock skew between local system time and exchange server time
-        // which was causing "--" to show when system clock is ahead of exchanges
-        let now = self.trades.back()
+        // Use the freshest trade time when recent, otherwise fall back to Utc::now().
+        // This avoids clock skew without breaking when the trade queue is stale/empty.
+        let now = self
+            .trades
+            .back()
             .map(|t| t.time)
+            .filter(|&t| (Utc::now() - t).num_seconds() < 5)
             .unwrap_or_else(Utc::now);
         let cutoff = now - ChronoDuration::seconds(window_secs);
         let mut acc: HashMap<String, (f64, f64, usize)> = HashMap::new(); // exchange -> (buy_usd, sell_usd, trades)
