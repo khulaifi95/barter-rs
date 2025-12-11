@@ -285,12 +285,12 @@ fn get_ws_url() -> String {
     std::env::var("WS_URL").unwrap_or_else(|_| "ws://127.0.0.1:9001".to_string())
 }
 
-/// Get whale threshold from WHALE_THRESHOLD env var (default: $500,000)
+/// Get whale threshold from WHALE_THRESHOLD_V1 env var (default: $200,000)
 fn whale_threshold() -> f64 {
-    std::env::var("WHALE_THRESHOLD")
+    std::env::var("WHALE_THRESHOLD_V1")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(500_000.0)
+        .unwrap_or(200_000.0)
 }
 
 /// Fetch BitMEX 24h historical volatility index (.BVOL24H)
@@ -1231,7 +1231,7 @@ fn render_whale_tape(
 ) {
     let threshold_k = whale_threshold() / 1000.0;
     let block = Block::default()
-        .title(format!(" WHALE TAPE (>${:.0}K, 90s) ", threshold_k))
+        .title(format!(" WHALE TAPE (>${:.0}K, 5m) ", threshold_k))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
@@ -1240,19 +1240,20 @@ fn render_whale_tape(
 
     if let Some(t) = snapshot.tickers.get(focused_ticker) {
         let now = chrono::Utc::now();
-        let cutoff = now - chrono::Duration::seconds(90);
+        let cutoff = now - chrono::Duration::seconds(300);
 
-        // Filter whales to last 90s
+        // Filter whales to last 5m and enforce minimum threshold
+        let threshold = whale_threshold();
         let recent_whales: Vec<_> = t
             .whales
             .iter()
-            .filter(|w| w.time >= cutoff)
+            .filter(|w| w.time >= cutoff && w.volume_usd >= threshold)
             .take(available_rows)
             .collect();
 
         if recent_whales.is_empty() {
             lines.push(Line::from(Span::styled(
-                "No whale trades in last 90s",
+                "No whale trades in last 5m",
                 Style::default().fg(Color::DarkGray),
             )));
         } else {

@@ -184,7 +184,9 @@ fn get_ws_url() -> String {
 }
 
 fn whale_threshold() -> f64 {
-    std::env::var("WHALE_THRESHOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(50_000.0)
+    // Whale cutoff (default $500K unless overridden via env; clamp to at least $500K)
+    let configured: f64 = std::env::var("WHALE_THRESHOLD_V2").ok().and_then(|v| v.parse().ok()).unwrap_or(500_000.0);
+    configured.max(500_000.0)
 }
 
 async fn fetch_bvol24h(client: &Client) -> Result<f64, reqwest::Error> {
@@ -989,7 +991,7 @@ fn render_whales(
 ) {
     let threshold_k = whale_threshold() / 1000.0;
     let block = Block::default()
-        .title(format!(" WHALES (>${:.0}K, 90s) ", threshold_k))
+        .title(format!(" WHALES (>${:.0}K, 5m) ", threshold_k))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(C_ACCENT));
     let rows = area.height.saturating_sub(2) as usize;
@@ -1000,12 +1002,16 @@ fn render_whales(
 
     if let Some(t) = snapshot.tickers.get(ticker) {
         let now = chrono::Utc::now();
-        let cutoff = now - chrono::Duration::seconds(90);
+        let cutoff = now - chrono::Duration::seconds(300);
 
-        let recent: Vec<_> = t.whales.iter().filter(|w| w.time >= cutoff).take(rows).collect();
+        let threshold = whale_threshold();
+        let recent: Vec<_> = t.whales.iter()
+            .filter(|w| w.time >= cutoff && w.volume_usd >= threshold)
+            .take(rows)
+            .collect();
 
         if recent.is_empty() {
-            lines.push(Line::from(Span::styled("No whale trades in last 90s", Style::default().fg(C_DIM))));
+            lines.push(Line::from(Span::styled("No whale trades in last 5m", Style::default().fg(C_DIM))));
         } else {
             for w in recent {
                 let age = (now - w.time).num_milliseconds() as f64 / 1000.0;
