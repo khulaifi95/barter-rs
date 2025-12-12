@@ -191,7 +191,7 @@ async fn main() {
                         let is_spot =
                             matches!(market_event.instrument.kind, MarketDataInstrumentKind::Spot);
                         if is_spot && notional >= spot_log_threshold {
-                            info!(
+                            debug!(
                                 "SPOT TRADE >=50k {} {}/{} @ {} qty {} notional {} side {:?}",
                                 market_event.exchange,
                                 market_event.instrument.base,
@@ -206,7 +206,7 @@ async fn main() {
 
                     // Debug logging for liquidation events to verify flow
                     if let DataKind::Liquidation(liq) = &market_event.kind {
-                        info!(
+                        debug!(
                             "LIQ EVENT {} {}/{} @ {} qty {} side {:?}",
                             market_event.exchange,
                             market_event.instrument.base,
@@ -219,7 +219,7 @@ async fn main() {
 
                     // Debug logging for open interest events
                     if let DataKind::OpenInterest(oi) = &market_event.kind {
-                        info!(
+                        debug!(
                             "OI EVENT {} {}/{} contracts: {} notional: {:?}",
                             market_event.exchange,
                             market_event.instrument.base,
@@ -294,7 +294,10 @@ async fn main() {
                                 message.instrument.base,
                                 message.instrument.quote
                             );
-                            let throttle_ms = 50; // ~20 updates/sec per instrument
+                            let throttle_ms: u64 = std::env::var("L1_THROTTLE_MS")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(50); // ~20 updates/sec per instrument
                             let now = Instant::now();
                             let should_skip = if let Some(prev) = l1_last_broadcast.get(&key) {
                                 now.duration_since(*prev) < Duration::from_millis(throttle_ms)
@@ -324,7 +327,7 @@ async fn main() {
                     }
                     if is_liquidation {
                         let receivers = tx_trades.receiver_count();
-                        info!(
+                        debug!(
                             "BROADCASTING liquidation to {} clients: {} {}/{}",
                             receivers,
                             message.exchange,
@@ -334,7 +337,7 @@ async fn main() {
                     }
                     if is_open_interest {
                         let receivers = tx_trades.receiver_count();
-                        info!(
+                        debug!(
                             "BROADCASTING open_interest to {} clients: {} {}/{}",
                             receivers,
                             message.exchange,

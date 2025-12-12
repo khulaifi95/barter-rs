@@ -455,7 +455,6 @@ struct WhaleCounters {
 pub struct AggregatedSnapshot {
     pub tickers: HashMap<String, TickerSnapshot>,
     pub correlation: [[f64; 3]; 3],
-    pub exchange_health: HashMap<String, bool>,
 }
 
 /// Per-ticker snapshot with pre-computed metrics.
@@ -938,12 +937,9 @@ impl Aggregator {
 
         let correlation = self.compute_correlation();
 
-        let exchange_health = self.compute_exchange_health();
-
         AggregatedSnapshot {
             tickers: tickers_out,
             correlation,
-            exchange_health,
         }
     }
 
@@ -967,16 +963,6 @@ impl Aggregator {
         }
 
         matrix
-    }
-
-    fn compute_exchange_health(&self) -> HashMap<String, bool> {
-        let now = Utc::now();
-        let mut health = HashMap::new();
-        for (ex, last) in &self.exchange_last_seen {
-            let ok = (now - *last).num_seconds() <= 30;
-            health.insert(ex.clone(), ok);
-        }
-        health
     }
 
     /// Get seconds since last event per exchange (for scalper freshness display)
@@ -1018,8 +1004,8 @@ struct CvdRecord {
     total_quote: f64,
 }
 
-/// OI retention for velocity calculation (10 minutes)
-const OI_RETENTION_SECS: i64 = 10 * 60;
+/// OI retention for velocity calculation (20 minutes to cover 15m delta window)
+const OI_RETENTION_SECS: i64 = 20 * 60;
 /// Basis retention for momentum tracking (10 minutes)
 const BASIS_RETENTION_SECS: i64 = 10 * 60;
 
@@ -2025,7 +2011,7 @@ impl TickerState {
             oi_delta_per_exchange_15m,
             oi_freshness_secs,
             oi_freshness_per_exchange,
-            exchange_health: HashMap::new(), // TODO: populate from aggregator
+            exchange_health: HashMap::new(),
             tick_direction,
             tick_direction_5m,
             tick_direction_30s,
@@ -2796,28 +2782,43 @@ impl TickerState {
         }
     }
 
-    /// Per-exchange OI delta calculation
-    /// Returns (5m deltas per exchange, 15m deltas per exchange)
-    /// Note: Currently returns current OI values as we don't track per-exchange history yet
+    /// Per-exchange OI deltas over 5m and 15m windows.
+    /// Units: normalized base currency (BTC/ETH/SOL). UIs convert to USD by multiplying by price.
     fn oi_delta_per_exchange(&self) -> (HashMap<String, f64>, HashMap<String, f64>) {
-        // Calculate total OI for percentage calculation
-        let total_oi: f64 = self.oi_by_exchange.values().copied().sum();
+        let now = Utc::now();
+        let cutoff_5m = now - ChronoDuration::seconds(300);
+        let cutoff_15m = now - ChronoDuration::seconds(900);
 
-        // For now, we use the current OI values
-        // TODO: Track per-exchange OI history for true delta calculation
         let mut delta_5m: HashMap<String, f64> = HashMap::new();
         let mut delta_15m: HashMap<String, f64> = HashMap::new();
 
-        // Get the overall delta and distribute proportionally
-        let (total_delta_5m, _) = self.oi_velocity(300);
-        let (total_delta_15m, _) = self.oi_velocity(900);
-
-        for (exchange, &oi) in &self.oi_by_exchange {
-            let share = if total_oi > 0.0 { oi / total_oi } else { 0.0 };
-            // Abbreviate exchange name
+        for (exchange, history) in &self.oi_history_by_exchange {
             let abbrev = abbreviate_exchange(exchange);
-            delta_5m.insert(abbrev.to_string(), total_delta_5m * share);
-            delta_15m.insert(abbrev.to_string(), total_delta_15m * share);
+
+            // Need at least 2 records for meaningful delta
+            if history.len() < 2 {
+                delta_5m.insert(abbrev.to_string(), 0.0);
+                delta_15m.insert(abbrev.to_string(), 0.0);
+                continue;
+            }
+
+            let latest = history.back().map(|r| r.total).unwrap_or(0.0);
+
+            // Find oldest record within each window
+            let oldest_5m = history
+                .iter()
+                .find(|r| r.time >= cutoff_5m)
+                .map(|r| r.total)
+                .unwrap_or(latest);
+
+            let oldest_15m = history
+                .iter()
+                .find(|r| r.time >= cutoff_15m)
+                .map(|r| r.total)
+                .unwrap_or(latest);
+
+            delta_5m.insert(abbrev.to_string(), latest - oldest_5m);
+            delta_15m.insert(abbrev.to_string(), latest - oldest_15m);
         }
 
         (delta_5m, delta_15m)
