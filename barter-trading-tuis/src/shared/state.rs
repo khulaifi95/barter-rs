@@ -1459,7 +1459,7 @@ impl TickerState {
             deque.push_front(record.clone());
 
             // Time-based retention: remove whales older than 5 minutes
-            let cutoff = Utc::now() - ChronoDuration::seconds(retention_secs);
+            let cutoff = time - ChronoDuration::seconds(retention_secs);
             while deque.back().map(|w| w.time < cutoff).unwrap_or(false) {
                 deque.pop_back();
             }
@@ -2541,18 +2541,44 @@ impl TickerState {
     /// Fair whale selection: distribute display slots across exchanges
     /// to prevent high-volume exchanges from drowning others
     fn fair_whale_selection(&self, limit: usize) -> Vec<WhaleRecord> {
-        let exchange_count = self.whales_by_exchange.len();
-        if exchange_count == 0 {
+        if self.whales_by_exchange.is_empty() {
+            return Vec::new();
+        }
+
+        // Window whales to last 5 minutes using exchange-time reference when available.
+        // This avoids clock-skew issues vs Utc::now() and ensures the whale tape
+        // scrolls even when no new whales are detected (trades continue updating).
+        let now_local = Utc::now();
+        let now_ref = self
+            .trades
+            .back()
+            .map(|t| t.time)
+            .filter(|&t| (now_local - t).num_seconds() < 5)
+            .unwrap_or(now_local);
+        let cutoff = now_ref - ChronoDuration::seconds(300);
+
+        let mut active_exchange_count = 0usize;
+        for deque in self.whales_by_exchange.values() {
+            if deque.iter().any(|w| w.time >= cutoff) {
+                active_exchange_count += 1;
+            }
+        }
+        if active_exchange_count == 0 {
             return Vec::new();
         }
 
         // Allocate slots per exchange (min 3 per exchange if possible)
-        let slots_per_exchange = (limit / exchange_count).max(3);
+        let slots_per_exchange = (limit / active_exchange_count).max(3);
 
         // Take top N whales from each exchange fairly
         let mut result = Vec::with_capacity(limit);
         for deque in self.whales_by_exchange.values() {
-            result.extend(deque.iter().take(slots_per_exchange).cloned());
+            result.extend(
+                deque.iter()
+                    .filter(|w| w.time >= cutoff)
+                    .take(slots_per_exchange)
+                    .cloned(),
+            );
         }
 
         // Sort by time (most recent first) and limit

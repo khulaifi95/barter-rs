@@ -285,12 +285,14 @@ fn get_ws_url() -> String {
     std::env::var("WS_URL").unwrap_or_else(|_| "ws://127.0.0.1:9001".to_string())
 }
 
-/// Get whale threshold from WHALE_THRESHOLD_V1 env var (default: $200,000)
+/// Get whale display filter from WHALE_THRESHOLD_V1 env var (default: $500,000).
+/// This is a per-view filter for the scalper; detection remains adaptive in shared state.
 fn whale_threshold() -> f64 {
-    std::env::var("WHALE_THRESHOLD_V1")
+    let configured: f64 = std::env::var("WHALE_THRESHOLD_V1")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(200_000.0)
+        .unwrap_or(500_000.0);
+    configured.max(500_000.0)
 }
 
 /// Fetch BitMEX 24h historical volatility index (.BVOL24H)
@@ -1239,26 +1241,25 @@ fn render_whale_tape(
     let mut lines = Vec::new();
 
     if let Some(t) = snapshot.tickers.get(focused_ticker) {
-        let now = chrono::Utc::now();
-        let cutoff = now - chrono::Duration::seconds(300);
+        let now_local = chrono::Utc::now();
 
-        // Filter whales to last 5m and enforce minimum threshold
+        // Whales are already windowed (5m) in the shared snapshot; apply only the per-view filter.
         let threshold = whale_threshold();
         let recent_whales: Vec<_> = t
             .whales
             .iter()
-            .filter(|w| w.time >= cutoff && w.volume_usd >= threshold)
+            .filter(|w| w.volume_usd >= threshold)
             .take(available_rows)
             .collect();
 
         if recent_whales.is_empty() {
             lines.push(Line::from(Span::styled(
-                "No whale trades in last 5m",
+                "No whale trades above threshold in last 5m",
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
             for whale in recent_whales {
-                let age = (now - whale.time).num_milliseconds() as f64 / 1000.0;
+                let age = (now_local - whale.time).num_milliseconds() as f64 / 1000.0;
                 let side_color = if whale.side == Side::Buy {
                     Color::Green
                 } else {

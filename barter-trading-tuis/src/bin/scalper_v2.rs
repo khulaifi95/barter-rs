@@ -1001,20 +1001,19 @@ fn render_whales(
     let mut lines = Vec::new();
 
     if let Some(t) = snapshot.tickers.get(ticker) {
-        let now = chrono::Utc::now();
-        let cutoff = now - chrono::Duration::seconds(300);
+        let now_local = chrono::Utc::now();
 
         let threshold = whale_threshold();
         let recent: Vec<_> = t.whales.iter()
-            .filter(|w| w.time >= cutoff && w.volume_usd >= threshold)
+            .filter(|w| w.volume_usd >= threshold)
             .take(rows)
             .collect();
 
         if recent.is_empty() {
-            lines.push(Line::from(Span::styled("No whale trades in last 5m", Style::default().fg(C_DIM))));
+            lines.push(Line::from(Span::styled("No whale trades above threshold in last 5m", Style::default().fg(C_DIM))));
         } else {
             for w in recent {
-                let age = (now - w.time).num_milliseconds() as f64 / 1000.0;
+                let age = (now_local - w.time).num_milliseconds() as f64 / 1000.0;
                 let side_color = if w.side == Side::Buy { C_BUY } else { C_SELL };
                 let ex = match w.exchange.as_str() {
                     "BinanceFuturesUsd" | "BinanceSpot" => "BNC",
