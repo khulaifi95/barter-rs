@@ -14,9 +14,10 @@ use std::{
 };
 
 use barter_trading_tuis::{
-    AggregatedSnapshot, Aggregator, ConnectionStatus, DivergenceSignal,
-    FlowSignal, Side, WebSocketClient, WebSocketConfig,
+    AggregatedSnapshot, Aggregator, Candle1m, ConnectionStatus, DivergenceSignal,
+    FlowSignal, Side, WebSocketClient, WebSocketConfig, ticker_to_binance_symbol,
 };
+use rustls::crypto::ring::default_provider;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -31,6 +32,8 @@ use ratatui::{
     Terminal,
 };
 use tokio::sync::Mutex;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use futures::StreamExt;
 
 static TICKERS: OnceLock<Vec<String>> = OnceLock::new();
 
@@ -97,8 +100,83 @@ fn tickers() -> &'static [String] {
     TICKERS.get_or_init(get_tickers)
 }
 
+/// Spawn a Binance 1m kline stream for a ticker (perps)
+async fn run_binance_kline_stream(ticker: &str, agg: Arc<Mutex<Aggregator>>) {
+    let symbol = ticker_to_binance_symbol(ticker).to_lowercase();
+    let url = format!("wss://fstream.binance.com/ws/{}@kline_1m", symbol);
+
+    loop {
+        // Resync from REST on reconnect to avoid drift
+        {
+            let mut guard = agg.lock().await;
+            let _ = guard.backfill_1m_klines(&[ticker]).await;
+        }
+
+        match connect_async(&url).await {
+            Ok((ws_stream, _)) => {
+                let (_, mut read) = ws_stream.split();
+                while let Some(msg) = read.next().await {
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if let Some(k) = v.get("k") {
+                                    let is_final = k.get("x").and_then(|b| b.as_bool()).unwrap_or(false);
+                                    if !is_final {
+                                        continue;
+                                    }
+                                    if let (Some(start_ms), Some(open), Some(high), Some(low), Some(close), Some(vol)) = (
+                                        k.get("t").and_then(|v| v.as_i64()),
+                                        k.get("o").and_then(|v| v.as_str()),
+                                        k.get("h").and_then(|v| v.as_str()),
+                                        k.get("l").and_then(|v| v.as_str()),
+                                        k.get("c").and_then(|v| v.as_str()),
+                                        k.get("v").and_then(|v| v.as_str()),
+                                    ) {
+                                        if let Some(start_time) = chrono::DateTime::from_timestamp_millis(start_ms) {
+                                            if let (Ok(o), Ok(h), Ok(l), Ok(c), Ok(volume)) =
+                                                (open.parse::<f64>(), high.parse::<f64>(), low.parse::<f64>(), close.parse::<f64>(), vol.parse::<f64>())
+                                            {
+                                                let candle = Candle1m {
+                                                    open: o,
+                                                    high: h,
+                                                    low: l,
+                                                    close: c,
+                                                    volume,
+                                                    start_time,
+                                                    is_complete: true,
+                                                };
+                                                let mut guard = agg.lock().await;
+                                                guard.push_1m_candle(ticker, candle);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
+                        Ok(Message::Close(_)) => break,
+                        Err(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[kline-ws] {} connect error: {}", ticker, e);
+            }
+        }
+
+        // Backoff before reconnect
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Install rustls crypto provider (required for TLS fetches / wss)
+    if let Err(e) = default_provider().install_default() {
+        eprintln!("[crypto] provider install: {:?}", e);
+    }
+
     // Setup panic hook to restore terminal on crash
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -118,11 +196,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let aggregator = Arc::new(Mutex::new(Aggregator::new()));
     let connected = Arc::new(AtomicBool::new(false));
 
-    // Backfill tvVWAP and ATR from historical data on startup (silently - no logs to avoid TUI bleed)
+    // Backfill tvVWAP, ATR, and RV from authoritative Binance 1m klines
     {
         let ticker_list: Vec<&str> = tickers().iter().map(|s| s.as_str()).collect();
         let mut guard = aggregator.lock().await;
-        let _ = guard.backfill_all(&ticker_list).await;
+        let _ = guard.backfill_1m_klines(&ticker_list).await;
+    }
+
+    // Binance 1m kline WebSocket streams (authoritative candles)
+    {
+        let agg = Arc::clone(&aggregator);
+        for ticker in tickers().iter().cloned() {
+            let agg_clone = Arc::clone(&agg);
+            tokio::spawn(async move {
+                run_binance_kline_stream(&ticker, agg_clone).await;
+            });
+        }
     }
 
     // WebSocket client
@@ -348,8 +437,8 @@ fn render_exchange_intelligence(f: &mut ratatui::Frame, area: Rect, snapshot: &A
 
         let total_oi: f64 = oi_by_exch.values().copied().sum();
 
-        // Get BTC price to convert OI delta from BTC to USD
-        let btc_price = t.latest_price.unwrap_or(87000.0);
+        // Get BTC price to convert OI delta from BTC to USD (use Binance for consistency)
+        let btc_price = t.binance_perp_last.or(t.latest_price).unwrap_or(87000.0);
 
         // Use the correct total delta (same as MARKET PULSE) and distribute by share
         // This avoids the oi_delta_per_exchange bug where HashMap overwrites on duplicate abbreviated keys
@@ -378,8 +467,9 @@ fn render_exchange_intelligence(f: &mut ratatui::Frame, area: Rect, snapshot: &A
             let color_15m = if delta_15m_usd > 0.0 { Color::Green } else if delta_15m_usd < 0.0 { Color::Red } else { Color::Gray };
             let arrow = if delta_5m_usd > 0.0 { "↑" } else if delta_5m_usd < 0.0 { "↓" } else { "→" };
 
-            let health = t.exchange_health.get(exch).copied().unwrap_or(0.5);
-            let health_color = if health < 1.0 { Color::Green } else if health < 5.0 { Color::Yellow } else { Color::Red };
+            // Use OI freshness for dot color (green < 5s, yellow 5-15s, red > 15s)
+            let oi_age = t.oi_freshness_per_exchange.get(exch).copied().unwrap_or(999.0);
+            let oi_freshness_color = if oi_age < 5.0 { Color::Green } else if oi_age < 15.0 { Color::Yellow } else { Color::Red };
 
             lines.push(Line::from(vec![
                 Span::styled(format!("  {:3}", exch), Style::default().fg(Color::Cyan)),
@@ -388,7 +478,7 @@ fn render_exchange_intelligence(f: &mut ratatui::Frame, area: Rect, snapshot: &A
                 Span::styled("/", Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{:<7} ", format_delta(delta_15m_usd)), Style::default().fg(color_15m)),
                 Span::styled(arrow, Style::default().fg(color_5m)),
-                Span::styled(" ●", Style::default().fg(health_color)),
+                Span::styled(" ●", Style::default().fg(oi_freshness_color)),
             ]));
         }
 
@@ -529,12 +619,15 @@ fn abbreviate_exchange_for_display(name: &str) -> &'static str {
 
 /// Format delta value with K/M suffix
 fn format_delta(value: f64) -> String {
-    if value.abs() >= 1_000_000.0 {
+    let abs = value.abs();
+    if abs >= 1_000_000.0 {
         format!("{:+.1}M", value / 1_000_000.0)
-    } else if value.abs() >= 1_000.0 {
+    } else if abs >= 1_000.0 {
         format!("{:+.1}K", value / 1_000.0)
-    } else {
+    } else if abs >= 1.0 {
         format!("{:+.0}", value)
+    } else {
+        "~0".to_string()  // Avoid showing +0 or -0 for tiny values
     }
 }
 
@@ -637,9 +730,10 @@ fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggr
 
     for ticker in tickers() {
         if let Some(t) = snapshot.tickers.get(ticker) {
-            // Ticker header with price and health indicator
+            // Ticker header with price and health indicator (use Binance for consistency)
             let price_str = t
-                .latest_price
+                .binance_perp_last
+                .or(t.latest_price)
                 .map(|p| {
                     if p >= 1000.0 {
                         format!("${:.1}K", p / 1000.0)
@@ -691,8 +785,8 @@ fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggr
                 Span::raw(format!("{:.0}{}(5m)", v5m, s5m)),
             ]));
 
-            // OI with per-exchange breakdown - convert from contracts to USD
-            let ticker_price = t.latest_price.unwrap_or(1.0);
+            // OI with per-exchange breakdown - convert from contracts to USD (use Binance for consistency)
+            let ticker_price = t.binance_perp_last.or(t.latest_price).unwrap_or(1.0);
             let oi_delta_usd = t.oi_delta_5m * ticker_price;
             let (oi_arrow, oi_color) = if oi_delta_usd > 100_000.0 {
                 ("↑", Color::Green)

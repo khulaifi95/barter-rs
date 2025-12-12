@@ -22,9 +22,17 @@ pub use shared::websocket::{WebSocketClient, WebSocketConfig};
 
 pub use shared::aggregation::{calculate_vwap, VolumeWindow};
 
+// Traditional markets (ES/NQ) correlation module
+pub use shared::trad_markets::{
+    CorrelationSignals, IbkrConnectionStatus, TradMarketState,
+    render_trad_markets_panel, spawn_ibkr_feed,
+};
+
 // Aggregation engine (shared across all TUIs)
 pub use shared::state::{
     AggregatedSnapshot, Aggregator, BackfillResult, BasisMomentum, BasisState, BasisStats,
     BasisTrend, CascadeLevel, CvdSummary, DivergenceSignal, FlowSignal, LiquidationCluster,
     OrderflowStats, TickDirection, TickerSnapshot, TradingSession, VolTrend, WhaleRecord,
+    // 1m kline support (authoritative source for tvVWAP/ATR/RV)
+    Candle1m, fetch_binance_1m_candles, ticker_to_binance_symbol,
 };

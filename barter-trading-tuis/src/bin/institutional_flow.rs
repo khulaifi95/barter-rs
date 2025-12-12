@@ -459,7 +459,8 @@ fn render_momentum_signals(f: &mut Frame, snapshot: &AggregatedSnapshot, area: R
     ));
     for ticker in tickers() {
         if let Some(t) = snapshot.tickers.get(ticker) {
-            if let (Some(vwap), Some(price)) = (t.vwap_1m, t.latest_price) {
+            // Use Binance perp price for consistent VWAP deviation calculation
+            if let (Some(vwap), Some(price)) = (t.vwap_1m, t.binance_perp_last.or(t.latest_price)) {
                 let dev = ((price - vwap) / vwap) * 100.0;
                 let color = if dev >= 0.0 { Color::Green } else { Color::Red };
                 vwap_parts.push(Span::styled(

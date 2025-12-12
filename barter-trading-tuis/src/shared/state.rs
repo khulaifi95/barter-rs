@@ -21,7 +21,19 @@ use std::sync::OnceLock;
 // SMA's equal weighting of 70-minute-old data causes unacceptable lag during rapid moves.
 // Future consideration: If EMA proves too noisy, revisit SMA or use shorter period (ATR-10).
 
-/// 5-minute candle for ATR calculation
+/// 1-minute candle from Binance kline stream (authoritative source)
+#[derive(Clone, Debug)]
+pub struct Candle1m {
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    pub start_time: DateTime<Utc>,
+    pub is_complete: bool,
+}
+
+/// 5-minute candle for ATR calculation (aggregated from 1m candles)
 #[derive(Clone, Debug)]
 struct Candle5m {
     open: f64,
@@ -282,8 +294,69 @@ pub async fn fetch_binance_5m_candles(symbol: &str) -> Result<Vec<Candle5m>, Str
     Ok(candles)
 }
 
+/// Fetch 1m candles from Binance futures API (authoritative source for tvVWAP/ATR/RV)
+pub async fn fetch_binance_1m_candles(symbol: &str) -> Result<Vec<Candle1m>, String> {
+    // Calculate start time: 00:00 UTC today
+    let now = Utc::now();
+    let start_of_day = now
+        .with_hour(0)
+        .and_then(|t| t.with_minute(0))
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(now);
+    let start_ms = start_of_day.timestamp_millis();
+
+    // Fetch from start of day (for tvVWAP) plus some warmup for ATR
+    // 1m candles: fetch last 300 (5 hours) for ATR warmup and RV calculation
+    let warmup_start_ms = start_ms - (60 * 60 * 1000); // 1 hour before midnight
+
+    let url = format!(
+        "https://fapi.binance.com/fapi/v1/klines?symbol={}&interval=1m&startTime={}&limit=1000",
+        symbol, warmup_start_ms
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP error: {}", response.status()));
+    }
+
+    let klines: Vec<BinanceKline> = response
+        .json()
+        .await
+        .map_err(|e| format!("JSON parse failed: {}", e))?;
+
+    let candles: Vec<Candle1m> = klines
+        .into_iter()
+        .filter_map(|k| {
+            let open_time_ms = k.0;
+            let close_time_ms = k.6;
+            let start_time = DateTime::from_timestamp_millis(open_time_ms)?;
+            // Mark candle as complete if close time has passed
+            let is_complete = close_time_ms < now.timestamp_millis();
+            Some(Candle1m {
+                open: k.1.parse().ok()?,
+                high: k.2.parse().ok()?,
+                low: k.3.parse().ok()?,
+                close: k.4.parse().ok()?,
+                volume: k.5.parse().ok()?,
+                start_time,
+                is_complete,
+            })
+        })
+        .collect();
+
+    Ok(candles)
+}
+
 /// Map ticker to Binance futures symbol
-fn ticker_to_binance_symbol(ticker: &str) -> &'static str {
+pub fn ticker_to_binance_symbol(ticker: &str) -> &'static str {
     match ticker {
         "BTC" => "BTCUSDT",
         "ETH" => "ETHUSDT",
@@ -295,17 +368,19 @@ fn ticker_to_binance_symbol(ticker: &str) -> &'static str {
 // Default constants (overridable via environment variables)
 const TRADE_RETENTION_SECS: i64 = 15 * 60;
 const LIQ_RETENTION_SECS: i64 = 10 * 60;
-const CVD_RETENTION_SECS: i64 = 5 * 60;
+const CVD_RETENTION_SECS: i64 = 15 * 60; // Extended to 15m to match UI panels
 const PRICE_RETENTION_SECS: i64 = 15 * 60;
 
 /// Get whale detection threshold from WHALE_THRESHOLD env var (default: $500,000)
 fn whale_threshold() -> f64 {
     static WHALE_THRESHOLD: OnceLock<f64> = OnceLock::new();
     *WHALE_THRESHOLD.get_or_init(|| {
-        std::env::var("WHALE_THRESHOLD")
+        let configured: f64 = std::env::var("WHALE_THRESHOLD")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(500_000.0)
+            .unwrap_or(500_000.0);
+        // Always enforce a minimum of $500K to keep whale definitions consistent
+        configured.max(500_000.0)
     })
 }
 
@@ -380,7 +455,6 @@ struct WhaleCounters {
 pub struct AggregatedSnapshot {
     pub tickers: HashMap<String, TickerSnapshot>,
     pub correlation: [[f64; 3]; 3],
-    pub exchange_health: HashMap<String, bool>,
 }
 
 /// Per-ticker snapshot with pre-computed metrics.
@@ -391,6 +465,12 @@ pub struct TickerSnapshot {
     pub latest_spread_pct: Option<f64>,
     pub spot_mid: Option<f64>,
     pub perp_mid: Option<f64>,
+    /// Binance perp last trade price - consistent reference across all TUIs
+    pub binance_perp_last: Option<f64>,
+    /// Fair value: 30s volume-weighted mid across all perp exchanges
+    pub fair_value: Option<f64>,
+    /// Fair value deviation in basis points: (binance_last - FV) / FV * 10000
+    pub fair_value_deviation_bps: Option<f64>,
     pub basis: Option<BasisStats>,
     // Multi-timeframe orderflow (P0: 5s/15s/30s for scalper, 1m/5m for swing)
     pub orderflow_5s: OrderflowStats,
@@ -438,6 +518,10 @@ pub struct TickerSnapshot {
     pub oi_per_exchange: HashMap<String, f64>,
     pub oi_delta_per_exchange_5m: HashMap<String, f64>,
     pub oi_delta_per_exchange_15m: HashMap<String, f64>,
+    /// OI freshness: seconds since last OI update (max across all exchanges)
+    pub oi_freshness_secs: f64,
+    /// OI freshness per exchange: seconds since last OI update
+    pub oi_freshness_per_exchange: HashMap<String, f64>,
     // Exchange health (seconds since last data)
     pub exchange_health: HashMap<String, f64>,
     pub tick_direction: TickDirection,
@@ -671,6 +755,45 @@ impl Aggregator {
         }
     }
 
+    /// Backfill tvVWAP, ATR, and RV from authoritative Binance 1m klines
+    /// This is the preferred backfill method - use this for accurate metrics
+    pub async fn backfill_1m_klines(&mut self, tickers: &[&str]) -> HashMap<String, BackfillResult> {
+        let mut results = HashMap::new();
+
+        for ticker in tickers {
+            let symbol = ticker_to_binance_symbol(ticker);
+
+            // Ensure ticker state exists
+            let state = self
+                .tickers
+                .entry(ticker.to_string())
+                .or_insert_with(|| TickerState::new(ticker.to_string()));
+
+            match fetch_binance_1m_candles(symbol).await {
+                Ok(candles) => {
+                    let result = state.backfill_from_1m_candles(candles);
+                    results.insert(ticker.to_string(), result);
+                }
+                Err(e) => {
+                    eprintln!("[backfill-1m] {} failed: {}", ticker, e);
+                    results.insert(ticker.to_string(), BackfillResult::default());
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Push a 1m candle update from Binance kline WebSocket
+    pub fn push_1m_candle(&mut self, ticker: &str, candle: Candle1m) {
+        let state = self
+            .tickers
+            .entry(ticker.to_string())
+            .or_insert_with(|| TickerState::new(ticker.to_string()));
+
+        state.push_1m_candle(candle);
+    }
+
     pub fn process_event(&mut self, event: MarketEventMessage) {
         let ticker = event.instrument.base.to_uppercase();
         let kind = event.instrument.kind.to_lowercase();
@@ -732,7 +855,9 @@ impl Aggregator {
             }
             "open_interest" => {
                 if let Ok(oi) = serde_json::from_value::<OpenInterestData>(event.data) {
-                    state.push_oi(&event.exchange, oi.contracts);
+                    // Use exchange time from OI data if available, fallback to event time
+                    let oi_time = oi.time.unwrap_or(event.time_exchange);
+                    state.push_oi(&event.exchange, oi.contracts, oi_time);
                 }
             }
             "order_book_l1" => {
@@ -812,12 +937,9 @@ impl Aggregator {
 
         let correlation = self.compute_correlation();
 
-        let exchange_health = self.compute_exchange_health();
-
         AggregatedSnapshot {
             tickers: tickers_out,
             correlation,
-            exchange_health,
         }
     }
 
@@ -841,16 +963,6 @@ impl Aggregator {
         }
 
         matrix
-    }
-
-    fn compute_exchange_health(&self) -> HashMap<String, bool> {
-        let now = Utc::now();
-        let mut health = HashMap::new();
-        for (ex, last) in &self.exchange_last_seen {
-            let ok = (now - *last).num_seconds() <= 30;
-            health.insert(ex.clone(), ok);
-        }
-        health
     }
 
     /// Get seconds since last event per exchange (for scalper freshness display)
@@ -892,8 +1004,8 @@ struct CvdRecord {
     total_quote: f64,
 }
 
-/// OI retention for velocity calculation (10 minutes)
-const OI_RETENTION_SECS: i64 = 10 * 60;
+/// OI retention for velocity calculation (20 minutes to cover 15m delta window)
+const OI_RETENTION_SECS: i64 = 20 * 60;
 /// Basis retention for momentum tracking (10 minutes)
 const BASIS_RETENTION_SECS: i64 = 10 * 60;
 
@@ -924,10 +1036,14 @@ struct TickerState {
     oi_by_exchange: HashMap<String, f64>,
     oi_history: VecDeque<OiRecord>,
     oi_history_by_exchange: HashMap<String, VecDeque<OiRecord>>,
+    // OI last update timestamp per exchange (for freshness tracking)
+    oi_last_update: HashMap<String, DateTime<Utc>>,
     // P1: Basis history for momentum tracking
     basis_history: VecDeque<BasisRecord>,
     spot_mid: Option<f64>,
     perp_mid: Option<f64>,
+    // Binance perp last trade price - consistent reference for all TUIs
+    binance_perp_last: Option<f64>,
     spread_pct: Option<f64>,
     best_bid: Option<(f64, f64)>,
     best_ask: Option<(f64, f64)>,
@@ -940,12 +1056,22 @@ struct TickerState {
     vwap_daily: VwapState,
     vwap_session: VwapState,
     current_session: Option<TradingSession>,
-    // tvVWAP state (HLC3 on 5m candles - TradingView style)
+    // tvVWAP state (HLC3 on 5m candles - TradingView style) - DEPRECATED: kept for fallback
     tv_vwap: VwapState,
-    // ATR-14 state (5m candles, EMA)
+    // ATR-14 state (5m candles, EMA) - DEPRECATED: kept for fallback
     candles_5m: VecDeque<Candle5m>,
     current_candle: Option<Candle5m>,
     atr_state: AtrState,
+
+    // === KLINE-BASED METRICS (authoritative, from Binance 1m klines) ===
+    // 1m candle buffer from Binance kline stream (keep 300 = 5 hours)
+    candles_1m: VecDeque<Candle1m>,
+    // tvVWAP computed from 1m klines (authoritative)
+    kline_tv_vwap: VwapState,
+    // ATR-14 computed from 1m klines (14 minutes lookback)
+    kline_atr_state: AtrState,
+    // Flag to indicate kline data is available and should be used
+    use_kline_metrics: bool,
     // L2 Orderbook state per exchange
     book_imbalance_by_exchange: HashMap<String, f64>,  // Current imbalance (0-100%, 50% = balanced)
     book_last_update: HashMap<String, DateTime<Utc>>,  // Last update time per exchange
@@ -964,9 +1090,11 @@ impl TickerState {
             oi_by_exchange: HashMap::new(),
             oi_history: VecDeque::new(),
             oi_history_by_exchange: HashMap::new(),
+            oi_last_update: HashMap::new(),
             basis_history: VecDeque::new(),
             spot_mid: None,
             perp_mid: None,
+            binance_perp_last: None,
             spread_pct: None,
             best_bid: None,
             best_ask: None,
@@ -982,6 +1110,11 @@ impl TickerState {
             candles_5m: VecDeque::with_capacity(15), // Keep 15 candles (14 for ATR + current)
             current_candle: None,
             atr_state: AtrState::default(),
+            // Kline-based metrics (authoritative)
+            candles_1m: VecDeque::with_capacity(300), // Keep 300 1m candles (5 hours)
+            kline_tv_vwap: VwapState::default(),
+            kline_atr_state: AtrState::default(),
+            use_kline_metrics: false, // Will be set to true once kline data is available
             book_imbalance_by_exchange: HashMap::new(),
             book_last_update: HashMap::new(),
             book_flip_history: VecDeque::new(),
@@ -1012,14 +1145,20 @@ impl TickerState {
         for candle in candles {
             let candle_date = candle.start_time.date_naive();
 
-            // Only add to tvVWAP if candle is from today
-            if candle_date == today {
+            // Skip incomplete candles (candle end time = start + 5 minutes)
+            let candle_end = candle.start_time + ChronoDuration::minutes(5);
+            let is_complete = candle_end <= now;
+
+            // Only add to tvVWAP if candle is from today AND complete
+            if candle_date == today && is_complete {
                 let hlc3 = (candle.high + candle.low + candle.close) / 3.0;
                 self.tv_vwap.add_trade(hlc3, candle.volume);
             }
 
-            // Collect candles for ATR (use recent candles regardless of day)
-            candles_for_atr.push(candle);
+            // Collect candles for ATR (use recent completed candles regardless of day)
+            if is_complete {
+                candles_for_atr.push(candle);
+            }
         }
 
         // Pre-warm ATR with the last 14+ candles
@@ -1052,6 +1191,182 @@ impl TickerState {
                 None
             },
         }
+    }
+
+    /// Backfill tvVWAP, ATR, and RV from authoritative Binance 1m klines
+    /// This is the preferred method - results will not drift from exchange data
+    pub fn backfill_from_1m_candles(&mut self, candles: Vec<Candle1m>) -> BackfillResult {
+        if candles.is_empty() {
+            return BackfillResult::default();
+        }
+
+        let now = Utc::now();
+        let today = now.date_naive();
+
+        // Reset kline-based tvVWAP for today
+        self.kline_tv_vwap.reset(now);
+
+        // Reset kline-based ATR state
+        self.kline_atr_state = AtrState::default();
+
+        // Clear existing 1m candle buffer
+        self.candles_1m.clear();
+
+        let mut complete_candles: Vec<Candle1m> = Vec::new();
+
+        for candle in candles {
+            // Only process complete candles
+            if !candle.is_complete {
+                continue;
+            }
+
+            let candle_date = candle.start_time.date_naive();
+
+            // Add to tvVWAP if candle is from today
+            if candle_date == today {
+                let hlc3 = (candle.high + candle.low + candle.close) / 3.0;
+                self.kline_tv_vwap.add_trade(hlc3, candle.volume);
+            }
+
+            complete_candles.push(candle);
+        }
+
+        // Sort by time
+        complete_candles.sort_by_key(|c| c.start_time);
+
+        // Update ATR from 1m candles (convert to Candle5m-like for ATR update)
+        for candle in complete_candles.iter() {
+            // Create a temporary Candle5m for ATR calculation
+            let candle_5m = Candle5m {
+                open: candle.open,
+                high: candle.high,
+                low: candle.low,
+                close: candle.close,
+                volume: candle.volume,
+                start_time: candle.start_time,
+            };
+            self.kline_atr_state.update(&candle_5m);
+        }
+
+        // Store recent candles (keep last 300 for RV calculation)
+        let recent_candles: Vec<Candle1m> = complete_candles
+            .into_iter()
+            .rev()
+            .take(300)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        self.candles_1m = VecDeque::from(recent_candles);
+
+        // Mark kline metrics as available
+        self.use_kline_metrics = true;
+
+        BackfillResult {
+            candles_loaded: self.candles_1m.len(),
+            tv_vwap: self.kline_tv_vwap.vwap(),
+            atr_14: if self.kline_atr_state.initialized || self.kline_atr_state.tr_count >= 5 {
+                Some(self.kline_atr_state.value())
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Process a single 1m kline update from WebSocket stream
+    pub fn push_1m_candle(&mut self, candle: Candle1m) {
+        // Only process complete candles for tvVWAP/ATR
+        if !candle.is_complete {
+            return;
+        }
+
+        let now = Utc::now();
+        let today = now.date_naive();
+        let candle_date = candle.start_time.date_naive();
+
+        // Check if tvVWAP needs daily reset (new day at 00:00 UTC)
+        let needs_reset = match self.kline_tv_vwap.last_reset {
+            Some(last) => candle.start_time.date_naive() != last.date_naive(),
+            None => true,
+        };
+        if needs_reset {
+            self.kline_tv_vwap.reset(candle.start_time);
+        }
+
+        // Add to tvVWAP if candle is from today
+        if candle_date == today {
+            let hlc3 = (candle.high + candle.low + candle.close) / 3.0;
+            self.kline_tv_vwap.add_trade(hlc3, candle.volume);
+        }
+
+        // Update ATR
+        let candle_5m = Candle5m {
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close,
+            volume: candle.volume,
+            start_time: candle.start_time,
+        };
+        self.kline_atr_state.update(&candle_5m);
+
+        // Add to buffer (avoid duplicates by checking start_time)
+        if self.candles_1m.back().map(|c| c.start_time) != Some(candle.start_time) {
+            self.candles_1m.push_back(candle);
+            // Keep buffer size manageable
+            while self.candles_1m.len() > 300 {
+                self.candles_1m.pop_front();
+            }
+        }
+
+        // Mark kline metrics as available
+        self.use_kline_metrics = true;
+    }
+
+    /// Calculate RV from 1m klines for a given window (in minutes)
+    fn calculate_rv_from_1m(&self, minutes: usize) -> Option<f64> {
+        if self.candles_1m.len() < minutes {
+            return None;
+        }
+
+        // Get the last N candles
+        let candles: Vec<&Candle1m> = self.candles_1m.iter().rev().take(minutes).collect();
+        if candles.len() < 3 {
+            return None;
+        }
+
+        // Calculate close-to-close returns
+        let mut returns = Vec::with_capacity(candles.len() - 1);
+        for i in 0..candles.len() - 1 {
+            let current = candles[i].close;
+            let prev = candles[i + 1].close;
+            if prev > 0.0 {
+                returns.push((current - prev) / prev);
+            }
+        }
+
+        if returns.is_empty() {
+            return None;
+        }
+
+        // Calculate standard deviation
+        let mean: f64 = returns.iter().sum::<f64>() / returns.len() as f64;
+        let variance: f64 = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+        let std_dev = variance.sqrt();
+
+        // Return as percentage
+        Some(std_dev * 100.0)
+    }
+
+    /// Get RV30 (30-minute realized volatility from 1m candles)
+    pub fn rv_30m_from_klines(&self) -> Option<f64> {
+        self.calculate_rv_from_1m(30)
+    }
+
+    /// Get RV60 (60-minute realized volatility from 1m candles)
+    pub fn rv_1h_from_klines(&self) -> Option<f64> {
+        self.calculate_rv_from_1m(60)
     }
 
     fn push_trade(
@@ -1134,12 +1449,23 @@ impl TickerState {
 
             // Push into per-exchange buffer; cap per exchange so one venue can't drown others
             let cap_per_exchange = (max_whales() / 3).max(50).min(max_whales());
+            let hard_cap = cap_per_exchange * 3; // Safety: 3x soft cap to prevent unbounded growth
+            let retention_secs = 300_i64; // Keep whales for 5 minutes
+
             let deque = self
                 .whales_by_exchange
                 .entry(exchange.to_string())
                 .or_insert_with(VecDeque::new);
             deque.push_front(record.clone());
-            while deque.len() > cap_per_exchange {
+
+            // Time-based retention: remove whales older than 5 minutes
+            let cutoff = Utc::now() - ChronoDuration::seconds(retention_secs);
+            while deque.back().map(|w| w.time < cutoff).unwrap_or(false) {
+                deque.pop_back();
+            }
+
+            // Hard cap safety: prevent unbounded growth even within retention window
+            while deque.len() > hard_cap {
                 deque.pop_back();
             }
 
@@ -1158,6 +1484,11 @@ impl TickerState {
         }
         if is_perp {
             self.perp_mid = Some(trade.price);
+            // Track Binance perp last price specifically for consistent TUI display
+            // Guard: only set if price > 0 to prevent 0.000 display in headers
+            if exchange.to_lowercase().contains("binance") && trade.price > 0.0 {
+                self.binance_perp_last = Some(trade.price);
+            }
         }
 
         // Update CVD history based on trades (perps only), windowed
@@ -1172,7 +1503,14 @@ impl TickerState {
         // Update VWAP and ATR (perps only for consistency)
         if is_perp {
             self.update_vwap(trade.price, normalized_amount, time);
-            self.update_candle(trade.price, normalized_amount, time);
+            // Only update trade-based candles if kline metrics are NOT available (fallback only)
+            // When kline metrics are active, tvVWAP/ATR/RV come from authoritative 1m klines
+            if !self.use_kline_metrics {
+                let is_binance = exchange.to_lowercase().contains("binance");
+                if is_binance {
+                    self.update_candle(trade.price, normalized_amount, time);
+                }
+            }
         }
 
         self.prune(time);
@@ -1293,7 +1631,7 @@ impl TickerState {
         }
     }
 
-    fn push_oi(&mut self, exchange: &str, contracts: f64) {
+    fn push_oi(&mut self, exchange: &str, contracts: f64, exchange_time: DateTime<Utc>) {
         // NORMALIZE: OKX reports raw contracts, not base currency
         // OKX contract sizes: BTC=0.01, ETH=0.1, SOL=1
         // Binance and Bybit report in base currency already
@@ -1311,6 +1649,10 @@ impl TickerState {
 
         // P1: Track OI time-series for velocity calculation
         let now = Utc::now();
+
+        // Track OI timestamp per exchange for freshness calculation
+        // Use current time (when we received it), not exchange time, for accurate freshness
+        self.oi_last_update.insert(exchange.to_string(), now);
         let total: f64 = self.oi_by_exchange.values().copied().sum();
         self.oi_history.push_back(OiRecord { time: now, total });
 
@@ -1414,8 +1756,9 @@ impl TickerState {
         time: DateTime<Utc>,
     ) {
         // Calculate bid imbalance percentage (0-100%, 50% = balanced)
-        // Use top 20 levels for imbalance calculation
-        let imbalance_pct = book.bid_imbalance_pct(20);
+        // Use all available levels for imbalance calculation
+        let levels_available = book.bids.levels.len().min(book.asks.levels.len());
+        let imbalance_pct = book.bid_imbalance_pct(levels_available);
 
         // Check for flip (direction change)
         let is_bid_heavy = imbalance_pct > 50.0;
@@ -1517,7 +1860,8 @@ impl TickerState {
         let vwap_1m = self.vwap(60);
         let vwap_5m = self.vwap(300);
         // Per-exchange fairness: ensure all exchanges represented in whale display
-        let whales: Vec<WhaleRecord> = self.fair_whale_selection(20);
+        // Show more recent whales while keeping cross-exchange fairness
+        let whales: Vec<WhaleRecord> = self.fair_whale_selection(40);
         let (clusters, cascade_risk, next_level, protection_level) = self.liquidation_clusters();
         let liq_rate_per_min = self.liquidation_rate_per_min();
         let liq_bucket = self.liquidation_bucket_size();
@@ -1541,6 +1885,7 @@ impl TickerState {
         let (oi_delta_15m, _) = self.oi_velocity(900);
         let oi_per_exchange = self.oi_by_exchange.clone();
         let (oi_delta_per_exchange_5m, oi_delta_per_exchange_15m) = self.oi_delta_per_exchange();
+        let (oi_freshness_secs, oi_freshness_per_exchange) = self.oi_freshness();
         // P0: Multi-timeframe tick direction (30s, 1m, 5m)
         let tick_direction_30s = self.tick_direction(30);
         let tick_direction = self.tick_direction(60);
@@ -1565,15 +1910,27 @@ impl TickerState {
             _ => None,
         };
 
-        // tvVWAP (TradingView style - HLC3 on 5m candles)
-        let tv_vwap = self.tv_vwap.vwap();
+        // tvVWAP (TradingView style - HLC3 on candles)
+        // Prefer kline-based metrics (authoritative) when available
+        let tv_vwap = if self.use_kline_metrics {
+            self.kline_tv_vwap.vwap()
+        } else {
+            self.tv_vwap.vwap()
+        };
         let tv_vwap_deviation = match (self.latest_price(), tv_vwap) {
             (Some(price), Some(vwap)) if vwap > 0.0 => Some((price - vwap) / vwap * 100.0),
             _ => None,
         };
 
-        // ATR-14 (5m candles, EMA)
-        let atr_14 = if self.atr_state.initialized || self.atr_state.tr_count >= 5 {
+        // ATR-14 (candles, EMA)
+        // Prefer kline-based ATR (1m candles, 14-minute lookback) when available
+        let atr_14 = if self.use_kline_metrics {
+            if self.kline_atr_state.initialized || self.kline_atr_state.tr_count >= 5 {
+                Some(self.kline_atr_state.value())
+            } else {
+                None
+            }
+        } else if self.atr_state.initialized || self.atr_state.tr_count >= 5 {
             Some(self.atr_state.value())
         } else {
             None
@@ -1583,8 +1940,28 @@ impl TickerState {
             _ => None,
         };
 
-        // Realized Volatility (30m and 1h) - standard deviation of 5m returns
-        let (realized_vol_30m, realized_vol_1h, realized_vol_trend) = self.calculate_realized_volatility();
+        // Realized Volatility (30m and 1h)
+        // Prefer kline-based RV (1m candles) when available
+        let (realized_vol_30m, realized_vol_1h, realized_vol_trend) = if self.use_kline_metrics {
+            let rv_30m = self.rv_30m_from_klines();
+            let rv_1h = self.rv_1h_from_klines();
+            let trend = match (rv_30m, rv_1h) {
+                (Some(r30), Some(r60)) if r60 > 0.0 => {
+                    let ratio = r30 / r60;
+                    if ratio > 1.2 {
+                        VolTrend::Expanding
+                    } else if ratio < 0.8 {
+                        VolTrend::Contracting
+                    } else {
+                        VolTrend::Stable
+                    }
+                }
+                _ => VolTrend::Stable,
+            };
+            (rv_30m, rv_1h, trend)
+        } else {
+            self.calculate_realized_volatility()
+        };
 
         TickerSnapshot {
             ticker: self.ticker.clone(),
@@ -1592,6 +1969,9 @@ impl TickerState {
             latest_spread_pct: self.spread_pct,
             spot_mid: self.spot_mid,
             perp_mid: self.perp_mid,
+            binance_perp_last: self.binance_perp_last,
+            fair_value: self.fair_value_30s(),
+            fair_value_deviation_bps: self.fair_value_deviation_bps(),
             basis,
             orderflow_5s,
             orderflow_15s,
@@ -1629,7 +2009,9 @@ impl TickerState {
             oi_per_exchange,
             oi_delta_per_exchange_5m,
             oi_delta_per_exchange_15m,
-            exchange_health: HashMap::new(), // TODO: populate from aggregator
+            oi_freshness_secs,
+            oi_freshness_per_exchange,
+            exchange_health: HashMap::new(),
             tick_direction,
             tick_direction_5m,
             tick_direction_30s,
@@ -1651,7 +2033,12 @@ impl TickerState {
             vwap_daily_deviation,
             tv_vwap,
             tv_vwap_deviation,
-            candles_5m_len: self.candles_5m.len(),
+            // For UI gating: when using klines, report 1m buffer length; otherwise 5m buffer
+            candles_5m_len: if self.use_kline_metrics {
+                self.candles_1m.len()
+            } else {
+                self.candles_5m.len()
+            },
             atr_14,
             atr_14_pct,
             realized_vol_30m,
@@ -1765,6 +2152,49 @@ impl TickerState {
             Some(*p)
         } else {
             self.perp_mid.or(self.spot_mid)
+        }
+    }
+
+    /// Calculate fair value as 30s volume-weighted mid across all perp exchanges
+    fn fair_value_30s(&self) -> Option<f64> {
+        // Use last trade's exchange time as reference to avoid clock skew
+        let now = self
+            .trades
+            .back()
+            .map(|t| t.time)
+            .unwrap_or_else(Utc::now);
+        let cutoff = now - ChronoDuration::seconds(30);
+
+        let mut sum_pv = 0.0;  // sum of price * volume
+        let mut sum_v = 0.0;   // sum of volume
+
+        for t in self.trades.iter().rev() {
+            if t.time < cutoff {
+                break;
+            }
+            if t.is_perp {
+                sum_pv += t.price * t.usd;
+                sum_v += t.usd;
+            }
+        }
+
+        if sum_v > 0.0 {
+            Some(sum_pv / sum_v)
+        } else {
+            None
+        }
+    }
+
+    /// Calculate FV deviation in basis points: (binance_last - FV) / FV * 10000
+    /// Returns None if either price is missing or <= 0 to prevent garbage FV display
+    fn fair_value_deviation_bps(&self) -> Option<f64> {
+        let bnc_price = self.binance_perp_last?;
+        let fv = self.fair_value_30s()?;
+        // Guard: both prices must be positive to compute meaningful FV deviation
+        if bnc_price > 0.0 && fv > 0.0 {
+            Some((bnc_price - fv) / fv * 10000.0)
+        } else {
+            None
         }
     }
 
@@ -2133,7 +2563,13 @@ impl TickerState {
 
     /// Rolling CVD total over a window (seconds)
     fn cvd_total(&self, window_secs: i64) -> f64 {
-        let now = Utc::now();
+        // Use freshest trade time if recent to avoid clock skew; otherwise fall back to Utc::now()
+        let now = self
+            .trades
+            .back()
+            .map(|t| t.time)
+            .filter(|&t| (Utc::now() - t).num_seconds() < 5)
+            .unwrap_or_else(Utc::now);
         let cutoff = now - ChronoDuration::seconds(window_secs);
         self.trades
             .iter()
@@ -2169,7 +2605,14 @@ impl TickerState {
 
     /// Per-exchange short-window stats (CVD/volume/trades) for scalper
     fn per_exchange_short_stats(&self, window_secs: i64) -> HashMap<String, PerExchangeShortStats> {
-        let now = Utc::now();
+        // Use the freshest trade time when recent, otherwise fall back to Utc::now().
+        // This avoids clock skew without breaking when the trade queue is stale/empty.
+        let now = self
+            .trades
+            .back()
+            .map(|t| t.time)
+            .filter(|&t| (Utc::now() - t).num_seconds() < 5)
+            .unwrap_or_else(Utc::now);
         let cutoff = now - ChronoDuration::seconds(window_secs);
         let mut acc: HashMap<String, (f64, f64, usize)> = HashMap::new(); // exchange -> (buy_usd, sell_usd, trades)
 
@@ -2339,31 +2782,67 @@ impl TickerState {
         }
     }
 
-    /// Per-exchange OI delta calculation
-    /// Returns (5m deltas per exchange, 15m deltas per exchange)
-    /// Note: Currently returns current OI values as we don't track per-exchange history yet
+    /// Per-exchange OI deltas over 5m and 15m windows.
+    /// Units: normalized base currency (BTC/ETH/SOL). UIs convert to USD by multiplying by price.
     fn oi_delta_per_exchange(&self) -> (HashMap<String, f64>, HashMap<String, f64>) {
-        // Calculate total OI for percentage calculation
-        let total_oi: f64 = self.oi_by_exchange.values().copied().sum();
+        let now = Utc::now();
+        let cutoff_5m = now - ChronoDuration::seconds(300);
+        let cutoff_15m = now - ChronoDuration::seconds(900);
 
-        // For now, we use the current OI values
-        // TODO: Track per-exchange OI history for true delta calculation
         let mut delta_5m: HashMap<String, f64> = HashMap::new();
         let mut delta_15m: HashMap<String, f64> = HashMap::new();
 
-        // Get the overall delta and distribute proportionally
-        let (total_delta_5m, _) = self.oi_velocity(300);
-        let (total_delta_15m, _) = self.oi_velocity(900);
-
-        for (exchange, &oi) in &self.oi_by_exchange {
-            let share = if total_oi > 0.0 { oi / total_oi } else { 0.0 };
-            // Abbreviate exchange name
+        for (exchange, history) in &self.oi_history_by_exchange {
             let abbrev = abbreviate_exchange(exchange);
-            delta_5m.insert(abbrev.to_string(), total_delta_5m * share);
-            delta_15m.insert(abbrev.to_string(), total_delta_15m * share);
+
+            // Need at least 2 records for meaningful delta
+            if history.len() < 2 {
+                delta_5m.insert(abbrev.to_string(), 0.0);
+                delta_15m.insert(abbrev.to_string(), 0.0);
+                continue;
+            }
+
+            let latest = history.back().map(|r| r.total).unwrap_or(0.0);
+
+            // Find oldest record within each window
+            let oldest_5m = history
+                .iter()
+                .find(|r| r.time >= cutoff_5m)
+                .map(|r| r.total)
+                .unwrap_or(latest);
+
+            let oldest_15m = history
+                .iter()
+                .find(|r| r.time >= cutoff_15m)
+                .map(|r| r.total)
+                .unwrap_or(latest);
+
+            delta_5m.insert(abbrev.to_string(), latest - oldest_5m);
+            delta_15m.insert(abbrev.to_string(), latest - oldest_15m);
         }
 
         (delta_5m, delta_15m)
+    }
+
+    /// Calculate OI freshness (seconds since last update) per exchange
+    /// Returns (min_freshness, per_exchange_freshness)
+    /// min_freshness = most recent OI update across all exchanges (for header display)
+    fn oi_freshness(&self) -> (f64, HashMap<String, f64>) {
+        let now = Utc::now();
+        let mut per_exchange: HashMap<String, f64> = HashMap::new();
+        let mut min_freshness: f64 = 999.0; // Start high, find minimum
+
+        for (exchange, last_update) in &self.oi_last_update {
+            let age_secs = (now - *last_update).num_milliseconds() as f64 / 1000.0;
+            let abbrev = abbreviate_exchange(exchange);
+            per_exchange.insert(abbrev.to_string(), age_secs);
+            if age_secs < min_freshness {
+                min_freshness = age_secs; // Track most recent (smallest age)
+            }
+        }
+
+        // If no OI data yet, min_freshness stays at 999.0 to indicate stale
+        (min_freshness, per_exchange)
     }
 
     /// P1: Flow signal detection based on price/CVD relationship
