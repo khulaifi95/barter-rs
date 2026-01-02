@@ -758,11 +758,14 @@ struct BybitFundingRateResponse {
     #[serde(rename = "retCode")]
     ret_code: i64,
     result: BybitFundingRateResult,
-    time: String,
+    time: i64,
 }
 
 #[derive(Debug, Deserialize)]
 struct BybitFundingRateResult {
+    #[serde(default)]
+    #[allow(dead_code)]
+    category: String,
     list: Vec<BybitFundingRateEntry>,
 }
 
@@ -911,24 +914,30 @@ fn binance_funding_rate_poller(
                         } else {
                             match response.json::<BinanceFundingRateResponse>().await {
                                 Ok(data) => {
-                                    let rate = parse_f64(&data.last_funding_rate)?;
-                                    let time_exchange =
-                                        DateTime::from_timestamp_millis(data.time)
-                                            .unwrap_or_else(Utc::now);
-                                    let next_time =
-                                        DateTime::from_timestamp_millis(data.next_funding_time);
-
-                                    Ok(MarketEvent {
-                                        time_exchange,
-                                        time_received: Utc::now(),
-                                        exchange: ExchangeId::BinanceFuturesUsd,
-                                        instrument: instrument_clone,
-                                        kind: DataKind::FundingRate(FundingRate {
-                                            rate,
-                                            time: Some(time_exchange),
-                                            next_time,
-                                        }),
-                                    })
+                                    match parse_f64(&data.last_funding_rate) {
+                                        Ok(rate) => {
+                                            let time_exchange =
+                                                DateTime::from_timestamp_millis(data.time)
+                                                    .unwrap_or_else(Utc::now);
+                                            let next_time =
+                                                DateTime::from_timestamp_millis(data.next_funding_time);
+                                            debug!("Binance funding {symbol}: rate={rate}");
+                                            Ok(MarketEvent {
+                                                time_exchange,
+                                                time_received: Utc::now(),
+                                                exchange: ExchangeId::BinanceFuturesUsd,
+                                                instrument: instrument_clone,
+                                                kind: DataKind::FundingRate(FundingRate {
+                                                    rate,
+                                                    time: Some(time_exchange),
+                                                    next_time,
+                                                }),
+                                            })
+                                        }
+                                        Err(e) => Err(DataError::Socket(format!(
+                                            "Binance funding rate parse error ({symbol}): {e:?}"
+                                        ))),
+                                    }
                                 }
                                 Err(parse_err) => Err(DataError::Socket(format!(
                                     "Binance funding parse failed ({symbol}): {parse_err}"
@@ -988,27 +997,30 @@ fn bybit_funding_rate_poller(
                                         .find(|item| item.symbol == symbol)
                                         .or_else(|| data.result.list.first());
                                     if let Some(entry) = entry {
-                                        let rate = parse_f64(&entry.funding_rate)?;
-                                        let next_time_ms = parse_i64(&entry.next_funding_time)?;
-                                        let time_exchange =
-                                            DateTime::from_timestamp_millis(
-                                                parse_i64(&data.time)?,
-                                            )
-                                            .unwrap_or_else(Utc::now);
-                                        let next_time =
-                                            DateTime::from_timestamp_millis(next_time_ms);
-
-                                        Ok(MarketEvent {
-                                            time_exchange,
-                                            time_received: Utc::now(),
-                                            exchange: ExchangeId::BybitPerpetualsUsd,
-                                            instrument: instrument_clone,
-                                            kind: DataKind::FundingRate(FundingRate {
-                                                rate,
-                                                time: Some(time_exchange),
-                                                next_time,
-                                            }),
-                                        })
+                                        match (parse_f64(&entry.funding_rate), parse_i64(&entry.next_funding_time)) {
+                                            (Ok(rate), Ok(next_time_ms)) => {
+                                                let time_exchange =
+                                                    DateTime::from_timestamp_millis(data.time)
+                                                        .unwrap_or_else(Utc::now);
+                                                let next_time =
+                                                    DateTime::from_timestamp_millis(next_time_ms);
+                                                debug!("Bybit funding {symbol}: rate={rate}");
+                                                Ok(MarketEvent {
+                                                    time_exchange,
+                                                    time_received: Utc::now(),
+                                                    exchange: ExchangeId::BybitPerpetualsUsd,
+                                                    instrument: instrument_clone,
+                                                    kind: DataKind::FundingRate(FundingRate {
+                                                        rate,
+                                                        time: Some(time_exchange),
+                                                        next_time,
+                                                    }),
+                                                })
+                                            }
+                                            _ => Err(DataError::Socket(format!(
+                                                "Bybit funding parse error ({symbol})"
+                                            ))),
+                                        }
                                     } else {
                                         Err(DataError::Socket(format!(
                                             "Bybit funding missing data ({symbol})"
@@ -1058,26 +1070,30 @@ fn okx_funding_rate_poller(
                             match response.json::<OkxFundingRateResponse>().await {
                                 Ok(data) => {
                                     if let Some(entry) = data.data.first() {
-                                        let rate = parse_f64(&entry.funding_rate)?;
-                                        let funding_time_ms = parse_i64(&entry.funding_time)?;
-                                        let next_time_ms = parse_i64(&entry.next_funding_time)?;
-                                        let time_exchange =
-                                            DateTime::from_timestamp_millis(funding_time_ms)
-                                                .unwrap_or_else(Utc::now);
-                                        let next_time =
-                                            DateTime::from_timestamp_millis(next_time_ms);
-
-                                        Ok(MarketEvent {
-                                            time_exchange,
-                                            time_received: Utc::now(),
-                                            exchange: ExchangeId::Okx,
-                                            instrument: instrument_clone,
-                                            kind: DataKind::FundingRate(FundingRate {
-                                                rate,
-                                                time: Some(time_exchange),
-                                                next_time,
-                                            }),
-                                        })
+                                        match (parse_f64(&entry.funding_rate), parse_i64(&entry.funding_time), parse_i64(&entry.next_funding_time)) {
+                                            (Ok(rate), Ok(funding_time_ms), Ok(next_time_ms)) => {
+                                                let time_exchange =
+                                                    DateTime::from_timestamp_millis(funding_time_ms)
+                                                        .unwrap_or_else(Utc::now);
+                                                let next_time =
+                                                    DateTime::from_timestamp_millis(next_time_ms);
+                                                debug!("OKX funding {symbol}: rate={rate}");
+                                                Ok(MarketEvent {
+                                                    time_exchange,
+                                                    time_received: Utc::now(),
+                                                    exchange: ExchangeId::Okx,
+                                                    instrument: instrument_clone,
+                                                    kind: DataKind::FundingRate(FundingRate {
+                                                        rate,
+                                                        time: Some(time_exchange),
+                                                        next_time,
+                                                    }),
+                                                })
+                                            }
+                                            _ => Err(DataError::Socket(format!(
+                                                "OKX funding parse error ({symbol})"
+                                            ))),
+                                        }
                                     } else {
                                         Err(DataError::Socket(format!(
                                             "OKX funding missing data ({symbol})"
