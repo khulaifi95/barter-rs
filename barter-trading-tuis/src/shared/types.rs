@@ -97,6 +97,19 @@ pub struct OpenInterestData {
     pub time: Option<DateTime<Utc>>,
 }
 
+/// Funding rate event data
+///
+/// Represents the current funding rate for a perpetual contract
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FundingRateData {
+    /// Funding rate as a decimal (eg 0.0001 = 0.01%)
+    pub rate: f64,
+    /// Exchange-provided timestamp (optional)
+    pub time: Option<DateTime<Utc>>,
+    /// Next funding time (optional)
+    pub next_time: Option<DateTime<Utc>>,
+}
+
 /// Cumulative Volume Delta (CVD) event data
 ///
 /// Represents the net buying/selling pressure

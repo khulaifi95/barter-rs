@@ -2,6 +2,7 @@ use barter_data::{
     error::DataError,
     event::{DataKind, MarketEvent},
     streams::{builder::dynamic::DynamicStreams, consumer::MarketStreamResult, reconnect::Event},
+    subscription::funding::FundingRate,
     subscription::open_interest::OpenInterest,
 };
 use barter_instrument::{
@@ -77,6 +78,10 @@ impl From<MarketEvent<MarketDataInstrument, DataKind>> for MarketEventMessage {
             DataKind::OpenInterest(oi) => (
                 "open_interest",
                 serde_json::to_value(oi).unwrap_or_default(),
+            ),
+            DataKind::FundingRate(fr) => (
+                "funding_rate",
+                serde_json::to_value(fr).unwrap_or_default(),
             ),
             DataKind::CumulativeVolumeDelta(cvd) => (
                 "cumulative_volume_delta",
@@ -161,10 +166,13 @@ async fn main() {
     let streams = init_market_streams().await;
 
     // Combine WebSocket and REST API streams
-    let combined_stream = stream::select(
-        streams.select_all::<MarketStreamResult<MarketDataInstrument, DataKind>>(),
-        binance_open_interest_stream(),
-    );
+    let combined_stream = stream::select_all(vec![
+        streams
+            .select_all::<MarketStreamResult<MarketDataInstrument, DataKind>>()
+            .boxed(),
+        binance_open_interest_stream().boxed(),
+        funding_rate_stream().boxed(),
+    ]);
 
     futures::pin_mut!(combined_stream);
 
@@ -735,6 +743,74 @@ struct BinanceOpenInterestResponse {
     time: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct BinanceFundingRateResponse {
+    #[serde(rename = "lastFundingRate")]
+    last_funding_rate: String,
+    #[serde(rename = "nextFundingTime")]
+    next_funding_time: i64,
+    #[serde(rename = "time")]
+    time: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitFundingRateResponse {
+    #[serde(rename = "retCode")]
+    ret_code: i64,
+    result: BybitFundingRateResult,
+    time: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitFundingRateResult {
+    list: Vec<BybitFundingRateEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitFundingRateEntry {
+    #[serde(rename = "fundingRate")]
+    funding_rate: String,
+    #[serde(rename = "nextFundingTime")]
+    next_funding_time: String,
+    symbol: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxFundingRateResponse {
+    data: Vec<OkxFundingRateEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxFundingRateEntry {
+    #[serde(rename = "fundingRate")]
+    funding_rate: String,
+    #[serde(rename = "fundingTime")]
+    funding_time: String,
+    #[serde(rename = "nextFundingTime")]
+    next_funding_time: String,
+}
+
+fn funding_poll_interval() -> Duration {
+    Duration::from_secs(
+        std::env::var("FUNDING_POLL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+    )
+}
+
+fn parse_f64(value: &str) -> Result<f64, DataError> {
+    value
+        .parse::<f64>()
+        .map_err(|err| DataError::Socket(format!("Funding rate parse failed: {err}")))
+}
+
+fn parse_i64(value: &str) -> Result<i64, DataError> {
+    value
+        .parse::<i64>()
+        .map_err(|err| DataError::Socket(format!("Funding time parse failed: {err}")))
+}
+
 /// Build a combined Stream of Binance open-interest polling events (REST fallback)
 fn binance_open_interest_stream()
 -> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> {
@@ -762,6 +838,265 @@ fn binance_open_interest_stream()
             .into_iter()
             .map(|(symbol, instrument)| binance_open_interest_poller(symbol, instrument).boxed())
             .collect::<Vec<_>>(),
+    )
+}
+
+/// Build a combined Stream of funding-rate polling events (REST)
+fn funding_rate_stream()
+-> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> {
+    let specs = vec![
+        (
+            "BTCUSDT",
+            MarketDataInstrument::from(("btc", "usdt", MarketDataInstrumentKind::Perpetual)),
+        ),
+        (
+            "ETHUSDT",
+            MarketDataInstrument::from(("eth", "usdt", MarketDataInstrumentKind::Perpetual)),
+        ),
+        (
+            "SOLUSDT",
+            MarketDataInstrument::from(("sol", "usdt", MarketDataInstrumentKind::Perpetual)),
+        ),
+    ];
+
+    let mut streams: Vec<
+        futures::stream::BoxStream<
+            'static,
+            MarketStreamResult<MarketDataInstrument, DataKind>,
+        >,
+    > = Vec::new();
+
+    for (symbol, instrument) in &specs {
+        streams.push(binance_funding_rate_poller(symbol, instrument.clone()).boxed());
+        streams.push(bybit_funding_rate_poller(symbol, instrument.clone()).boxed());
+    }
+
+    let okx_specs = vec![
+        ("BTC-USDT-SWAP", "btc"),
+        ("ETH-USDT-SWAP", "eth"),
+        ("SOL-USDT-SWAP", "sol"),
+    ];
+    for (symbol, base) in okx_specs {
+        let instrument =
+            MarketDataInstrument::from((base, "usdt", MarketDataInstrumentKind::Perpetual));
+        streams.push(okx_funding_rate_poller(symbol, instrument).boxed());
+    }
+
+    stream::select_all(streams)
+}
+
+fn binance_funding_rate_poller(
+    symbol: &'static str,
+    instrument: MarketDataInstrument,
+) -> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> + Send {
+    let client = Client::new();
+    let url = format!(
+        "https://fapi.binance.com/fapi/v1/premiumIndex?symbol={}",
+        symbol
+    );
+
+    stream::unfold(
+        (client, url, interval(funding_poll_interval()), instrument),
+        move |(client, url, mut timer, instrument)| async move {
+            timer.tick().await;
+
+            let instrument_clone = instrument.clone();
+            let result: Result<MarketEvent<MarketDataInstrument, DataKind>, DataError> =
+                match client.get(&url).send().await {
+                    Ok(response) => {
+                        if let Err(status_err) = response.error_for_status_ref() {
+                            Err(DataError::Socket(format!(
+                                "Binance funding poll failed ({symbol}): {status_err}"
+                            )))
+                        } else {
+                            match response.json::<BinanceFundingRateResponse>().await {
+                                Ok(data) => {
+                                    let rate = parse_f64(&data.last_funding_rate)?;
+                                    let time_exchange =
+                                        DateTime::from_timestamp_millis(data.time)
+                                            .unwrap_or_else(Utc::now);
+                                    let next_time =
+                                        DateTime::from_timestamp_millis(data.next_funding_time);
+
+                                    Ok(MarketEvent {
+                                        time_exchange,
+                                        time_received: Utc::now(),
+                                        exchange: ExchangeId::BinanceFuturesUsd,
+                                        instrument: instrument_clone,
+                                        kind: DataKind::FundingRate(FundingRate {
+                                            rate,
+                                            time: Some(time_exchange),
+                                            next_time,
+                                        }),
+                                    })
+                                }
+                                Err(parse_err) => Err(DataError::Socket(format!(
+                                    "Binance funding parse failed ({symbol}): {parse_err}"
+                                ))),
+                            }
+                        }
+                    }
+                    Err(request_err) => Err(DataError::Socket(format!(
+                        "Binance funding request failed ({symbol}): {request_err}"
+                    ))),
+                };
+
+            Some((Event::Item(result), (client, url, timer, instrument)))
+        },
+    )
+}
+
+fn bybit_funding_rate_poller(
+    symbol: &'static str,
+    instrument: MarketDataInstrument,
+) -> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> + Send {
+    let client = Client::new();
+    let url = format!(
+        "https://api.bybit.com/v5/market/tickers?category=linear&symbol={}",
+        symbol
+    );
+
+    stream::unfold(
+        (client, url, interval(funding_poll_interval()), instrument),
+        move |(client, url, mut timer, instrument)| async move {
+            timer.tick().await;
+
+            let instrument_clone = instrument.clone();
+            let result: Result<MarketEvent<MarketDataInstrument, DataKind>, DataError> =
+                match client.get(&url).send().await {
+                    Ok(response) => {
+                        if let Err(status_err) = response.error_for_status_ref() {
+                            Err(DataError::Socket(format!(
+                                "Bybit funding poll failed ({symbol}): {status_err}"
+                            )))
+                        } else {
+                            match response.json::<BybitFundingRateResponse>().await {
+                                Ok(data) => {
+                                    if data.ret_code != 0 {
+                                        return Some((
+                                            Event::Item(Err(DataError::Socket(format!(
+                                                "Bybit funding error ({symbol}): retCode {}",
+                                                data.ret_code
+                                            )))),
+                                            (client, url, timer, instrument),
+                                        ));
+                                    }
+                                    let entry = data
+                                        .result
+                                        .list
+                                        .iter()
+                                        .find(|item| item.symbol == symbol)
+                                        .or_else(|| data.result.list.first());
+                                    if let Some(entry) = entry {
+                                        let rate = parse_f64(&entry.funding_rate)?;
+                                        let next_time_ms = parse_i64(&entry.next_funding_time)?;
+                                        let time_exchange =
+                                            DateTime::from_timestamp_millis(
+                                                parse_i64(&data.time)?,
+                                            )
+                                            .unwrap_or_else(Utc::now);
+                                        let next_time =
+                                            DateTime::from_timestamp_millis(next_time_ms);
+
+                                        Ok(MarketEvent {
+                                            time_exchange,
+                                            time_received: Utc::now(),
+                                            exchange: ExchangeId::BybitPerpetualsUsd,
+                                            instrument: instrument_clone,
+                                            kind: DataKind::FundingRate(FundingRate {
+                                                rate,
+                                                time: Some(time_exchange),
+                                                next_time,
+                                            }),
+                                        })
+                                    } else {
+                                        Err(DataError::Socket(format!(
+                                            "Bybit funding missing data ({symbol})"
+                                        )))
+                                    }
+                                }
+                                Err(parse_err) => Err(DataError::Socket(format!(
+                                    "Bybit funding parse failed ({symbol}): {parse_err}"
+                                ))),
+                            }
+                        }
+                    }
+                    Err(request_err) => Err(DataError::Socket(format!(
+                        "Bybit funding request failed ({symbol}): {request_err}"
+                    ))),
+                };
+
+            Some((Event::Item(result), (client, url, timer, instrument)))
+        },
+    )
+}
+
+fn okx_funding_rate_poller(
+    symbol: &'static str,
+    instrument: MarketDataInstrument,
+) -> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> + Send {
+    let client = Client::new();
+    let url = format!(
+        "https://www.okx.com/api/v5/public/funding-rate?instId={}",
+        symbol
+    );
+
+    stream::unfold(
+        (client, url, interval(funding_poll_interval()), instrument),
+        move |(client, url, mut timer, instrument)| async move {
+            timer.tick().await;
+
+            let instrument_clone = instrument.clone();
+            let result: Result<MarketEvent<MarketDataInstrument, DataKind>, DataError> =
+                match client.get(&url).send().await {
+                    Ok(response) => {
+                        if let Err(status_err) = response.error_for_status_ref() {
+                            Err(DataError::Socket(format!(
+                                "OKX funding poll failed ({symbol}): {status_err}"
+                            )))
+                        } else {
+                            match response.json::<OkxFundingRateResponse>().await {
+                                Ok(data) => {
+                                    if let Some(entry) = data.data.first() {
+                                        let rate = parse_f64(&entry.funding_rate)?;
+                                        let funding_time_ms = parse_i64(&entry.funding_time)?;
+                                        let next_time_ms = parse_i64(&entry.next_funding_time)?;
+                                        let time_exchange =
+                                            DateTime::from_timestamp_millis(funding_time_ms)
+                                                .unwrap_or_else(Utc::now);
+                                        let next_time =
+                                            DateTime::from_timestamp_millis(next_time_ms);
+
+                                        Ok(MarketEvent {
+                                            time_exchange,
+                                            time_received: Utc::now(),
+                                            exchange: ExchangeId::Okx,
+                                            instrument: instrument_clone,
+                                            kind: DataKind::FundingRate(FundingRate {
+                                                rate,
+                                                time: Some(time_exchange),
+                                                next_time,
+                                            }),
+                                        })
+                                    } else {
+                                        Err(DataError::Socket(format!(
+                                            "OKX funding missing data ({symbol})"
+                                        )))
+                                    }
+                                }
+                                Err(parse_err) => Err(DataError::Socket(format!(
+                                    "OKX funding parse failed ({symbol}): {parse_err}"
+                                ))),
+                            }
+                        }
+                    }
+                    Err(request_err) => Err(DataError::Socket(format!(
+                        "OKX funding request failed ({symbol}): {request_err}"
+                    ))),
+                };
+
+            Some((Event::Item(result), (client, url, timer, instrument)))
+        },
     )
 }
 

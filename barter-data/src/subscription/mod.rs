@@ -26,6 +26,9 @@ pub mod cvd;
 /// Liquidation [`SubscriptionKind`] and the associated Barter output data model.
 pub mod liquidation;
 
+/// Funding rate [`SubscriptionKind`] and the associated Barter output data model.
+pub mod funding;
+
 /// Open interest [`SubscriptionKind`] and the associated Barter output data model.
 pub mod open_interest;
 

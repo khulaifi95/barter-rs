@@ -4,8 +4,8 @@
 //! so each TUI can render consistent metrics without duplicating calculations.
 
 use crate::shared::types::{
-    CvdData, LiquidationData, MarketEventMessage, OpenInterestData, OrderBookL1Data, Side,
-    TradeData,
+    CvdData, FundingRateData, LiquidationData, MarketEventMessage, OpenInterestData,
+    OrderBookL1Data, Side, TradeData,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Datelike, Timelike, Utc};
 use rust_decimal::prelude::ToPrimitive;
@@ -518,6 +518,7 @@ pub struct TickerSnapshot {
     pub oi_per_exchange: HashMap<String, f64>,
     pub oi_delta_per_exchange_5m: HashMap<String, f64>,
     pub oi_delta_per_exchange_15m: HashMap<String, f64>,
+    pub funding_rate_by_exchange: HashMap<String, f64>,
     /// OI freshness: seconds since last OI update (max across all exchanges)
     pub oi_freshness_secs: f64,
     /// OI freshness per exchange: seconds since last OI update
@@ -860,6 +861,11 @@ impl Aggregator {
                     state.push_oi(&event.exchange, oi.contracts, oi_time);
                 }
             }
+            "funding_rate" => {
+                if let Ok(funding) = serde_json::from_value::<FundingRateData>(event.data) {
+                    state.push_funding_rate(&event.exchange, funding.rate);
+                }
+            }
             "order_book_l1" => {
                 if let Ok(ob) = serde_json::from_value::<OrderBookL1Data>(event.data) {
                     state.push_orderbook(ob, is_spot, is_perp, event.time_exchange);
@@ -1038,6 +1044,8 @@ struct TickerState {
     oi_history_by_exchange: HashMap<String, VecDeque<OiRecord>>,
     // OI last update timestamp per exchange (for freshness tracking)
     oi_last_update: HashMap<String, DateTime<Utc>>,
+    // Funding rates per exchange (last known)
+    funding_rate_by_exchange: HashMap<String, f64>,
     // P1: Basis history for momentum tracking
     basis_history: VecDeque<BasisRecord>,
     spot_mid: Option<f64>,
@@ -1091,6 +1099,7 @@ impl TickerState {
             oi_history: VecDeque::new(),
             oi_history_by_exchange: HashMap::new(),
             oi_last_update: HashMap::new(),
+            funding_rate_by_exchange: HashMap::new(),
             basis_history: VecDeque::new(),
             spot_mid: None,
             perp_mid: None,
@@ -1686,6 +1695,12 @@ impl TickerState {
         }
     }
 
+    fn push_funding_rate(&mut self, exchange: &str, rate: f64) {
+        let exchange_short = abbreviate_exchange(exchange);
+        self.funding_rate_by_exchange
+            .insert(exchange_short.to_string(), rate);
+    }
+
     fn push_orderbook(
         &mut self,
         ob: OrderBookL1Data,
@@ -2009,6 +2024,7 @@ impl TickerState {
             oi_per_exchange,
             oi_delta_per_exchange_5m,
             oi_delta_per_exchange_15m,
+            funding_rate_by_exchange: self.funding_rate_by_exchange.clone(),
             oi_freshness_secs,
             oi_freshness_per_exchange,
             exchange_health: HashMap::new(),

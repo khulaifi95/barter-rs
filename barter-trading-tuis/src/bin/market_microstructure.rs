@@ -820,6 +820,22 @@ fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggr
                 ),
             ]));
 
+            // Funding rates per exchange (perps)
+            let bnc_funding = t.funding_rate_by_exchange.get("BNC").copied();
+            let okx_funding = t.funding_rate_by_exchange.get("OKX").copied();
+            let bbt_funding = t.funding_rate_by_exchange.get("BBT").copied();
+
+            let (bnc_str, bnc_color) = format_funding_rate(bnc_funding);
+            let (okx_str, okx_color) = format_funding_rate(okx_funding);
+            let (bbt_str, bbt_color) = format_funding_rate(bbt_funding);
+
+            lines.push(Line::from(vec![
+                Span::styled(" Fund: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("BNC{} ", bnc_str), Style::default().fg(bnc_color)),
+                Span::styled(format!("OKX{} ", okx_str), Style::default().fg(okx_color)),
+                Span::styled(format!("BBT{}", bbt_str), Style::default().fg(bbt_color)),
+            ]));
+
             // VWAP line: daily | session [SESSION]
             let vwap_daily_str = t.vwap_daily
                 .map(|v| format!("${:.2}", v))
@@ -956,6 +972,23 @@ fn format_delta_short(value: f64) -> String {
         format!("{:+.0}", value)
     } else {
         "0".to_string()
+    }
+}
+
+fn format_funding_rate(rate: Option<f64>) -> (String, Color) {
+    match rate {
+        Some(r) => {
+            let pct = r * 100.0;
+            let color = if r > 0.0 {
+                Color::Red
+            } else if r < 0.0 {
+                Color::Green
+            } else {
+                Color::Gray
+            };
+            (format!("{:+.3}%", pct), color)
+        }
+        None => ("---".to_string(), Color::DarkGray),
     }
 }
 
