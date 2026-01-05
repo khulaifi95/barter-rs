@@ -821,7 +821,7 @@ impl Aggregator {
 
         match event.kind.as_str() {
             "trade" => {
-                if let Ok(trade) = serde_json::from_value::<TradeData>(event.data) {
+                if let Ok(trade) = serde_json::from_value::<TradeData>(event.data.clone()) {
                     // Debug: log Binance trades to verify is_perp classification
                     if event.exchange.contains("Binance") {
                         use std::io::Write;
@@ -1875,8 +1875,9 @@ impl TickerState {
         let vwap_1m = self.vwap(60);
         let vwap_5m = self.vwap(300);
         // Per-exchange fairness: ensure all exchanges represented in whale display
-        // Show more recent whales while keeping cross-exchange fairness
-        let whales: Vec<WhaleRecord> = self.fair_whale_selection(40);
+        // Show more recent whales while keeping cross-exchange fairness.
+        // Bump to 80 so the tape captures more of the last 5m without losing venue balance.
+        let whales: Vec<WhaleRecord> = self.fair_whale_selection(80);
         let (clusters, cascade_risk, next_level, protection_level) = self.liquidation_clusters();
         let liq_rate_per_min = self.liquidation_rate_per_min();
         let liq_bucket = self.liquidation_bucket_size();
@@ -2185,8 +2186,10 @@ impl TickerState {
         let mut sum_v = 0.0;   // sum of volume
 
         for t in self.trades.iter().rev() {
+            // Do not break early here: exchange timestamps can arrive slightly out of order,
+            // and a single old trade could hide newer ones behind it.
             if t.time < cutoff {
-                break;
+                continue;
             }
             if t.is_perp {
                 sum_pv += t.price * t.usd;
@@ -2565,12 +2568,9 @@ impl TickerState {
         // This avoids clock-skew issues vs Utc::now() and ensures the whale tape
         // scrolls even when no new whales are detected (trades continue updating).
         let now_local = Utc::now();
-        let now_ref = self
-            .trades
-            .back()
-            .map(|t| t.time)
-            .filter(|&t| (now_local - t).num_seconds() < 5)
-            .unwrap_or(now_local);
+        let latest_trade_time = self.trades.back().map(|t| t.time).unwrap_or(now_local);
+        // Clamp to local time to avoid future exchange timestamps shrinking the window.
+        let now_ref = latest_trade_time.min(now_local);
         let cutoff = now_ref - ChronoDuration::seconds(300);
 
         let mut active_exchange_count = 0usize;
@@ -2605,13 +2605,15 @@ impl TickerState {
 
     /// Rolling CVD total over a window (seconds)
     fn cvd_total(&self, window_secs: i64) -> f64 {
-        // Use freshest trade time if recent to avoid clock skew; otherwise fall back to Utc::now()
-        let now = self
-            .trades
-            .back()
-            .map(|t| t.time)
-            .filter(|&t| (Utc::now() - t).num_seconds() < 5)
-            .unwrap_or_else(Utc::now);
+        // Use freshest trade time if recent; clamp to local time to avoid future skew.
+        let now_local = Utc::now();
+        let latest_trade = self.trades.back().map(|t| t.time).unwrap_or(now_local);
+        let candidate = if (now_local - latest_trade).num_seconds() < 5 {
+            latest_trade
+        } else {
+            now_local
+        };
+        let now = candidate.min(now_local);
         let cutoff = now - ChronoDuration::seconds(window_secs);
         self.trades
             .iter()
@@ -2647,14 +2649,15 @@ impl TickerState {
 
     /// Per-exchange short-window stats (CVD/volume/trades) for scalper
     fn per_exchange_short_stats(&self, window_secs: i64) -> HashMap<String, PerExchangeShortStats> {
-        // Use the freshest trade time when recent, otherwise fall back to Utc::now().
-        // This avoids clock skew without breaking when the trade queue is stale/empty.
-        let now = self
-            .trades
-            .back()
-            .map(|t| t.time)
-            .filter(|&t| (Utc::now() - t).num_seconds() < 5)
-            .unwrap_or_else(Utc::now);
+        // Use freshest trade time when recent; clamp to local time to avoid future skew.
+        let now_local = Utc::now();
+        let latest_trade = self.trades.back().map(|t| t.time).unwrap_or(now_local);
+        let candidate = if (now_local - latest_trade).num_seconds() < 5 {
+            latest_trade
+        } else {
+            now_local
+        };
+        let now = candidate.min(now_local);
         let cutoff = now - ChronoDuration::seconds(window_secs);
         let mut acc: HashMap<String, (f64, f64, usize)> = HashMap::new(); // exchange -> (buy_usd, sell_usd, trades)
 

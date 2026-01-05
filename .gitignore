@@ -33,3 +33,4 @@ visualize_data.py
 run_tui2.sh
 run_tui3.sh
 target/
+.gemini-clipboard/
