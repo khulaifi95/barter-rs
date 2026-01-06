@@ -44,4 +44,4 @@ clean git tree and a commit recorded here.
 
 - [x] Build: `cargo build -p barter-data-server` (commit: 25ecee2)
 - [x] Build: `cargo build -p barter-trading-tuis --bins` (commit: 41282e9)
-- [ ] Tests: `cargo test -p barter-trading-tuis --lib` (commit: )
+- [x] Tests: `cargo test -p barter-trading-tuis --lib` (commit: 1bf39b6)
