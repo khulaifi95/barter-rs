@@ -13,7 +13,7 @@ clean git tree and a commit recorded here.
 ## Phase A — Baseline & Safety Rails (no behavior change)
 
 - [x] A1: Add versioned message envelope in barter-data (schema version, source, timestamp). (commit: 25ecee2)
-- [ ] A2: Feature flags in TUIs to prefer server data but allow fallback to direct fetch. (commit: )
+- [x] A2: Feature flags in TUIs to prefer server data but allow fallback to direct fetch. (commit: 41282e9)
 - [ ] A3: Shadow-mode logging for new event types without UI changes. (commit: )
 
 ## Phase B — Centralize External Sources (raw feeds)
@@ -43,5 +43,5 @@ clean git tree and a commit recorded here.
 ## Build/Test Gates
 
 - [x] Build: `cargo build -p barter-data-server` (commit: 25ecee2)
-- [ ] Build: `cargo build -p barter-trading-tuis --bins` (commit: )
+- [x] Build: `cargo build -p barter-trading-tuis --bins` (commit: 41282e9)
 - [ ] Tests: `cargo test -p barter-trading-tuis --lib` (commit: )
