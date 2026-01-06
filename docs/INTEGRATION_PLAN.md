@@ -26,7 +26,7 @@ clean git tree and a commit recorded here.
 
 - [x] C1: Define MarketSnapshot schema for derived metrics. (commit: 082d608)
 - [x] C2: Server-side snapshot builder (RVOL/CVD/vol regime/fuel). (commit: 8b29a3d)
-- [ ] C3: TUIs consume snapshot + drift debug panel. (commit: )
+- [x] C3: TUIs consume snapshot + drift debug panel. (commit: 42a7417)
 
 ## Phase D — Cutover & Cleanup
 
