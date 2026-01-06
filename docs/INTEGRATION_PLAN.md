@@ -18,7 +18,7 @@ clean git tree and a commit recorded here.
 
 ## Phase B — Centralize External Sources (raw feeds)
 
-- [ ] B1: IBKR feed ingestion in barter-data-server + new event type. (commit: )
+- [x] B1: IBKR feed ingestion in barter-data-server + new event type. (commit: 168c6b0)
 - [ ] B2: Deribit options poller in barter-data-server + options snapshot event. (commit: )
 - [ ] B3: TUIs parse new event types with fallback paths. (commit: )
 
