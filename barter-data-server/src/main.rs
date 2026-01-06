@@ -9,7 +9,7 @@ use barter_instrument::{
     exchange::ExchangeId,
     instrument::market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use futures::{SinkExt, StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ use tokio::{
     sync::broadcast,
     time::{interval, Duration},
 };
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 // L2 throttling per exchange (OKX is noisier, needs higher throttle)
@@ -50,6 +50,22 @@ fn get_l2_throttle_ms(exchange: &str) -> u64 {
     }
 }
 
+fn trad_tick_event(tick: TradMarketTick) -> MarketEventMessage {
+    let exchange_time = chrono::Utc.timestamp_millis_opt(tick.ts).single().unwrap_or_else(Utc::now);
+    MarketEventMessage {
+        time_exchange: exchange_time,
+        time_received: Utc::now(),
+        exchange: "Ibkr".to_string(),
+        instrument: InstrumentInfo {
+            base: tick.symbol.clone(),
+            quote: "USD".to_string(),
+            kind: "Index".to_string(),
+        },
+        kind: "trad_tick".to_string(),
+        data: serde_json::to_value(tick).unwrap_or_default(),
+    }
+}
+
 /// Market event wrapper for JSON serialization
 #[derive(Debug, Clone, Serialize)]
 struct MarketEventMessage {
@@ -66,6 +82,19 @@ struct InstrumentInfo {
     base: String,
     quote: String,
     kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct TradMarketTick {
+    symbol: String,
+    ts: i64,
+    px: f64,
+    #[serde(default)]
+    sz: f64,
+    #[serde(default)]
+    bid: Option<f64>,
+    #[serde(default)]
+    ask: Option<f64>,
 }
 
 impl From<MarketEvent<MarketDataInstrument, DataKind>> for MarketEventMessage {
@@ -117,6 +146,19 @@ impl From<MarketEvent<MarketDataInstrument, DataKind>> for MarketEventMessage {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum IbkrMessage {
+    #[serde(rename = "tick")]
+    Tick(TradMarketTick),
+    #[serde(rename = "tick_backfill")]
+    TickBackfill { symbol: String, ticks: Vec<TradMarketTick> },
+    #[serde(rename = "welcome")]
+    Welcome { #[serde(default)] message: Option<String> },
+    #[serde(rename = "status")]
+    Status { #[serde(default)] connected: Option<bool> },
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize logging
@@ -158,6 +200,14 @@ async fn main() {
     tokio::spawn(async move {
         start_websocket_server(server_addr, tx_trades_clone, tx_l2_clone).await;
     });
+
+    // IBKR bridge feed (ES/NQ) -> trad_tick events
+    {
+        let tx_trades = tx_trades.clone();
+        tokio::spawn(async move {
+            start_ibkr_bridge_feed(tx_trades).await;
+        });
+    }
 
     info!("WebSocket server listening on ws://{}", server_addr);
     info!("Clients can connect to receive real-time market data");
@@ -411,6 +461,71 @@ async fn start_websocket_server(
         let tx_trades = tx_trades.clone();
         let tx_l2 = tx_l2.clone();
         tokio::spawn(handle_client(stream, peer_addr, tx_trades, tx_l2));
+    }
+}
+
+async fn start_ibkr_bridge_feed(tx_trades: Arc<broadcast::Sender<MarketEventMessage>>) {
+    if std::env::var("IBKR_BRIDGE_ENABLED")
+        .ok()
+        .map(|v| matches!(v.as_str(), "0" | "false" | "FALSE"))
+        .unwrap_or(false)
+    {
+        info!("IBKR bridge feed disabled (IBKR_BRIDGE_ENABLED=0)");
+        return;
+    }
+
+    let url = std::env::var("IBKR_BRIDGE_WS_URL")
+        .unwrap_or_else(|_| "ws://127.0.0.1:8765/ws".to_string());
+    info!("IBKR bridge feed enabled: {}", url);
+
+    loop {
+        match connect_async(&url).await {
+            Ok((ws_stream, _)) => {
+                info!("Connected to ibkr-bridge at {}", url);
+                let (_, mut read) = ws_stream.split();
+
+                while let Some(msg) = read.next().await {
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            match serde_json::from_str::<IbkrMessage>(&text) {
+                                Ok(IbkrMessage::Tick(tick)) => {
+                                    let _ = tx_trades.send(trad_tick_event(tick));
+                                }
+                                Ok(IbkrMessage::TickBackfill { ticks, .. }) => {
+                                    for tick in ticks {
+                                        let _ = tx_trades.send(trad_tick_event(tick));
+                                    }
+                                }
+                                Ok(IbkrMessage::Welcome { .. }) => {
+                                    debug!("IBKR bridge welcome received");
+                                }
+                                Ok(IbkrMessage::Status { .. }) => {
+                                    debug!("IBKR bridge status received");
+                                }
+                                Err(e) => {
+                                    debug!("IBKR parse error: {}", e);
+                                }
+                            }
+                        }
+                        Ok(Message::Close(_)) => {
+                            warn!("ibkr-bridge connection closed");
+                            break;
+                        }
+                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
+                        Err(e) => {
+                            warn!("ibkr-bridge websocket error: {}", e);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to connect to ibkr-bridge at {}: {}", url, e);
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
