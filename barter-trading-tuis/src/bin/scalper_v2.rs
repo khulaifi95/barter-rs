@@ -20,7 +20,7 @@ use barter_trading_tuis::{
     AggregatedSnapshot, Aggregator, Candle1m, ConnectionStatus, DivergenceSignal, FlowSignal,
     Side, VolTrend, WebSocketClient, WebSocketConfig, ticker_to_binance_symbol,
     // Trad markets (ES/NQ) correlation
-    IbkrConnectionStatus, TradMarketState, render_trad_markets_panel, spawn_ibkr_feed,
+    IbkrConnectionStatus, TradMarketState, render_trad_markets_panel,
 };
 use rustls::crypto::ring::default_provider;
 use crossterm::{
@@ -325,18 +325,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Trad markets (ES/NQ) correlation state
-    let trad_source = std::env::var("TRAD_SOURCE").unwrap_or_else(|_| "ibkr".to_string());
-    let use_ibkr = !matches!(trad_source.as_str(), "server" | "ws");
     let trad_state = Arc::new(Mutex::new(TradMarketState::new()));
     let (ibkr_status_tx, ibkr_status_rx) = tokio::sync::watch::channel(IbkrConnectionStatus::Disconnected);
-    {
-        if use_ibkr {
-            let state = Arc::clone(&trad_state);
-            spawn_ibkr_feed(state, ibkr_status_tx);
-        } else {
-            eprintln!("TRAD_SOURCE=server: skipping ibkr-bridge");
-        }
-    }
 
     for &ticker in &TICKERS {
         let agg = Arc::clone(&aggregator);
@@ -353,13 +343,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         let agg = Arc::clone(&aggregator);
         let trad = Arc::clone(&trad_state);
-        let use_server_trad = !use_ibkr;
+        let ibkr_status_tx = ibkr_status_tx.clone();
         tokio::spawn(async move {
             let mut last_latency_log = Instant::now();
             let mut latency_samples: Vec<i64> = Vec::new();
 
             while let Some(event) = event_rx.recv().await {
-                if use_server_trad && event.kind == "trad_tick" {
+                if event.kind == "trad_tick" {
                     if let Ok(tick) = serde_json::from_value::<barter_trading_tuis::shared::types::TradTickData>(event.data.clone()) {
                         let size = if tick.sz > 0.0 { tick.sz } else { 1.0 };
                         let mut trad_guard = trad.lock().await;
@@ -369,6 +359,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             _ => {}
                         }
                     }
+                    let _ = ibkr_status_tx.send(IbkrConnectionStatus::Connected);
                     continue;
                 }
                 // Measure latency: exchange timestamp vs now

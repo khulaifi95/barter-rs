@@ -20,9 +20,7 @@ use barter_trading_tuis::{
 use barter_trading_tuis::shared::{
     audit::AuditLogger,
     config::Config,
-    deribit::DeribitRestClient,
-    market_state::{ConfigProvider, DeribitClient, Direction as FlowDirection, State, TradingBias, TradMarketStatus},
-    gamma::GammaCalculator,
+    market_state::{ConfigProvider, Direction as FlowDirection, State, TradingBias, TradMarketStatus},
     options_state::OptionsContextBuilder,
     orchestrator::StateOrchestrator,
     snapshot_bridge::build_market_data_input,
@@ -206,8 +204,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let aggregator = Arc::new(Mutex::new(Aggregator::new()));
     let connected = Arc::new(AtomicBool::new(false));
     let options_cache = Arc::new(Mutex::new(HashMap::new()));
-    let options_source = std::env::var("OPTIONS_SOURCE").unwrap_or_else(|_| "direct".to_string());
-    let use_direct_options = !matches!(options_source.as_str(), "server" | "ws");
 
     // Watch channel for sharing MarketState from orchestrator to UI
     let (state_tx, state_rx) = watch::channel::<HashMap<String, OrchestratorResult>>(HashMap::new());
@@ -243,7 +239,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         let agg = Arc::clone(&aggregator);
         let options_cache = Arc::clone(&options_cache);
-        let use_server_options = !use_direct_options;
         tokio::spawn(async move {
             let options_builder = OptionsContextBuilder::new();
             while let Some(event) = event_rx.recv().await {
@@ -251,7 +246,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     // TradFi ticks are not consumed in this TUI yet.
                     continue;
                 }
-                if use_server_options && event.kind == "options_chain" {
+                if event.kind == "options_chain" {
                     if let Ok(chain) = serde_json::from_value::<barter_trading_tuis::shared::market_state::OptionsChain>(event.data.clone()) {
                         let ticker = event.instrument.base.to_uppercase();
                         let spot = {
@@ -299,7 +294,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let agg = Arc::clone(&aggregator);
         let options_cache = Arc::clone(&options_cache);
         let state_tx = state_tx.clone();
-        let use_direct_options = use_direct_options;
         tokio::spawn(async move {
             // Load config from file with fallback to defaults
             let config = Config::load().unwrap_or_else(|e| {
@@ -310,69 +304,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // Create real audit logger (writes to logs/audit/)
             let logger = AuditLogger::new(&config.thresholds().audit);
             let mut orchestrator = StateOrchestrator::new(config, logger);
-
-            if !use_direct_options {
-                tracing::info!("OPTIONS_SOURCE=server: skipping direct Deribit polling");
-            }
-
-            // Deribit client for options data (gamma flip calculation)
-            let deribit_client = DeribitRestClient::default();
-            let gamma_calc = GammaCalculator::default();
-            let options_builder = OptionsContextBuilder::new();
-
-            let mut last_options_fetch = Instant::now() - Duration::from_secs(120); // Force initial fetch
-
             let calc_interval = Duration::from_millis(200);
-            let options_refresh = Duration::from_secs(60);
             let mut last_calc = Instant::now();
 
             loop {
-                // Refresh options data every 60 seconds (for BTC only initially)
-                if use_direct_options && last_options_fetch.elapsed() >= options_refresh {
-                    // Get spot price first
-                    let spot = {
-                        let guard = agg.lock().await;
-                        guard.snapshot()
-                            .tickers
-                            .get("BTC")
-                            .and_then(|s| s.binance_perp_last)
-                            .unwrap_or(0.0)
-                    };
-
-                    if spot <= 0.0 {
-                        tracing::debug!("Deribit: BTC spot=0, waiting for price data");
-                        // Retry in 5 seconds
-                        last_options_fetch = Instant::now() - options_refresh + Duration::from_secs(5);
-                    } else {
-                        tracing::info!("Fetching Deribit options for BTC (spot=${:.2})", spot);
-                        match deribit_client.fetch_options_chain("BTC").await {
-                            Ok(chain) => {
-                                // Count contracts with greeks for debugging
-                                let with_greeks = chain.contracts.iter()
-                                    .filter(|c| c.gamma > 0.0 || c.delta.abs() > 0.0)
-                                    .count();
-                                let ctx = options_builder.build(&chain, spot);
-                                tracing::info!(
-                                    "Deribit BTC OK: {} contracts ({} with greeks), gamma_flip=${:.0}, gex={:.2}M, dex={:.2}M",
-                                    chain.contracts.len(),
-                                    with_greeks,
-                                    ctx.gamma_flip_price,
-                                    ctx.gexp / 1_000_000.0,
-                                    ctx.dexp / 1_000_000.0
-                                );
-                                let mut cache = options_cache.lock().await;
-                                cache.insert("BTC".to_string(), ctx);
-                                last_options_fetch = Instant::now();
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to fetch Deribit options: {:?}", e);
-                                // Retry in 10 seconds on error
-                                last_options_fetch = Instant::now() - options_refresh + Duration::from_secs(10);
-                            }
-                        }
-                    }
-                }
-
                 if last_calc.elapsed() >= calc_interval {
                     let snapshot = {
                         let guard = agg.lock().await;

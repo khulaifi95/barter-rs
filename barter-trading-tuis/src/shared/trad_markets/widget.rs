@@ -43,7 +43,7 @@ pub fn render_trad_markets_panel(
     // If disconnected and no data, show placeholder
     if ibkr_status != IbkrConnectionStatus::Connected && signals.es_price <= 0.0 {
         let placeholder = vec![
-            Line::from(Span::styled("Waiting for ibkr-bridge...", Style::default().fg(C_TEXT))),
+            Line::from(Span::styled("Waiting for trad feed...", Style::default().fg(C_TEXT))),
         ];
         f.render_widget(Paragraph::new(placeholder), inner);
         return;

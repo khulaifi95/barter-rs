@@ -20,8 +20,7 @@ use barter_trading_tuis::{
 use barter_trading_tuis::shared::{
     audit::AuditLogger,
     config::Config,
-    deribit::DeribitRestClient,
-    market_state::{ConfigProvider, DeribitClient, TradMarketStatus},
+    market_state::{ConfigProvider, TradMarketStatus},
     options_state::OptionsContextBuilder,
     orchestrator::StateOrchestrator,
     snapshot_bridge::build_market_data_input,
@@ -59,10 +58,6 @@ fn get_ws_url() -> String {
 
 fn tickers() -> &'static [String] {
     TICKERS.get_or_init(get_tickers)
-}
-
-fn supports_deribit(ticker: &str) -> bool {
-    matches!(ticker.to_uppercase().as_str(), "BTC" | "ETH")
 }
 
 /// Spawn a Binance 1m kline stream for a ticker (perps)
@@ -182,14 +177,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         WebSocketClient::with_config(WebSocketConfig::new(ws_url).with_channel_buffer_size(50_000));
     let (mut event_rx, mut status_rx) = client.start();
 
-    let options_source = std::env::var("OPTIONS_SOURCE").unwrap_or_else(|_| "direct".to_string());
-    let use_direct_options = !matches!(options_source.as_str(), "server" | "ws");
     let options_cache = Arc::new(Mutex::new(HashMap::new()));
 
     {
         let agg = Arc::clone(&aggregator);
         let options_cache = Arc::clone(&options_cache);
-        let use_server_options = !use_direct_options;
         tokio::spawn(async move {
             let options_builder = OptionsContextBuilder::new();
             while let Some(event) = event_rx.recv().await {
@@ -197,7 +189,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     // TradFi ticks are not consumed in this TUI yet.
                     continue;
                 }
-                if use_server_options && event.kind == "options_chain" {
+                if event.kind == "options_chain" {
                     if let Ok(chain) = serde_json::from_value::<barter_trading_tuis::shared::market_state::OptionsChain>(event.data.clone()) {
                         let ticker = event.instrument.base.to_uppercase();
                         let spot = {
@@ -236,74 +228,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         });
-    }
-
-    // Background task: Deribit options refresh every 60s (direct source)
-    if use_direct_options {
-        let options_cache = Arc::clone(&options_cache);
-        let agg = Arc::clone(&aggregator);
-        tokio::spawn(async move {
-            let deribit_client = DeribitRestClient::default();
-            let options_builder = OptionsContextBuilder::new();
-            let refresh = Duration::from_secs(60);
-            let mut last_fetch = Instant::now() - refresh;
-            let ticker_list = tickers().to_vec();
-
-            loop {
-                if last_fetch.elapsed() >= refresh {
-                    let snapshot = {
-                        let guard = agg.lock().await;
-                        guard.snapshot()
-                    };
-
-                    let mut any_fetched = false;
-                    for ticker in &ticker_list {
-                        if !supports_deribit(ticker) {
-                            continue;
-                        }
-                        let spot = snapshot
-                            .tickers
-                            .get(ticker)
-                            .and_then(|s| s.binance_perp_last)
-                            .unwrap_or(0.0);
-                        if spot <= 0.0 {
-                            tracing::debug!("Deribit: {} spot=0, waiting for price data", ticker);
-                            continue;
-                        }
-                        tracing::info!("Fetching Deribit options for {} (spot=${:.2})", ticker, spot);
-                        match deribit_client.fetch_options_chain(ticker).await {
-                            Ok(chain) => {
-                                let ctx = options_builder.build(&chain, spot);
-                                tracing::info!(
-                                    "Deribit {} OK: {} contracts, gamma_flip=${:.0}, gex={:.0}",
-                                    ticker,
-                                    chain.contracts.len(),
-                                    ctx.gamma_flip_price,
-                                    ctx.gexp
-                                );
-                                let mut cache = options_cache.lock().await;
-                                cache.insert(ticker.clone(), ctx);
-                                any_fetched = true;
-                            }
-                            Err(e) => {
-                                tracing::warn!("Deribit fetch failed for {}: {:?}", ticker, e);
-                            }
-                        }
-                    }
-                    // Only update last_fetch if we actually fetched something
-                    // This ensures we retry quickly if price data wasn't available yet
-                    if any_fetched {
-                        last_fetch = Instant::now();
-                    } else {
-                        // Retry in 5 seconds if no spot prices were available
-                        last_fetch = Instant::now() - refresh + Duration::from_secs(5);
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        });
-    } else {
-        tracing::info!("OPTIONS_SOURCE=server: skipping direct Deribit polling");
     }
 
     // Market State Engine - calculates MarketState every 200ms
