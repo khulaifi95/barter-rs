@@ -182,6 +182,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         WebSocketClient::with_config(WebSocketConfig::new(ws_url).with_channel_buffer_size(50_000));
     let (mut event_rx, mut status_rx) = client.start();
 
+    let options_source = std::env::var("OPTIONS_SOURCE").unwrap_or_else(|_| "direct".to_string());
+    let use_direct_options = !matches!(options_source.as_str(), "server" | "ws");
+
     {
         let agg = Arc::clone(&aggregator);
         tokio::spawn(async move {
@@ -206,9 +209,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    // Background task: Deribit options refresh every 60s
+    // Background task: Deribit options refresh every 60s (direct source)
     let options_cache = Arc::new(Mutex::new(HashMap::new()));
-    {
+    if use_direct_options {
         let options_cache = Arc::clone(&options_cache);
         let agg = Arc::clone(&aggregator);
         tokio::spawn(async move {
@@ -271,6 +274,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         });
+    } else {
+        tracing::info!("OPTIONS_SOURCE=server: skipping direct Deribit polling");
     }
 
     // Market State Engine - calculates MarketState every 200ms

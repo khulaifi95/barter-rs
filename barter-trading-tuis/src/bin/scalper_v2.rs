@@ -325,11 +325,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Trad markets (ES/NQ) correlation state
+    let trad_source = std::env::var("TRAD_SOURCE").unwrap_or_else(|_| "ibkr".to_string());
+    let use_ibkr = !matches!(trad_source.as_str(), "server" | "ws");
     let trad_state = Arc::new(Mutex::new(TradMarketState::new()));
     let (ibkr_status_tx, ibkr_status_rx) = tokio::sync::watch::channel(IbkrConnectionStatus::Disconnected);
     {
-        let state = Arc::clone(&trad_state);
-        spawn_ibkr_feed(state, ibkr_status_tx);
+        if use_ibkr {
+            let state = Arc::clone(&trad_state);
+            spawn_ibkr_feed(state, ibkr_status_tx);
+        } else {
+            eprintln!("TRAD_SOURCE=server: skipping ibkr-bridge");
+        }
     }
 
     for &ticker in &TICKERS {

@@ -278,6 +278,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let logger = AuditLogger::new(&config.thresholds().audit);
             let mut orchestrator = StateOrchestrator::new(config, logger);
 
+            let options_source =
+                std::env::var("OPTIONS_SOURCE").unwrap_or_else(|_| "direct".to_string());
+            let use_direct_options = !matches!(options_source.as_str(), "server" | "ws");
+            if !use_direct_options {
+                tracing::info!("OPTIONS_SOURCE=server: skipping direct Deribit polling");
+            }
+
             // Deribit client for options data (gamma flip calculation)
             let deribit_client = DeribitRestClient::default();
             let gamma_calc = GammaCalculator::default();
@@ -293,7 +300,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             loop {
                 // Refresh options data every 60 seconds (for BTC only initially)
-                if last_options_fetch.elapsed() >= options_refresh {
+                if use_direct_options && last_options_fetch.elapsed() >= options_refresh {
                     // Get spot price first
                     let spot = {
                         let guard = agg.lock().await;

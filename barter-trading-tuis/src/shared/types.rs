@@ -25,6 +25,18 @@ pub struct MarketEventMessage {
     pub data: serde_json::Value,
 }
 
+/// Versioned envelope for market events (optional).
+///
+/// When present, the payload is a `MarketEventMessage` and includes
+/// schema metadata for compatibility during migrations.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MarketEventEnvelope {
+    pub schema_version: u16,
+    pub source: String,
+    pub time_sent: DateTime<Utc>,
+    pub payload: MarketEventMessage,
+}
+
 /// Instrument information
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InstrumentInfo {

@@ -1,7 +1,7 @@
 /// WebSocket client for connecting to the aggregated market data server
 ///
 /// Provides automatic reconnection, heartbeat, and event parsing
-use crate::shared::types::MarketEventMessage;
+use crate::shared::types::{MarketEventEnvelope, MarketEventMessage};
 use futures::{SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -180,6 +180,16 @@ async fn run_websocket_loop(
                             }
 
                             // Try to parse as market event
+                            if let Ok(envelope) = serde_json::from_str::<MarketEventEnvelope>(&text)
+                            {
+                                if event_tx.send(envelope.payload).await.is_err() {
+                                    warn!("Event receiver dropped, stopping client");
+                                    should_break = true;
+                                    break;
+                                }
+                                continue;
+                            }
+
                             match serde_json::from_str::<MarketEventMessage>(&text) {
                                 Ok(event) => {
                                     if event_tx.send(event).await.is_err() {
