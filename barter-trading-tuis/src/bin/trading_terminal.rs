@@ -184,11 +184,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let options_source = std::env::var("OPTIONS_SOURCE").unwrap_or_else(|_| "direct".to_string());
     let use_direct_options = !matches!(options_source.as_str(), "server" | "ws");
+    let options_cache = Arc::new(Mutex::new(HashMap::new()));
 
     {
         let agg = Arc::clone(&aggregator);
+        let options_cache = Arc::clone(&options_cache);
+        let use_server_options = !use_direct_options;
         tokio::spawn(async move {
+            let options_builder = OptionsContextBuilder::new();
             while let Some(event) = event_rx.recv().await {
+                if event.kind == "trad_tick" {
+                    // TradFi ticks are not consumed in this TUI yet.
+                    continue;
+                }
+                if use_server_options && event.kind == "options_chain" {
+                    if let Ok(chain) = serde_json::from_value::<barter_trading_tuis::shared::market_state::OptionsChain>(event.data.clone()) {
+                        let ticker = event.instrument.base.to_uppercase();
+                        let spot = {
+                            let guard = agg.lock().await;
+                            guard
+                                .snapshot()
+                                .tickers
+                                .get(&ticker)
+                                .and_then(|s| s.binance_perp_last)
+                                .unwrap_or(0.0)
+                        };
+                        if spot > 0.0 {
+                            let ctx = options_builder.build(&chain, spot);
+                            let mut cache = options_cache.lock().await;
+                            cache.insert(ticker, ctx);
+                        }
+                    }
+                    continue;
+                }
+
                 let mut guard = agg.lock().await;
                 guard.process_event(event);
             }
@@ -210,7 +239,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Background task: Deribit options refresh every 60s (direct source)
-    let options_cache = Arc::new(Mutex::new(HashMap::new()));
     if use_direct_options {
         let options_cache = Arc::clone(&options_cache);
         let agg = Arc::clone(&aggregator);

@@ -353,11 +353,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         let agg = Arc::clone(&aggregator);
         let trad = Arc::clone(&trad_state);
+        let use_server_trad = !use_ibkr;
         tokio::spawn(async move {
             let mut last_latency_log = Instant::now();
             let mut latency_samples: Vec<i64> = Vec::new();
 
             while let Some(event) = event_rx.recv().await {
+                if use_server_trad && event.kind == "trad_tick" {
+                    if let Ok(tick) = serde_json::from_value::<barter_trading_tuis::shared::types::TradTickData>(event.data.clone()) {
+                        let size = if tick.sz > 0.0 { tick.sz } else { 1.0 };
+                        let mut trad_guard = trad.lock().await;
+                        match tick.symbol.as_str() {
+                            "ES" => trad_guard.update_es_tick(tick.px, size, tick.ts),
+                            "NQ" => trad_guard.update_nq_tick(tick.px, size, tick.ts),
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
                 // Measure latency: exchange timestamp vs now
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 let exchange_ms = event.time_exchange.timestamp_millis();

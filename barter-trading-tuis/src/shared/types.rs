@@ -122,6 +122,20 @@ pub struct FundingRateData {
     pub next_time: Option<DateTime<Utc>>,
 }
 
+/// Traditional markets tick data (ES/NQ) from ibkr-bridge
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TradTickData {
+    pub symbol: String,
+    pub ts: i64,
+    pub px: f64,
+    #[serde(default)]
+    pub sz: f64,
+    #[serde(default)]
+    pub bid: Option<f64>,
+    #[serde(default)]
+    pub ask: Option<f64>,
+}
+
 /// Cumulative Volume Delta (CVD) event data
 ///
 /// Represents the net buying/selling pressure

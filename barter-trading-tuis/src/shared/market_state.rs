@@ -583,14 +583,14 @@ pub trait FundingTracker: Send + Sync {
 // ============================================================================
 
 /// Options chain from Deribit (used by DeribitClient trait)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OptionsChain {
     pub contracts: Vec<OptionContract>,
     pub timestamp: i64,
 }
 
 /// Single option contract
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptionContract {
     pub instrument_name: String,
     pub strike: f64,

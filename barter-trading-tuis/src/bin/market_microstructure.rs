@@ -205,6 +205,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Shared aggregation engine
     let aggregator = Arc::new(Mutex::new(Aggregator::new()));
     let connected = Arc::new(AtomicBool::new(false));
+    let options_cache = Arc::new(Mutex::new(HashMap::new()));
+    let options_source = std::env::var("OPTIONS_SOURCE").unwrap_or_else(|_| "direct".to_string());
+    let use_direct_options = !matches!(options_source.as_str(), "server" | "ws");
 
     // Watch channel for sharing MarketState from orchestrator to UI
     let (state_tx, state_rx) = watch::channel::<HashMap<String, OrchestratorResult>>(HashMap::new());
@@ -239,8 +242,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Event processor
     {
         let agg = Arc::clone(&aggregator);
+        let options_cache = Arc::clone(&options_cache);
+        let use_server_options = !use_direct_options;
         tokio::spawn(async move {
+            let options_builder = OptionsContextBuilder::new();
             while let Some(event) = event_rx.recv().await {
+                if event.kind == "trad_tick" {
+                    // TradFi ticks are not consumed in this TUI yet.
+                    continue;
+                }
+                if use_server_options && event.kind == "options_chain" {
+                    if let Ok(chain) = serde_json::from_value::<barter_trading_tuis::shared::market_state::OptionsChain>(event.data.clone()) {
+                        let ticker = event.instrument.base.to_uppercase();
+                        let spot = {
+                            let guard = agg.lock().await;
+                            guard
+                                .snapshot()
+                                .tickers
+                                .get(&ticker)
+                                .and_then(|s| s.binance_perp_last)
+                                .unwrap_or(0.0)
+                        };
+                        if spot > 0.0 {
+                            let ctx = options_builder.build(&chain, spot);
+                            let mut cache = options_cache.lock().await;
+                            cache.insert(ticker, ctx);
+                        }
+                    }
+                    continue;
+                }
+
                 let mut guard = agg.lock().await;
                 guard.process_event(event);
             }
@@ -266,7 +297,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Calculates MarketState every 200ms and logs state transitions
     {
         let agg = Arc::clone(&aggregator);
+        let options_cache = Arc::clone(&options_cache);
         let state_tx = state_tx.clone();
+        let use_direct_options = use_direct_options;
         tokio::spawn(async move {
             // Load config from file with fallback to defaults
             let config = Config::load().unwrap_or_else(|e| {
@@ -278,9 +311,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let logger = AuditLogger::new(&config.thresholds().audit);
             let mut orchestrator = StateOrchestrator::new(config, logger);
 
-            let options_source =
-                std::env::var("OPTIONS_SOURCE").unwrap_or_else(|_| "direct".to_string());
-            let use_direct_options = !matches!(options_source.as_str(), "server" | "ws");
             if !use_direct_options {
                 tracing::info!("OPTIONS_SOURCE=server: skipping direct Deribit polling");
             }
@@ -290,8 +320,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let gamma_calc = GammaCalculator::default();
             let options_builder = OptionsContextBuilder::new();
 
-            // Cache for options context (refresh every 60s per spec)
-            let mut btc_options_ctx = None;
             let mut last_options_fetch = Instant::now() - Duration::from_secs(120); // Force initial fetch
 
             let calc_interval = Duration::from_millis(200);
@@ -332,7 +360,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     ctx.gexp / 1_000_000.0,
                                     ctx.dexp / 1_000_000.0
                                 );
-                                btc_options_ctx = Some(ctx);
+                                let mut cache = options_cache.lock().await;
+                                cache.insert("BTC".to_string(), ctx);
                                 last_options_fetch = Instant::now();
                             }
                             Err(e) => {
@@ -361,9 +390,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             TradMarketStatus::Unavailable, // No IBKR in this binary
                         );
 
-                        // Attach options context for BTC
-                        if ticker == "BTC" {
-                            input.options_context = btc_options_ctx.clone();
+                        if let Some(ctx) = options_cache.lock().await.get(ticker).cloned() {
+                            input.options_context = Some(ctx);
                         }
 
                         let result = orchestrator.calculate(&input);
