@@ -13,6 +13,7 @@ use crate::shared::market_state::{
 };
 use crate::shared::orchestrator::{DataTimestamps, MarketDataInput};
 use crate::shared::state::{AggregatedSnapshot, TickerSnapshot};
+use crate::shared::types::SnapshotTicker;
 use chrono::Utc;
 
 /// Build MarketDataInput from a TickerSnapshot
@@ -21,6 +22,7 @@ use chrono::Utc;
 /// to the format expected by StateOrchestrator.
 pub fn build_market_data_input(
     snapshot: &TickerSnapshot,
+    server_snapshot: Option<&SnapshotTicker>,
     trad_status: TradMarketStatus,
 ) -> MarketDataInput {
     let now_ms = Utc::now().timestamp_millis();
@@ -28,27 +30,36 @@ pub fn build_market_data_input(
     MarketDataInput {
         spot_price: snapshot.binance_perp_last.unwrap_or(0.0),
         ticker: snapshot.ticker.clone(),
-        vol_score: build_vol_score(snapshot),
+        vol_score: build_vol_score(snapshot, server_snapshot),
         options_context: None, // Not available in current infrastructure
-        flow_score: build_flow_score(snapshot),
-        funding_score: build_funding_score(snapshot),
-        fuel_input: build_fuel_input(snapshot),
+        flow_score: build_flow_score(snapshot, server_snapshot),
+        funding_score: build_funding_score(snapshot, server_snapshot),
+        fuel_input: build_fuel_input(snapshot, server_snapshot),
         timestamps: build_timestamps(snapshot, now_ms),
         trad_status,
     }
 }
 
 /// Build VolRegimeScore from snapshot volatility data
-fn build_vol_score(snapshot: &TickerSnapshot) -> VolRegimeScore {
+fn build_vol_score(snapshot: &TickerSnapshot, server_snapshot: Option<&SnapshotTicker>) -> VolRegimeScore {
     // Use realized volatility if available
     let current_rv = snapshot.realized_vol_1h.unwrap_or(0.0);
 
     // Estimate percentile from trend (simplified - real implementation would use history)
-    let (percentile, regime) = match snapshot.realized_vol_trend {
+    let (mut percentile, mut regime) = match snapshot.realized_vol_trend {
         crate::shared::state::VolTrend::Contracting => (30.0, VolRegime::Low),
         crate::shared::state::VolTrend::Stable => (50.0, VolRegime::Normal),
         crate::shared::state::VolTrend::Expanding => (75.0, VolRegime::High),
     };
+
+    if let Some(server) = server_snapshot {
+        if server.vol_percentile > 0.0 {
+            percentile = server.vol_percentile;
+        }
+        if let Some(server_regime) = parse_vol_regime(&server.vol_regime) {
+            regime = server_regime;
+        }
+    }
 
     // Check for shock based on ATR or 1m return Z-score
     let atr_shock = snapshot
@@ -69,7 +80,7 @@ fn build_vol_score(snapshot: &TickerSnapshot) -> VolRegimeScore {
 }
 
 /// Build FlowScore from CVD data across exchanges
-fn build_flow_score(snapshot: &TickerSnapshot) -> FlowScore {
+fn build_flow_score(snapshot: &TickerSnapshot, server_snapshot: Option<&SnapshotTicker>) -> FlowScore {
     let cvd_5m = &snapshot.cvd_per_exchange_5m;
 
     // Count venues with positive/negative CVD
@@ -96,7 +107,9 @@ fn build_flow_score(snapshot: &TickerSnapshot) -> FlowScore {
     };
 
     // Net CVD across all venues
-    let cvd_net = snapshot.cvd_5m_total;
+    let cvd_net = server_snapshot
+        .map(|server| server.cvd_5m)
+        .unwrap_or(snapshot.cvd_5m_total);
 
     // Use flow signal for absorption detection
     // Distribution = selling into strength, Exhaustion = momentum fading
@@ -125,15 +138,21 @@ fn build_flow_score(snapshot: &TickerSnapshot) -> FlowScore {
 }
 
 /// Build FundingScore from exchange funding rates
-fn build_funding_score(snapshot: &TickerSnapshot) -> FundingScore {
-    let rates = &snapshot.funding_rate_by_exchange;
+fn build_funding_score(snapshot: &TickerSnapshot, server_snapshot: Option<&SnapshotTicker>) -> FundingScore {
+    let (current_rate, rate_15m_ago, velocity) = if let Some(server) = server_snapshot {
+        let rate_15m_ago = server.funding_rate - server.funding_velocity;
+        (server.funding_rate, rate_15m_ago, server.funding_velocity)
+    } else {
+        let rates = &snapshot.funding_rate_by_exchange;
 
-    // Calculate average funding rate
-    let (sum, count) = rates.iter().fold((0.0, 0), |(sum, count), (_, &rate)| {
-        (sum + rate, count + 1)
-    });
+        // Calculate average funding rate
+        let (sum, count) = rates.iter().fold((0.0, 0), |(sum, count), (_, &rate)| {
+            (sum + rate, count + 1)
+        });
 
-    let current_rate = if count > 0 { sum / count as f64 } else { 0.0 };
+        let current_rate = if count > 0 { sum / count as f64 } else { 0.0 };
+        (current_rate, snapshot.funding_rate_15m_ago, snapshot.funding_velocity_15m)
+    };
 
     // Thresholds from spec
     let is_extreme = current_rate > 0.0005 || current_rate < -0.0002;
@@ -141,15 +160,23 @@ fn build_funding_score(snapshot: &TickerSnapshot) -> FundingScore {
 
     FundingScore {
         current_rate,
-        rate_15m_ago: snapshot.funding_rate_15m_ago,
-        velocity: snapshot.funding_velocity_15m,
+        rate_15m_ago,
+        velocity,
         is_extreme,
         is_spiking,
         passed: !is_spiking,
     }
 }
 
-fn build_fuel_input(snapshot: &TickerSnapshot) -> FuelInput {
+fn build_fuel_input(snapshot: &TickerSnapshot, server_snapshot: Option<&SnapshotTicker>) -> FuelInput {
+    if let Some(server) = server_snapshot {
+        return FuelInput {
+            rvol_5m: server.rvol_5m,
+            oi_delta_usd_5m: server.oi_delta_5m,
+            liq_rate_usd_per_min: server.liq_rate_usd_per_min,
+        };
+    }
+
     let spot = snapshot.binance_perp_last.or(snapshot.latest_price).unwrap_or(0.0);
     let avg_5m = if snapshot.vol_1h > 0.0 {
         snapshot.vol_1h / 12.0
@@ -210,11 +237,26 @@ pub fn build_all_inputs(
     snapshot: &AggregatedSnapshot,
     trad_status: TradMarketStatus,
 ) -> Vec<MarketDataInput> {
+    let server_snapshot = snapshot.server_snapshot.as_ref();
     snapshot
         .tickers
         .values()
-        .map(|ticker_snap| build_market_data_input(ticker_snap, trad_status))
+        .map(|ticker_snap| {
+            let server_ticker = server_snapshot
+                .and_then(|snap| snap.tickers.get(&ticker_snap.ticker));
+            build_market_data_input(ticker_snap, server_ticker, trad_status)
+        })
         .collect()
+}
+
+fn parse_vol_regime(value: &str) -> Option<VolRegime> {
+    match value.to_ascii_lowercase().as_str() {
+        "low" => Some(VolRegime::Low),
+        "normal" => Some(VolRegime::Normal),
+        "high" => Some(VolRegime::High),
+        "extreme" => Some(VolRegime::Extreme),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -257,7 +299,7 @@ mod tests {
     #[test]
     fn test_build_market_data_input() {
         let snap = sample_snapshot();
-        let input = build_market_data_input(&snap, TradMarketStatus::Live);
+        let input = build_market_data_input(&snap, None, TradMarketStatus::Live);
 
         assert_eq!(input.ticker, "BTC");
         assert_eq!(input.spot_price, 92000.0);

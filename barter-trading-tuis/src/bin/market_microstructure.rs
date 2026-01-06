@@ -319,9 +319,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                     // Process each ticker through the orchestrator
                     for (ticker, ticker_snap) in &snapshot.tickers {
+                        let server_ticker = snapshot
+                            .server_snapshot
+                            .as_ref()
+                            .and_then(|snap| snap.tickers.get(ticker));
                         // Build input with proper options context
                         let mut input = build_market_data_input(
                             ticker_snap,
+                            server_ticker,
                             TradMarketStatus::Unavailable, // No IBKR in this binary
                         );
 

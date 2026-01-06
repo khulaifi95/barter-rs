@@ -255,8 +255,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let mut state_results = HashMap::new();
 
                     for (ticker, ticker_snap) in &snapshot.tickers {
+                        let server_ticker = snapshot
+                            .server_snapshot
+                            .as_ref()
+                            .and_then(|snap| snap.tickers.get(ticker));
                         let mut input = build_market_data_input(
                             ticker_snap,
+                            server_ticker,
                             TradMarketStatus::Unavailable,
                         );
                         if let Some(ctx) = options_cache.get(ticker) {
