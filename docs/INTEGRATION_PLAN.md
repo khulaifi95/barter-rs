@@ -12,7 +12,7 @@ clean git tree and a commit recorded here.
 
 ## Phase A — Baseline & Safety Rails (no behavior change)
 
-- [ ] A1: Add versioned message envelope in barter-data (schema version, source, timestamp). (commit: )
+- [x] A1: Add versioned message envelope in barter-data (schema version, source, timestamp). (commit: 25ecee2)
 - [ ] A2: Feature flags in TUIs to prefer server data but allow fallback to direct fetch. (commit: )
 - [ ] A3: Shadow-mode logging for new event types without UI changes. (commit: )
 
@@ -42,7 +42,6 @@ clean git tree and a commit recorded here.
 
 ## Build/Test Gates
 
-- [ ] Build: `cargo build -p barter-data-server` (commit: )
+- [x] Build: `cargo build -p barter-data-server` (commit: 25ecee2)
 - [ ] Build: `cargo build -p barter-trading-tuis --bins` (commit: )
 - [ ] Tests: `cargo test -p barter-trading-tuis --lib` (commit: )
-
