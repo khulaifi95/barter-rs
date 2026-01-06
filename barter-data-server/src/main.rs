@@ -1,6 +1,7 @@
 use barter_data::{
     error::DataError,
     event::{DataKind, MarketEvent, MarketEventEnvelope},
+    snapshot::{MarketSnapshot, SnapshotTicker},
     streams::{builder::dynamic::DynamicStreams, consumer::MarketStreamResult, reconnect::Event},
     subscription::funding::FundingRate,
     subscription::open_interest::OpenInterest,
@@ -13,7 +14,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use futures::{SinkExt, StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -114,6 +115,249 @@ struct OptionContract {
     delta: f64,
     gamma: f64,
     vega: f64,
+}
+
+struct SnapshotBuilder {
+    tickers: HashMap<String, TickerDerivedState>,
+}
+
+impl SnapshotBuilder {
+    fn new() -> Self {
+        Self { tickers: HashMap::new() }
+    }
+
+    fn update(&mut self, event: &MarketEvent<MarketDataInstrument, DataKind>) {
+        let ticker = event.instrument.base.to_string().to_uppercase();
+        let state = self
+            .tickers
+            .entry(ticker)
+            .or_insert_with(TickerDerivedState::new);
+        state.update(event);
+    }
+
+    fn snapshot(&mut self) -> MarketSnapshot {
+        let now = Utc::now();
+        let mut tickers = HashMap::new();
+        for (symbol, state) in self.tickers.iter_mut() {
+            tickers.insert(symbol.clone(), state.snapshot(now));
+        }
+        MarketSnapshot {
+            timestamp: now.timestamp_millis(),
+            tickers,
+        }
+    }
+}
+
+struct TickerDerivedState {
+    last_price: f64,
+    last_price_ts: DateTime<Utc>,
+    trade_volumes: VecDeque<(DateTime<Utc>, f64)>,
+    cvd_by_exchange: HashMap<String, VecDeque<(DateTime<Utc>, f64)>>,
+    oi_by_exchange: HashMap<String, VecDeque<(DateTime<Utc>, f64)>>,
+    funding_by_exchange: HashMap<String, VecDeque<(DateTime<Utc>, f64)>>,
+    liq_notional: VecDeque<(DateTime<Utc>, f64)>,
+}
+
+impl TickerDerivedState {
+    fn new() -> Self {
+        Self {
+            last_price: 0.0,
+            last_price_ts: Utc::now(),
+            trade_volumes: VecDeque::new(),
+            cvd_by_exchange: HashMap::new(),
+            oi_by_exchange: HashMap::new(),
+            funding_by_exchange: HashMap::new(),
+            liq_notional: VecDeque::new(),
+        }
+    }
+
+    fn update(&mut self, event: &MarketEvent<MarketDataInstrument, DataKind>) {
+        let now = event.time_exchange;
+        match &event.kind {
+            DataKind::Trade(trade) => {
+                self.last_price = trade.price;
+                self.last_price_ts = now;
+                self.trade_volumes.push_back((now, trade.price * trade.amount));
+                self.prune_trade_volumes(now);
+            }
+            DataKind::CumulativeVolumeDelta(cvd) => {
+                let entry = self
+                    .cvd_by_exchange
+                    .entry(format!("{:?}", event.exchange))
+                    .or_insert_with(VecDeque::new);
+                entry.push_back((now, cvd.delta_quote));
+                self.prune_cvd(now);
+            }
+            DataKind::OpenInterest(oi) => {
+                let value = oi.notional.unwrap_or(oi.contracts);
+                let entry = self
+                    .oi_by_exchange
+                    .entry(format!("{:?}", event.exchange))
+                    .or_insert_with(VecDeque::new);
+                entry.push_back((now, value));
+                self.prune_oi(now);
+            }
+            DataKind::FundingRate(fr) => {
+                let entry = self
+                    .funding_by_exchange
+                    .entry(format!("{:?}", event.exchange))
+                    .or_insert_with(VecDeque::new);
+                entry.push_back((now, fr.rate));
+                self.prune_funding(now);
+            }
+            DataKind::Liquidation(liq) => {
+                let notional = liq.price * liq.quantity;
+                self.liq_notional.push_back((now, notional));
+                self.prune_liquidations(now);
+            }
+            _ => {}
+        }
+    }
+
+    fn snapshot(&mut self, now: DateTime<Utc>) -> SnapshotTicker {
+        self.prune_trade_volumes(now);
+        self.prune_cvd(now);
+        self.prune_oi(now);
+        self.prune_funding(now);
+        self.prune_liquidations(now);
+
+        let vol_5m = self.sum_window(&self.trade_volumes, now, 300);
+        let vol_1h = self.sum_window(&self.trade_volumes, now, 3600);
+        let rvol_5m = if vol_1h > 0.0 {
+            vol_5m / (vol_1h / 12.0)
+        } else {
+            0.0
+        };
+
+        let cvd_5m = self.cvd_delta(now, 300);
+        let cvd_15m = self.cvd_delta(now, 900);
+
+        let oi_delta_5m = self.oi_delta(now, 300);
+        let funding_rate = self.funding_latest();
+        let funding_velocity = self.funding_velocity(now, 900);
+        let liq_rate_usd_per_min = self.sum_window(&self.liq_notional, now, 60);
+
+        SnapshotTicker {
+            price: self.last_price,
+            cvd_5m,
+            cvd_15m,
+            rvol_5m,
+            oi_delta_5m,
+            funding_rate,
+            funding_velocity,
+            liq_rate_usd_per_min,
+            vol_percentile: 0.0,
+            vol_regime: "unknown".to_string(),
+        }
+    }
+
+    fn sum_window(&self, data: &VecDeque<(DateTime<Utc>, f64)>, now: DateTime<Utc>, window_secs: i64) -> f64 {
+        data.iter()
+            .filter(|(ts, _)| (now - *ts).num_seconds() <= window_secs)
+            .map(|(_, v)| *v)
+            .sum()
+    }
+
+    fn cvd_delta(&self, now: DateTime<Utc>, window_secs: i64) -> f64 {
+        let mut total = 0.0;
+        for points in self.cvd_by_exchange.values() {
+            if points.is_empty() {
+                continue;
+            }
+            let latest = points.back().map(|v| v.1).unwrap_or(0.0);
+            let earliest = points
+                .iter()
+                .find(|(ts, _)| (now - *ts).num_seconds() <= window_secs)
+                .map(|v| v.1)
+                .unwrap_or_else(|| points.front().map(|v| v.1).unwrap_or(latest));
+            total += latest - earliest;
+        }
+        total
+    }
+
+    fn oi_delta(&self, now: DateTime<Utc>, window_secs: i64) -> f64 {
+        let mut total = 0.0;
+        for points in self.oi_by_exchange.values() {
+            if points.is_empty() {
+                continue;
+            }
+            let latest = points.back().map(|v| v.1).unwrap_or(0.0);
+            let earliest = points
+                .iter()
+                .find(|(ts, _)| (now - *ts).num_seconds() <= window_secs)
+                .map(|v| v.1)
+                .unwrap_or_else(|| points.front().map(|v| v.1).unwrap_or(latest));
+            total += latest - earliest;
+        }
+        total
+    }
+
+    fn funding_latest(&self) -> f64 {
+        let mut total = 0.0;
+        let mut count = 0.0;
+        for points in self.funding_by_exchange.values() {
+            if let Some((_, rate)) = points.back() {
+                total += *rate;
+                count += 1.0;
+            }
+        }
+        if count > 0.0 { total / count } else { 0.0 }
+    }
+
+    fn funding_velocity(&self, now: DateTime<Utc>, window_secs: i64) -> f64 {
+        let mut total = 0.0;
+        let mut count = 0.0;
+        for points in self.funding_by_exchange.values() {
+            if points.is_empty() {
+                continue;
+            }
+            let latest = points.back().map(|v| v.1).unwrap_or(0.0);
+            let earliest = points
+                .iter()
+                .find(|(ts, _)| (now - *ts).num_seconds() <= window_secs)
+                .map(|v| v.1)
+                .unwrap_or_else(|| points.front().map(|v| v.1).unwrap_or(latest));
+            total += latest - earliest;
+            count += 1.0;
+        }
+        if count > 0.0 { total / count } else { 0.0 }
+    }
+
+    fn prune_trade_volumes(&mut self, now: DateTime<Utc>) {
+        Self::prune_queue(&mut self.trade_volumes, now, 3600);
+    }
+
+    fn prune_cvd(&mut self, now: DateTime<Utc>) {
+        for points in self.cvd_by_exchange.values_mut() {
+            Self::prune_queue(points, now, 900);
+        }
+    }
+
+    fn prune_oi(&mut self, now: DateTime<Utc>) {
+        for points in self.oi_by_exchange.values_mut() {
+            Self::prune_queue(points, now, 900);
+        }
+    }
+
+    fn prune_funding(&mut self, now: DateTime<Utc>) {
+        for points in self.funding_by_exchange.values_mut() {
+            Self::prune_queue(points, now, 900);
+        }
+    }
+
+    fn prune_liquidations(&mut self, now: DateTime<Utc>) {
+        Self::prune_queue(&mut self.liq_notional, now, 60);
+    }
+
+    fn prune_queue(queue: &mut VecDeque<(DateTime<Utc>, f64)>, now: DateTime<Utc>, window_secs: i64) {
+        while let Some((ts, _)) = queue.front() {
+            if (now - *ts).num_seconds() > window_secs {
+                queue.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 impl From<MarketEvent<MarketDataInstrument, DataKind>> for MarketEventMessage {
@@ -243,6 +487,8 @@ async fn main() {
     let (tx_l2, _) = broadcast::channel::<MarketEventMessage>(l2_buffer);
     let tx_l2 = Arc::new(tx_l2);
 
+    let snapshot_builder = Arc::new(tokio::sync::Mutex::new(SnapshotBuilder::new()));
+
     // Start WebSocket server
     // Configurable via WS_ADDR env var (default: 0.0.0.0:9001)
     let server_addr_str = std::env::var("WS_ADDR").unwrap_or_else(|_| "0.0.0.0:9001".to_string());
@@ -268,6 +514,35 @@ async fn main() {
         let tx_trades = tx_trades.clone();
         tokio::spawn(async move {
             start_deribit_options_feed(tx_trades).await;
+        });
+    }
+
+    {
+        let tx_trades = tx_trades.clone();
+        let snapshot_builder = Arc::clone(&snapshot_builder);
+        let snapshot_secs: u64 = std::env::var("SNAPSHOT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        tokio::spawn(async move {
+            let mut tick = interval(Duration::from_secs(snapshot_secs));
+            loop {
+                tick.tick().await;
+                let snapshot = snapshot_builder.lock().await.snapshot();
+                let event = MarketEventMessage {
+                    time_exchange: Utc::now(),
+                    time_received: Utc::now(),
+                    exchange: "barter-data-server".to_string(),
+                    instrument: InstrumentInfo {
+                        base: "ALL".to_string(),
+                        quote: "USD".to_string(),
+                        kind: "Snapshot".to_string(),
+                    },
+                    kind: "market_snapshot".to_string(),
+                    data: serde_json::to_value(&snapshot).unwrap_or_default(),
+                };
+                let _ = tx_trades.send(event);
+            }
         });
     }
 
@@ -300,6 +575,7 @@ async fn main() {
             }
             Event::Item(result) => match result {
                 Ok(market_event) => {
+                    snapshot_builder.lock().await.update(&market_event);
                     // Debug logging for large spot trades to verify spot streams
                     // Threshold configurable via SPOT_LOG_THRESHOLD env var (default: $50,000)
                     if let DataKind::Trade(trade) = &market_event.kind {
