@@ -21,7 +21,7 @@ use barter_trading_tuis::shared::{
     audit::AuditLogger,
     config::Config,
     deribit::DeribitRestClient,
-    market_state::{ConfigProvider, DeribitClient, State, TradingBias, TradMarketStatus, GammaPosition},
+    market_state::{ConfigProvider, DeribitClient, Direction as FlowDirection, State, TradingBias, TradMarketStatus},
     gamma::GammaCalculator,
     options_state::OptionsContextBuilder,
     orchestrator::StateOrchestrator,
@@ -563,23 +563,24 @@ fn render_market_state_panel(
                 ));
             }
 
-            // Gamma context (compact)
-            let gamma = &state.components.gamma_context;
-            if gamma.gamma_flip_price > 0.0 {
-                let pos_char = match gamma.position {
-                    GammaPosition::AboveFlip => "↑",
-                    GammaPosition::BelowFlip => "↓",
-                    GammaPosition::AtFlip => "~",
+            // Flow consensus direction (CVD-based) - compact header cue
+            let flow = &state.components.flow_consensus;
+            if flow.venues_total > 0 {
+                let pos_char = match flow.consensus_direction {
+                    FlowDirection::Long => "↑",
+                    FlowDirection::Short => "↓",
+                    FlowDirection::Neutral => "~",
                 };
                 spans.push(Span::styled(
-                    format!("γ{}", pos_char),
-                    Style::default().fg(Color::Magenta),
+                    format!("CVD{}", pos_char),
+                    Style::default().fg(Color::Cyan),
                 ));
             }
 
             // NO-GAMMA/NO-TRAD indicators
             if result.no_gamma_mode {
-                spans.push(Span::styled(" [NO-γ]", Style::default().fg(Color::DarkGray)));
+                // Options data unavailable/stale for this ticker
+                spans.push(Span::styled(" [NO-OPTS]", Style::default().fg(Color::DarkGray)));
             }
         } else {
             spans.push(Span::styled(

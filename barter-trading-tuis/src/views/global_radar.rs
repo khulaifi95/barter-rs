@@ -878,7 +878,7 @@ fn render_footer(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
             Span::styled(format!("{:?}", result.state.state), Style::default().fg(state_color)),
             Span::raw(" | "),
             Span::styled(
-                if result.no_gamma_mode { "NO-γ" } else { "γ-OK" },
+                if result.no_gamma_mode { "NO-OPTS" } else { "OPTS-OK" },
                 Style::default().fg(if result.no_gamma_mode { Color::Yellow } else { Color::Green }),
             ),
             Span::raw(" | "),
@@ -904,7 +904,7 @@ fn warning_label(warn: &Warning) -> String {
         Warning::SingleVenueDisagreeing { venue } => format!("{} ✗", venue),
         Warning::LowLiquiditySession => "Low Liq".to_string(),
         Warning::StaleData { signal, .. } => format!("{:?} stale", signal),
-        Warning::NoGammaData => "NO-γ".to_string(),
+        Warning::NoGammaData => "NO-OPTS".to_string(),
         Warning::NoTradMarketsData => "NO-T".to_string(),
         Warning::ExpiryBucketConflict => "Bucket ⚠".to_string(),
     }
