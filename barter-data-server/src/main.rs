@@ -97,6 +97,25 @@ struct TradMarketTick {
     ask: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OptionsChainMessage {
+    contracts: Vec<OptionContract>,
+    timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OptionContract {
+    instrument_name: String,
+    strike: f64,
+    expiry: i64,
+    is_call: bool,
+    open_interest: f64,
+    mark_iv: f64,
+    delta: f64,
+    gamma: f64,
+    vega: f64,
+}
+
 impl From<MarketEvent<MarketDataInstrument, DataKind>> for MarketEventMessage {
     fn from(event: MarketEvent<MarketDataInstrument, DataKind>) -> Self {
         let (kind_name, data) = match &event.kind {
@@ -159,6 +178,41 @@ enum IbkrMessage {
     Status { #[serde(default)] connected: Option<bool> },
 }
 
+#[derive(Debug, Deserialize)]
+struct DeribitResponse<T> {
+    result: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeribitInstrument {
+    instrument_name: String,
+    strike: f64,
+    expiration_timestamp: i64,
+    option_type: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct DeribitBookSummary {
+    instrument_name: String,
+    open_interest: Option<f64>,
+    mark_iv: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeribitGreeks {
+    delta: f64,
+    gamma: f64,
+    vega: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeribitTicker {
+    instrument_name: String,
+    open_interest: Option<f64>,
+    mark_iv: Option<f64>,
+    greeks: Option<DeribitGreeks>,
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize logging
@@ -206,6 +260,14 @@ async fn main() {
         let tx_trades = tx_trades.clone();
         tokio::spawn(async move {
             start_ibkr_bridge_feed(tx_trades).await;
+        });
+    }
+
+    // Deribit options feed (options_chain events)
+    {
+        let tx_trades = tx_trades.clone();
+        tokio::spawn(async move {
+            start_deribit_options_feed(tx_trades).await;
         });
     }
 
@@ -527,6 +589,202 @@ async fn start_ibkr_bridge_feed(tx_trades: Arc<broadcast::Sender<MarketEventMess
 
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+async fn start_deribit_options_feed(tx_trades: Arc<broadcast::Sender<MarketEventMessage>>) {
+    if std::env::var("DERIBIT_ENABLED")
+        .ok()
+        .map(|v| matches!(v.as_str(), "0" | "false" | "FALSE"))
+        .unwrap_or(false)
+    {
+        info!("Deribit options feed disabled (DERIBIT_ENABLED=0)");
+        return;
+    }
+
+    let base_url = std::env::var("DERIBIT_API_BASE")
+        .unwrap_or_else(|_| "https://www.deribit.com/api/v2/public".to_string());
+    let tickers = std::env::var("DERIBIT_TICKERS").unwrap_or_else(|_| "BTC,ETH".to_string());
+    let top_n: usize = std::env::var("DERIBIT_GREEKS_TOP_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let refresh_secs: u64 = std::env::var("DERIBIT_REFRESH_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+
+    let client = Client::new();
+    let ticker_list: Vec<String> = tickers
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    info!(
+        "Deribit options feed enabled: {} (tickers: {:?}, refresh: {}s, greeks: top {})",
+        base_url, ticker_list, refresh_secs, top_n
+    );
+
+    let mut interval = interval(Duration::from_secs(refresh_secs));
+    loop {
+        interval.tick().await;
+        for ticker in &ticker_list {
+            match fetch_deribit_options_chain(&client, &base_url, ticker, top_n).await {
+                Ok(chain) => {
+                    let event = MarketEventMessage {
+                        time_exchange: Utc::now(),
+                        time_received: Utc::now(),
+                        exchange: "Deribit".to_string(),
+                        instrument: InstrumentInfo {
+                            base: ticker.clone(),
+                            quote: "USD".to_string(),
+                            kind: "Options".to_string(),
+                        },
+                        kind: "options_chain".to_string(),
+                        data: serde_json::to_value(&chain).unwrap_or_default(),
+                    };
+                    let _ = tx_trades.send(event);
+                }
+                Err(e) => {
+                    warn!("Deribit options fetch failed for {}: {}", ticker, e);
+                }
+            }
+        }
+    }
+}
+
+async fn fetch_deribit_options_chain(
+    client: &Client,
+    base_url: &str,
+    currency: &str,
+    top_n: usize,
+) -> Result<OptionsChainMessage, String> {
+    let instruments = fetch_deribit_instruments(client, base_url, currency).await?;
+    let summaries = fetch_deribit_book_summaries(client, base_url, currency).await?;
+
+    let mut summary_map: HashMap<String, DeribitBookSummary> = HashMap::new();
+    for summary in summaries {
+        summary_map.insert(summary.instrument_name.clone(), summary);
+    }
+
+    let mut contracts: Vec<OptionContract> = Vec::with_capacity(instruments.len());
+    for instrument in instruments {
+        let summary = summary_map
+            .get(&instrument.instrument_name)
+            .cloned()
+            .unwrap_or(DeribitBookSummary {
+                instrument_name: instrument.instrument_name.clone(),
+                open_interest: Some(0.0),
+                mark_iv: Some(0.0),
+            });
+
+        let is_call = instrument.option_type.to_lowercase() == "call";
+        contracts.push(OptionContract {
+            instrument_name: instrument.instrument_name,
+            strike: instrument.strike,
+            expiry: instrument.expiration_timestamp,
+            is_call,
+            open_interest: summary.open_interest.unwrap_or(0.0),
+            mark_iv: summary.mark_iv.unwrap_or(0.0),
+            delta: 0.0,
+            gamma: 0.0,
+            vega: 0.0,
+        });
+    }
+
+    contracts.sort_by(|a, b| b.open_interest.partial_cmp(&a.open_interest).unwrap_or(std::cmp::Ordering::Equal));
+    let top_instruments: Vec<String> = contracts
+        .iter()
+        .take(top_n)
+        .map(|c| c.instrument_name.clone())
+        .collect();
+
+    let mut greeks_map: HashMap<String, DeribitGreeks> = HashMap::new();
+    let mut futures = Vec::with_capacity(top_instruments.len());
+    for instrument_name in top_instruments {
+        futures.push(fetch_deribit_ticker(client, base_url, instrument_name));
+    }
+
+    for result in futures::future::join_all(futures).await {
+        if let Ok(ticker) = result {
+            if let Some(greeks) = ticker.greeks {
+                greeks_map.insert(ticker.instrument_name, greeks);
+            }
+        }
+    }
+
+    for contract in &mut contracts {
+        if let Some(greeks) = greeks_map.get(&contract.instrument_name) {
+            contract.delta = greeks.delta;
+            contract.gamma = greeks.gamma;
+            contract.vega = greeks.vega;
+        }
+    }
+
+    Ok(OptionsChainMessage {
+        contracts,
+        timestamp: Utc::now().timestamp_millis(),
+    })
+}
+
+async fn fetch_deribit_instruments(
+    client: &Client,
+    base_url: &str,
+    currency: &str,
+) -> Result<Vec<DeribitInstrument>, String> {
+    let url = format!(
+        "{}/get_instruments?currency={}&kind=option&expired=false",
+        base_url, currency
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json::<DeribitResponse<Vec<DeribitInstrument>>>()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(resp.result)
+}
+
+async fn fetch_deribit_book_summaries(
+    client: &Client,
+    base_url: &str,
+    currency: &str,
+) -> Result<Vec<DeribitBookSummary>, String> {
+    let url = format!(
+        "{}/get_book_summary_by_currency?currency={}&kind=option",
+        base_url, currency
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json::<DeribitResponse<Vec<DeribitBookSummary>>>()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(resp.result)
+}
+
+async fn fetch_deribit_ticker(
+    client: &Client,
+    base_url: &str,
+    instrument_name: String,
+) -> Result<DeribitTicker, String> {
+    let url = format!(
+        "{}/ticker?instrument_name={}",
+        base_url, instrument_name
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json::<DeribitResponse<DeribitTicker>>()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(resp.result)
 }
 
 /// Handle individual WebSocket client connection
