@@ -5,6 +5,7 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Market event message envelope from the server
 ///
@@ -35,6 +36,27 @@ pub struct MarketEventEnvelope {
     pub source: String,
     pub time_sent: DateTime<Utc>,
     pub payload: MarketEventMessage,
+}
+
+/// Derived metrics snapshot from the centralized server.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MarketSnapshotMessage {
+    pub timestamp: i64,
+    pub tickers: HashMap<String, SnapshotTicker>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SnapshotTicker {
+    pub price: f64,
+    pub cvd_5m: f64,
+    pub cvd_15m: f64,
+    pub rvol_5m: f64,
+    pub oi_delta_5m: f64,
+    pub funding_rate: f64,
+    pub funding_velocity: f64,
+    pub liq_rate_usd_per_min: f64,
+    pub vol_percentile: f64,
+    pub vol_regime: String,
 }
 
 /// Instrument information

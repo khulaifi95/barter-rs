@@ -126,6 +126,7 @@ pub mod error;
 
 /// Defines the generic [`MarketEvent<T>`](MarketEvent) used in every [`MarketStream`].
 pub mod event;
+pub mod snapshot;
 
 /// [`Connector`] implementations for each exchange.
 pub mod exchange;
