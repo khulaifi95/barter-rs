@@ -14,7 +14,7 @@ clean git tree and a commit recorded here.
 
 - [x] A1: Add versioned message envelope in barter-data (schema version, source, timestamp). (commit: 25ecee2)
 - [x] A2: Feature flags in TUIs to prefer server data but allow fallback to direct fetch. (commit: 41282e9)
-- [ ] A3: Shadow-mode logging for new event types without UI changes. (commit: )
+- [x] A3: Shadow-mode logging for new event types without UI changes. (commit: b1689d8)
 
 ## Phase B — Centralize External Sources (raw feeds)
 
