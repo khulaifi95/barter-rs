@@ -32,7 +32,7 @@ clean git tree and a commit recorded here.
 
 - [x] D1: Remove direct Deribit/IBKR connections from TUIs. (commit: 1c5af02)
 - [x] D2: Remove per-TUI rolling windows or guard behind debug flags. (commit: 4194ebe)
-- [ ] D3: Lock thresholds and finalize docs. (commit: )
+- [x] D3: Lock thresholds and finalize docs. (commit: 3b9c28a)
 
 ## Phase E — TUI Harmonization
 
