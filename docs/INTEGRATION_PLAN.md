@@ -36,9 +36,9 @@ clean git tree and a commit recorded here.
 
 ## Phase E — TUI Harmonization
 
-- [ ] E1: Trading-terminal as macro cockpit. (commit: )
-- [ ] E2: scalper_v2 as execution cockpit. (commit: )
-- [ ] E3: micro-structure as deep-dive/debug. (commit: )
+- [x] E1: Trading-terminal as macro cockpit. (commit: 7ffaa6e)
+- [x] E2: scalper_v2 as execution cockpit. (commit: 7ffaa6e)
+- [x] E3: micro-structure as deep-dive/debug. (commit: 7ffaa6e)
 
 ## Build/Test Gates
 
