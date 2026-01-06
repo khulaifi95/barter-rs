@@ -16,14 +16,14 @@
 | ❌ Complex Liquidation Heatmap | Defer to future. Use simple OI-based "Warning" only |
 | ❌ On-chain data | Too slow for microstructure |
 | ❌ Historical liquidation levels | Over-engineered before proving edge |
-| ❌ Z-Score for volatility | Use Rolling 7-Day Percentile instead (fat-tail robust) |
+| ❌ Z-Score only (no percentile) | Use **Dual-Vol**: 7-day percentile + 1m z-score |
 
 ### ELEVATED / CONFIRMED P0
 | Item | Reason |
 |------|--------|
 | ✅ Options Integration (Phase 2) | Gamma Flip is structural physics, not optional |
 | ✅ Dynamic Gamma Flip | Must account for IV shifts, not static OI |
-| ✅ Volatility Percentile | 7-day rolling rank, more robust than Z-score |
+| ✅ Dual-Vol Regime | 7-day percentile + 1m z-score shock (both required) |
 | ✅ Non-blocking Audit | mpsc channel, never block hot path |
 
 ### AUDIT LAYER CLARIFICATION
@@ -76,7 +76,7 @@ L1: REGIME FILTER  →  "Can I trade at all?"
          ↓
 L2: BIAS FILTER    →  "Which direction makes sense?"
          ↓
-L3: TRIGGER        →  "Is now the right time?"
+L3: TRIGGER + FUEL →  "Is now the right time and is the move real?"
          ↓
     STATE OUTPUT   →  WAIT / READY / CAUTION
 ```
@@ -97,8 +97,9 @@ If L1 fails, don't even evaluate L2. This prevents false positives.
 | F4 | Produce single MarketState output (WAIT/READY/CAUTION) | P0 |
 | F5 | Log every state transition to audit file (JSONL) | P0 |
 | F6 | Show confidence breakdown (why this state?) | P0 |
-| F7 | Detect liquidation clusters from OI distribution | P1 |
-| F8 | Session context (Asia/EU/US weighting) | P2 |
+| F7 | L3 Fuel quality gate (RVOL + OI delta + liquidation rate) | P0 |
+| F8 | Detect liquidation clusters from OI distribution | P1 |
+| F9 | Session context (Asia/EU/US weighting) | P2 |
 
 ### 2.2 Non-Functional Requirements
 
@@ -117,6 +118,30 @@ If L1 fails, don't even evaluate L2. This prevents false positives.
 - ❌ Auto-execution (signals only)
 
 ---
+
+## 2.4 Implementation Status (Current)
+
+### Implemented (in code)
+- **L3 Fuel gate**: RVOL (5m vs 1h), OI delta (5m, USD), liquidation rate (USD/min) integrated into state machine.
+- **Funding velocity**: 15m rate change wired from rolling funding history (per-exchange average).
+- **L3 UI split**: Trigger (consensus/absorption/funding) + Fuel (RVOL/OI/Liq) with icon status.
+- **L2 imbalance + walls**: smoothed BID/ASK ratio, top 2 bid/ask walls within band.
+- **Options context**: GEX/DEX/VEX, gamma flip, max pain, put/call walls, bucket summaries.
+- **Liquidation thresholds**: calibrated to real-world rates (LOW < 150K/min, EXHT > 2M/min).
+- **Config-driven thresholds**: all fuel thresholds live in `config/thresholds.toml`.
+
+### Pending / Gaps
+- **True 7-day percentile**: VolRegimeEngine exists but not yet wired into runtime (currently trend->percentile mapping).
+- **TradFi consolidation**: IBKR/TradFi feeds are not centralized in barter-data-server (see Section 3.3).
+- **Single source of truth**: TUIs compute rolling windows independently; snapshots can drift.
+
+### Planned (Migration)
+- Centralize **TradFi + Deribit options** into barter-data-server for consistent snapshots across TUIs.
+- Replace trend-based percentile with **VolRegimeEngine** (168 hourly samples + 60 1m returns).
+
+### Review Checkpoints (Thresholds)
+- **Pre-centralization:** Re-validate RVOL/OI/liquidation/funding thresholds against live data in each TUI to ensure no drift.
+- **Post-centralization:** Recalibrate using unified snapshots (single source of truth) and lock thresholds for production runs.
 
 ## 3. Architecture
 
@@ -150,7 +175,7 @@ If L1 fails, don't even evaluate L2. This prevents false positives.
 │  │   • Look for continuation setups                    │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                          ↓                                  │
-│  L3: TRIGGER (Execution Gate)                              │
+│  L3: TRIGGER (Consensus Gate)                             │
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │ Does flow confirm the bias?                          │   │
 │  │                                                      │   │
@@ -158,11 +183,22 @@ If L1 fails, don't even evaluate L2. This prevents false positives.
 │  │  • CVD consensus (2/3+ venues agree)                │   │
 │  │  • Funding velocity (not spiking against us)        │   │
 │  │  • No absorption detected                           │   │
-│  │                                                      │   │
-│  │ ALL PASS → READY                                    │   │
-│  │ PARTIAL  → CAUTION                                  │   │
-│  │ FAIL     → WAIT                                     │   │
 │  └─────────────────────────────────────────────────────┘   │
+│                          ↓                                  │
+│  L3: FUEL (Quality Gate)                                   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Is the move real (not just a squeeze)?               │   │
+│  │                                                      │   │
+│  │ Check:                                               │   │
+│  │  • RVOL (5m vs 1h baseline)                          │   │
+│  │  • OI delta (bias-aware)                             │   │
+│  │  • Liquidation rate (exhaustion filter)              │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                          ↓                                  │
+│  L3 RESULT:                                                │
+│   • READY if Trigger + Fuel both pass                    │
+│   • CAUTION if either is partial                         │
+│   • WAIT if either fails                                 │
 │                          ↓                                  │
 │  OUTPUT: MarketState { state, bias, confidence, reasons }  │
 │                                                             │
@@ -174,19 +210,20 @@ If L1 fails, don't even evaluate L2. This prevents false positives.
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                         DATA SOURCES                              │
-├──────────────┬──────────────┬──────────────┬────────────────────┤
-│   Binance    │    Bybit     │     OKX      │      Deribit       │
-│   (spot+perp)│   (perp)     │    (perp)    │     (options)      │
-└──────┬───────┴──────┬───────┴──────┬───────┴─────────┬──────────┘
-       │              │              │                 │
-       ▼              ▼              ▼                 ▼
+├──────────────┬──────────────┬──────────────┬──────────────┬──────────────┤
+│   Binance    │    Bybit     │     OKX      │    Deribit   │    IBKR      │
+│   (spot+perp)│   (perp)     │    (perp)    │   (options)  │   (ES/NQ)    │
+└──────┬───────┴──────┬───────┴──────┬───────┴──────┬───────┴──────┬───────┘
+       │              │              │              │              │
+       ▼              ▼              ▼              ▼              ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                      MARKET SNAPSHOT                              │
-│  • Per-venue: price, L2, CVD, flow imbalance, OI                 │
+│  • Per-venue: price, L2, CVD, flow imbalance, OI                  │
 │  • Aggregated: consensus, whale flow, spread                      │
-│  • Options: GEXP, gamma flip, max pain, walls                    │
-│  • Volatility: ATR, RV, BVOL, historical percentile              │
-│  • Funding: current rate, 15m velocity                           │
+│  • Options: GEX/DEX/VEX, gamma flip, max pain, walls              │
+│  • Volatility: ATR, RV, percentile, 1m z-score                    │
+│  • Funding: current rate + 15m velocity                           │
+│  • Fuel: RVOL (5m vs 1h), OI delta (USD), liq rate (USD/min)       │
 └──────────────────────────┬───────────────────────────────────────┘
                            │
                            ▼
@@ -202,6 +239,16 @@ If L1 fails, don't even evaluate L2. This prevents false positives.
 │  (render state)         │  │  (audit.jsonl)          │
 └─────────────────────────┘  └─────────────────────────┘
 ```
+
+### 3.3 Centralized Data Plan (TradFi + Options)
+
+**Current**: each TUI builds its own rolling snapshot from the WS feed; Deribit + IBKR are fetched directly by some binaries.  
+**Planned**: barter-data-server becomes the single aggregation hub for:
+- Crypto perps (Binance/Bybit/OKX)
+- Options (Deribit: gamma/GEX/DEX/VEX, walls, max pain)
+- TradFi (IBKR ES/NQ)
+
+**Goal**: one authoritative snapshot stream so all TUIs show the same state.
 
 ---
 
@@ -270,6 +317,10 @@ pub struct StateComponents {
     // L3: Triggers
     pub flow_consensus: FlowScore,
     pub funding_context: FundingScore,
+    pub fuel_context: FuelScore,
+
+    // Options context (if available)
+    pub options_context: Option<OptionsSummary>,
 
     // Warnings (don't block, but flag)
     pub warnings: Vec<Warning>,
@@ -280,6 +331,8 @@ pub struct VolRegimeScore {
     pub current_rv: f64,
     pub percentile: f64,        // 0-100, vs 7-day history
     pub regime: VolRegime,
+    pub zscore_1m: f64,         // 1m return z-score
+    pub is_shock: bool,
     pub passed: bool,           // Did it pass the filter?
 }
 
@@ -328,12 +381,40 @@ pub struct FundingScore {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct FuelInput {
+    pub rvol_5m: f64,            // vol_5m / (vol_1h / 12)
+    pub oi_delta_usd_5m: f64,    // OI delta (USD)
+    pub liq_rate_usd_per_min: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FuelScore {
+    pub rvol: f64,
+    pub rvol_status: RvolStatus,
+    pub oi_delta_usd_5m: f64,
+    pub oi_trend: OiTrend,
+    pub liq_rate_usd_per_min: f64,
+    pub liq_state: LiqState,
+    pub quality: FuelQuality,
+    pub passed: bool,
+}
+
+pub enum FuelQuality { High, Medium, Low, Fail }
+pub enum RvolStatus { Strong, Normal, Thin, Fail }
+pub enum OiTrend { NewMoney, Squeeze, Flat }
+pub enum LiqState { Low, Moderate, High, Exhaustion }
+
+#[derive(Debug, Clone, Serialize)]
 pub enum Warning {
     ApproachingGammaFlip { distance_pct: f64 },
     FundingElevated { rate: f64 },
     LiquidationClusterNearby { price: f64, size_usd: f64 },
     SingleVenueDisagreeing { venue: String },
     LowLiquiditySession,
+    StaleData { signal: Signal, age_ms: u64 },
+    NoGammaData,
+    NoTradMarketsData,
+    ExpiryBucketConflict,
 }
 ```
 
@@ -345,6 +426,10 @@ pub enum Warning {
 pub struct OptionsContext {
     /// Net gamma exposure in USD
     pub gexp: f64,
+    /// Net delta exposure in USD
+    pub dexp: f64,
+    /// Net vega exposure in USD
+    pub vexp: f64,
     /// The critical level: where gamma flips sign
     pub gamma_flip_price: f64,
     /// Max pain strike (price magnet near expiry)
@@ -353,6 +438,10 @@ pub struct OptionsContext {
     pub put_wall: Option<OptionsWall>,
     /// Nearest significant call wall (resistance)
     pub call_wall: Option<OptionsWall>,
+    /// Put/Call OI ratio
+    pub put_call_oi_ratio: f64,
+    /// Expiry buckets (0-7d / 7-30d / 30d+)
+    pub buckets: Vec<BucketSummary>,
     /// Hours until next major expiry
     pub hours_to_expiry: f64,
     /// Data freshness
@@ -365,6 +454,19 @@ pub struct OptionsWall {
     pub notional_usd: f64,
     pub distance_pct: f64,
 }
+
+pub struct BucketSummary {
+    pub label: String,          // "0-7d", "7-30d", "30d+"
+    pub gamma_flip: f64,
+    pub max_pain: f64,
+    pub put_wall: Option<OptionsWall>,
+    pub call_wall: Option<OptionsWall>,
+    pub gex: f64,
+    pub dex: f64,
+    pub put_call_ratio: f64,
+    pub hours_to_expiry: f64,
+    pub is_front: bool,
+}
 ```
 
 ---
@@ -372,6 +474,8 @@ pub struct OptionsWall {
 ## 5. Wireframes
 
 ### 5.1 Global Radar View (Primary)
+
+**Note:** Current implementation splits L3 into **TRIGGER** (consensus/timing) and **FUEL** (RVOL/OI/Liq quality). Wireframes below should be read with that split in mind.
 
 ```
 ┌─ TRADING TERMINAL ──────────────────────────────────────────────────────────┐
@@ -488,7 +592,7 @@ pub struct OptionsWall {
 | Task | File | Description |
 |------|------|-------------|
 | 1.1 | `src/shared/market_state.rs` | Core types: MarketState, State, TradingBias, Direction |
-| 1.2 | `src/shared/market_state.rs` | Component types: VolRegimeScore, GammaScore, FlowScore, FundingScore |
+| 1.2 | `src/shared/market_state.rs` | Component types: VolRegimeScore, GammaScore, FlowScore, FundingScore, FuelScore |
 | 1.3 | `src/shared/market_state.rs` | `calculate_state()` with hierarchical KILL logic |
 | 1.4 | `src/shared/vol_regime.rs` | **Percentile-based** regime (7-day rolling rank, NOT z-score) |
 | 1.5 | `src/shared/audit.rs` | Non-blocking JSONL logger (mpsc channel, bounded 10K) |
@@ -498,7 +602,7 @@ pub struct OptionsWall {
 ```rust
 // L1: If Vol > 95th percentile → WAIT (full stop, don't evaluate L2/L3)
 // L2: Price vs Gamma Flip → determines BIAS (MeanReversion vs Momentum)
-// L3: CVD consensus (2/3 venues) + Funding velocity → READY or CAUTION
+// L3: CVD consensus + funding velocity + fuel gate (RVOL/OI/Liq) → READY/CAUTION
 ```
 
 **Deliverable:** `MarketState::calculate()` produces WAIT/READY/CAUTION with auditable reasons.
@@ -525,10 +629,13 @@ pub struct OptionsWall {
 |------|------|-------------|
 | 3.1 | `src/shared/funding.rs` | FundingTracker with 15m ring buffer |
 | 3.2 | `src/shared/funding.rs` | Velocity calc: `Δ funding > 0.02%/15m` = spike |
-| 3.3 | Integration | Wire funding into L3 trigger |
-| 3.4 | Integration | CVD consensus: require 2/3 venues to agree |
+| 3.3 | Integration | RVOL calculation (5m vs 1h) |
+| 3.4 | Integration | OI delta (USD, 5m) + trend classification |
+| 3.5 | Integration | Liquidation rate (USD/min) + state classification |
+| 3.6 | Integration | L3 Trigger (CVD + funding + absorption) + L3 Fuel gate |
+| 3.7 | Integration | CVD consensus: require 2/3 venues to agree |
 
-**Deliverable:** Funding spike triggers CAUTION. CVD consensus gates READY.
+**Deliverable:** L3 Trigger + Fuel gates drive READY/CAUTION/WAIT using consensus + funding + RVOL/OI/Liq.
 
 ### Phase 4: Unified TUI (P0)
 **Duration: 3-4 days**
@@ -860,7 +967,7 @@ Every signal has a **maximum allowed staleness**. If exceeded, the signal is mar
 | Funding Rate | 5 minutes | Use last known value |
 | Gamma Flip (Deribit) | 10 minutes | **NO-GAMMA mode** - proceed without L2 bias |
 | ES/NQ (Trad Markets) | 2 minutes | **NO-TRAD mode** - bypass macro filter |
-| Volatility History | 1 hour | Use default 50th percentile |
+| Volatility History | 1 hour | Fallback to trend-based percentile until VolRegimeEngine wired |
 
 ### 9.2 NO-TRAD Fallback Mode
 
@@ -995,7 +1102,15 @@ min_agreement_pct = 66     # 2/3 venues must agree
 [funding]
 spike_threshold = 0.0002   # 0.02% velocity = spike
 extreme_long = 0.0005      # >0.05% = extreme
-extreme_short = -0.0002    # <-0.02% = extreme
+extreme_short = -0.0001    # <-0.01% = extreme
+
+[fuel]
+rvol_pass = 1.2            # >= 1.2x = healthy volume
+rvol_caution = 0.8         # 0.8-1.0x = thin volume
+oi_momentum_fail_usd = -15000000   # <= -$15M = squeeze risk (momentum)
+oi_momentum_caution_usd = -5000000 # <= -$5M = caution (momentum)
+liq_caution_usd_per_min = 150000   # >= $150K/min = caution (elevated)
+liq_fail_usd_per_min = 2000000     # >= $2M/min = exhaustion
 
 [freshness_ms]
 price = 1000

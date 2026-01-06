@@ -33,6 +33,7 @@ pub struct CorrelationSignals {
     // Lead/Lag
     pub lead_lag_bars: i32,   // Positive = ES leads
     pub lead_lag_secs: i32,   // In seconds for display
+    pub lead_lag_corr: Option<f64>,
 
     // Derived
     pub eq_sync: bool,        // ES/NQ corr > 0.85
@@ -170,10 +171,11 @@ impl TradMarketState {
         let divergence_z = calc_divergence_zscore(btc_es_spread, &self.spread_history);
 
         // Lead/lag (max 6 bars = 30 seconds)
-        let (lead_lag_bars, _) = if es_returns.len() >= 5 && btc_returns.len() >= 5 {
-            calc_lead_lag(&es_returns, &btc_returns, 6)
+        let (lead_lag_bars, lead_lag_corr) = if es_returns.len() >= 5 && btc_returns.len() >= 5 {
+            let (lag, corr) = calc_lead_lag(&es_returns, &btc_returns, 6);
+            (lag, Some(corr))
         } else {
-            (0, 0.0)
+            (0, None)
         };
         let lead_lag_secs = lead_lag_bars * 5;  // Convert to seconds
 
@@ -204,6 +206,7 @@ impl TradMarketState {
             divergence_z,
             lead_lag_bars,
             lead_lag_secs,
+            lead_lag_corr,
             eq_sync,
             es_bars_count: self.es_bars.len(),
             nq_bars_count: self.nq_bars.len(),

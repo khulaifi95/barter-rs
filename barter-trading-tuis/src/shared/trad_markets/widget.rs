@@ -131,14 +131,20 @@ pub fn render_trad_markets_panel(
     // Card values
     let es_nq_val = signals.es_nq_corr.map(|c| format!("{:.2}", c)).unwrap_or("--".to_string());
     let es_btc_val = signals.es_btc_corr.map(|c| format!("{:.2}", c)).unwrap_or("--".to_string());
-    let lead_val = if signals.lead_lag_secs > 0 {
+    let lead_corr_ok = signals
+        .lead_lag_corr
+        .map(|c| c.abs() >= 0.50)
+        .unwrap_or(false);
+    let lead_val = if !lead_corr_ok {
+        "N/A".to_string()
+    } else if signals.lead_lag_secs > 0 {
         "ES".to_string()
     } else if signals.lead_lag_secs < 0 {
         "BTC".to_string()
     } else {
         "SYNC".to_string()
     };
-    let lead_time = if signals.lead_lag_secs != 0 {
+    let lead_time = if lead_corr_ok && signals.lead_lag_secs != 0 {
         format!("+{}s", signals.lead_lag_secs.abs())
     } else {
         "".to_string()

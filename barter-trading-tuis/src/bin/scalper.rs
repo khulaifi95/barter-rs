@@ -1549,6 +1549,19 @@ fn render_header_compact_new(
         let spread_pct = t.latest_spread_pct.unwrap_or(0.0);
         let basis = t.basis.as_ref().map(|b| b.basis_pct).unwrap_or(0.0);
         let tps = t.trade_speed;
+        let (lag_str, lag_color) = match t.trade_lag_secs {
+            Some(lag) => {
+                let color = if lag < 2.0 {
+                    Color::Green
+                } else if lag < 10.0 {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                };
+                (format!("Lag:{:.0}s", lag), color)
+            }
+            None => ("Lag:--".to_string(), Color::DarkGray),
+        };
 
         // Fair value deviation (bps) if available
         let fv_span = t.fair_value_deviation_bps.map(|bps| {
@@ -1601,6 +1614,8 @@ fn render_header_compact_new(
         spans.push(Span::styled(format!("[{}]", status), Style::default().fg(status_color)));
         spans.push(Span::raw("  "));
         spans.push(Span::styled(format!("{:.0}t/s", tps), Style::default().fg(Color::Cyan)));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(lag_str, Style::default().fg(lag_color)));
         spans.push(Span::raw("  "));
         spans.push(Span::styled(format!("Sprd:{:.2}%", spread_pct), Style::default().fg(Color::Gray)));
         spans.push(Span::raw("  "));

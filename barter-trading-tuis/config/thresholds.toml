@@ -1,0 +1,83 @@
+# Market State Engine Configuration
+# Single source of truth for all thresholds
+# See docs/market_state.md Section 11 for documentation
+
+# =============================================================================
+# VOLATILITY THRESHOLDS (L1 Regime Filter)
+# =============================================================================
+[volatility]
+percentile_extreme = 95    # L1 kill threshold - WAIT if >= this
+percentile_high = 80       # Caution threshold - CAUTION if >= this
+zscore_shock = 3.5         # Flash crash threshold - WAIT if abs(zscore) >= this
+
+# =============================================================================
+# CONSENSUS THRESHOLDS (L3 Flow Filter)
+# =============================================================================
+[consensus]
+min_agreement_pct = 66     # 2/3 venues must agree for READY
+
+# =============================================================================
+# FUNDING THRESHOLDS (L3 Funding Filter)
+# =============================================================================
+[funding]
+spike_threshold = 0.0002   # 0.02% velocity in 15m = spike -> CAUTION
+extreme_long = 0.0005      # >0.05% funding = extreme long -> Warning
+extreme_short = -0.0001    # <-0.01% funding = extreme short -> Warning
+
+# =============================================================================
+# FUEL THRESHOLDS (L3 Quality Filter)
+# =============================================================================
+[fuel]
+rvol_pass = 1.2            # >= 1.2x = healthy volume
+rvol_caution = 0.8         # 0.8-1.0x = thin volume
+oi_momentum_fail_usd = -15000000   # <= -$15M = squeeze risk (momentum)
+oi_momentum_caution_usd = -5000000 # <= -$5M = caution (momentum)
+liq_caution_usd_per_min = 150000   # >= $150K/min = caution (elevated)
+liq_fail_usd_per_min = 2000000     # >= $2M/min = exhaustion
+
+# =============================================================================
+# FRESHNESS THRESHOLDS (Data Staleness Gates)
+# All values in milliseconds
+# =============================================================================
+[freshness_ms]
+price = 1000               # 1 second - WAIT if stale
+cvd = 2000                 # 2 seconds - WAIT if stale
+l2_book = 2000             # 2 seconds - use last known if stale
+whale = 10000              # 10 seconds - ignore filter if stale
+funding = 300000           # 5 minutes - use last known if stale
+gamma = 600000             # 10 minutes - NO-GAMMA mode if stale
+trad_markets = 120000      # 2 minutes - NO-TRAD mode if stale
+
+# =============================================================================
+# GAMMA THRESHOLDS (L2 Bias Filter)
+# =============================================================================
+[gamma]
+flip_buffer_pct = 0.5      # Within 0.5% of flip = AT_FLIP (uncertain zone)
+
+# =============================================================================
+# AUDIT CONFIGURATION
+# =============================================================================
+[audit]
+channel_size = 10000       # Bounded mpsc buffer - drop logs if full
+log_dir = "logs/audit"     # Audit log directory
+rotation_mb = 500          # Rotate file at 500MB
+retention_days = 30        # Keep logs for 30 days
+
+# =============================================================================
+# PER-TICKER OVERRIDES
+# Precedence: ticker-specific > default
+# Only specify fields that differ from defaults
+# =============================================================================
+
+[ticker.BTC]
+# BTC uses all defaults - no overrides needed
+
+[ticker.ETH]
+# ETH tends to have higher funding extremes
+[ticker.ETH.funding]
+extreme_long = 0.0008      # ETH tolerates higher positive funding
+
+[ticker.SOL]
+# SOL is more volatile, use stricter threshold
+[ticker.SOL.volatility]
+percentile_extreme = 90    # Trigger WAIT earlier for SOL

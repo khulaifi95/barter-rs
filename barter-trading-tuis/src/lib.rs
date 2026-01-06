@@ -10,6 +10,7 @@
 /// - WebSocket client for connecting to the aggregated server
 /// - Aggregation utilities for market data analysis
 pub mod shared;
+pub mod views;
 
 // Re-export commonly used types for convenience
 pub use shared::types::{
@@ -27,6 +28,9 @@ pub use shared::trad_markets::{
     CorrelationSignals, IbkrConnectionStatus, TradMarketState,
     render_trad_markets_panel, spawn_ibkr_feed,
 };
+
+// Market State Engine - orchestrator result for TUI display
+pub use shared::orchestrator::OrchestratorResult;
 
 // Aggregation engine (shared across all TUIs)
 pub use shared::state::{

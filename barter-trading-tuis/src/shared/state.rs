@@ -13,6 +13,18 @@ use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 
+const L2_IMBALANCE_BAND_PCT: f64 = 0.025; // +/-2.5% band (adjustable)
+const L2_WALL_MIN_DISTANCE_PCT: f64 = 0.10; // ignore near-top-of-book noise
+const BTC_WALL_SMALL: f64 = 100.0;
+const BTC_WALL_NORMAL: f64 = 250.0;
+const BTC_WALL_LARGE: f64 = 500.0;
+const BTC_WALL_HUGE: f64 = 1000.0;
+const USD_WALL_SMALL: f64 = 10_000_000.0;
+const USD_WALL_NORMAL: f64 = 25_000_000.0;
+const USD_WALL_LARGE: f64 = 50_000_000.0;
+const USD_WALL_HUGE: f64 = 100_000_000.0;
+const FUNDING_LOOKBACK_SECS: i64 = 15 * 60;
+
 // ============================================================================
 // VWAP & ATR Configuration
 // ============================================================================
@@ -457,6 +469,61 @@ pub struct AggregatedSnapshot {
     pub correlation: [[f64; 3]; 3],
 }
 
+#[derive(Clone, Debug)]
+pub enum WallTier {
+    Small,
+    Normal,
+    Large,
+    Huge,
+}
+
+impl Default for WallTier {
+    fn default() -> Self {
+        WallTier::Normal
+    }
+}
+impl WallTier {
+    fn rank(&self) -> u8 {
+        match self {
+            WallTier::Small => 1,
+            WallTier::Normal => 2,
+            WallTier::Large => 3,
+            WallTier::Huge => 4,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            WallTier::Small => "S",
+            WallTier::Normal => "N",
+            WallTier::Large => "L",
+            WallTier::Huge => "H",
+        }
+    }
+}
+
+/// Aggregated L2 wall near spot (size in USD notional)
+#[derive(Clone, Debug)]
+pub struct BookWall {
+    pub price: f64,
+    pub notional_usd: f64,
+    pub distance_pct: f64,
+    pub size_base: f64,
+    pub tier: WallTier,
+}
+
+impl Default for BookWall {
+    fn default() -> Self {
+        Self {
+            price: 0.0,
+            notional_usd: 0.0,
+            distance_pct: 0.0,
+            size_base: 0.0,
+            tier: WallTier::Normal,
+        }
+    }
+}
+
 /// Per-ticker snapshot with pre-computed metrics.
 #[derive(Clone, Debug, Default)]
 pub struct TickerSnapshot {
@@ -508,6 +575,7 @@ pub struct TickerSnapshot {
     pub cvd_velocity_15m: f64,
     pub trades_5m: usize,
     pub vol_5m: f64,
+    pub vol_1h: f64,
     pub avg_trade_usd_5m: f64,
     pub per_exchange_30s: HashMap<String, PerExchangeShortStats>,
     // OI with velocity (P1) - enhanced with per-exchange
@@ -519,6 +587,8 @@ pub struct TickerSnapshot {
     pub oi_delta_per_exchange_5m: HashMap<String, f64>,
     pub oi_delta_per_exchange_15m: HashMap<String, f64>,
     pub funding_rate_by_exchange: HashMap<String, f64>,
+    pub funding_rate_15m_ago: f64,
+    pub funding_velocity_15m: f64,
     /// OI freshness: seconds since last OI update (max across all exchanges)
     pub oi_freshness_secs: f64,
     /// OI freshness per exchange: seconds since last OI update
@@ -530,6 +600,8 @@ pub struct TickerSnapshot {
     pub tick_direction_30s: TickDirection,
     pub trade_speed: f64,
     pub avg_trade_usd: f64,
+    /// Seconds since the most recent trade exchange timestamp (lag indicator).
+    pub trade_lag_secs: Option<f64>,
     pub cvd_divergence: DivergenceSignal,
     /// Short-term (15s) price/CVD divergence for scalper
     pub cvd_divergence_15s: DivergenceSignal,
@@ -553,9 +625,18 @@ pub struct TickerSnapshot {
     pub realized_vol_30m: Option<f64>,     // RV % over last 30 min (6 candles)
     pub realized_vol_1h: Option<f64>,      // RV % over last hour (12 candles)
     pub realized_vol_trend: VolTrend,      // EXPANDING, CONTRACTING, STABLE
+    /// 1-minute return Z-score for shock detection (per spec: Dual-Vol L1 filter)
+    /// Calculated from rolling 60 1-minute returns. |σ| >= 3.5 = shock.
+    pub zscore_1m: f64,
     // L2 Orderbook imbalance (per exchange and aggregated)
     pub per_exchange_book_imbalance: HashMap<String, f64>, // Book imbalance by exchange (0-100%, 50% = balanced)
     pub aggregated_book_imbalance: f64,                    // Combined book imbalance across all exchanges
+    /// Smoothed aggregate book imbalance (EMA ~3s)
+    pub aggregated_book_imbalance_smoothed: f64,
+    /// Nearest aggregated bid wall within the L2 band
+    pub bid_walls: Vec<BookWall>,
+    /// Nearest aggregated ask wall within the L2 band
+    pub ask_walls: Vec<BookWall>,
     pub book_flip_count: usize,                             // Number of imbalance flips in last 30s
     pub book_freshness: HashMap<String, f64>,              // Seconds since last book update per exchange
 }
@@ -863,7 +944,7 @@ impl Aggregator {
             }
             "funding_rate" => {
                 if let Ok(funding) = serde_json::from_value::<FundingRateData>(event.data) {
-                    state.push_funding_rate(&event.exchange, funding.rate);
+                    state.push_funding_rate(&event.exchange, funding.rate, event.time_exchange);
                 }
             }
             "order_book_l1" => {
@@ -1032,6 +1113,7 @@ struct BasisRecord {
 struct TickerState {
     ticker: String,
     trades: VecDeque<TradeRecord>,
+    last_trade_time: Option<DateTime<Utc>>,
     // Per-exchange whale buffers to avoid a single venue dominating
     whales_by_exchange: HashMap<String, VecDeque<WhaleRecord>>,
     liquidations: VecDeque<LiquidationRecord>,
@@ -1046,6 +1128,8 @@ struct TickerState {
     oi_last_update: HashMap<String, DateTime<Utc>>,
     // Funding rates per exchange (last known)
     funding_rate_by_exchange: HashMap<String, f64>,
+    // Funding history (aggregated average) for 15m velocity
+    funding_history: VecDeque<(DateTime<Utc>, f64)>,
     // P1: Basis history for momentum tracking
     basis_history: VecDeque<BasisRecord>,
     spot_mid: Option<f64>,
@@ -1082,8 +1166,12 @@ struct TickerState {
     use_kline_metrics: bool,
     // L2 Orderbook state per exchange
     book_imbalance_by_exchange: HashMap<String, f64>,  // Current imbalance (0-100%, 50% = balanced)
+    smoothed_book_imbalance: f64,                      // Smoothed aggregate imbalance
+    book_imbalance_last_ts: Option<DateTime<Utc>>,     // Last timestamp used for smoothing
     book_last_update: HashMap<String, DateTime<Utc>>,  // Last update time per exchange
     book_flip_history: VecDeque<(DateTime<Utc>, bool)>, // (time, was_bid_heavy) for flip detection
+    bid_wall_by_exchange: HashMap<String, Vec<BookWall>>,
+    ask_wall_by_exchange: HashMap<String, Vec<BookWall>>,
 }
 
 impl TickerState {
@@ -1091,6 +1179,7 @@ impl TickerState {
         Self {
             ticker,
             trades: VecDeque::new(),
+            last_trade_time: None,
             whales_by_exchange: HashMap::new(),
             liquidations: VecDeque::new(),
             cvd_deltas_by_exchange: HashMap::new(),
@@ -1100,6 +1189,7 @@ impl TickerState {
             oi_history_by_exchange: HashMap::new(),
             oi_last_update: HashMap::new(),
             funding_rate_by_exchange: HashMap::new(),
+            funding_history: VecDeque::new(),
             basis_history: VecDeque::new(),
             spot_mid: None,
             perp_mid: None,
@@ -1125,8 +1215,12 @@ impl TickerState {
             kline_atr_state: AtrState::default(),
             use_kline_metrics: false, // Will be set to true once kline data is available
             book_imbalance_by_exchange: HashMap::new(),
+            smoothed_book_imbalance: 50.0,
+            book_imbalance_last_ts: None,
             book_last_update: HashMap::new(),
             book_flip_history: VecDeque::new(),
+            bid_wall_by_exchange: HashMap::new(),
+            ask_wall_by_exchange: HashMap::new(),
         }
     }
 
@@ -1378,6 +1472,50 @@ impl TickerState {
         self.calculate_rv_from_1m(60)
     }
 
+    /// Calculate 1-minute return Z-score from the last 60 returns.
+    /// Returns 0.0 if insufficient data or near-zero variance.
+    fn zscore_1m_from_klines(&self) -> f64 {
+        let closes: Vec<f64> = self
+            .candles_1m
+            .iter()
+            .filter(|c| c.is_complete)
+            .map(|c| c.close)
+            .collect();
+
+        if closes.len() < 61 {
+            return 0.0;
+        }
+
+        let start = closes.len().saturating_sub(61);
+        let window = &closes[start..];
+        let mut returns = Vec::with_capacity(window.len() - 1);
+        for i in 1..window.len() {
+            let prev = window[i - 1];
+            let curr = window[i];
+            if prev > 0.0 {
+                returns.push((curr - prev) / prev);
+            }
+        }
+
+        if returns.len() < 2 {
+            return 0.0;
+        }
+
+        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+        let variance = returns
+            .iter()
+            .map(|r| (r - mean).powi(2))
+            .sum::<f64>()
+            / returns.len() as f64;
+        let std_dev = variance.sqrt();
+        if std_dev <= f64::EPSILON {
+            return 0.0;
+        }
+
+        let latest = *returns.last().unwrap_or(&0.0);
+        (latest - mean) / std_dev
+    }
+
     fn push_trade(
         &mut self,
         trade: TradeData,
@@ -1413,6 +1551,7 @@ impl TickerState {
         };
 
         self.trades.push_back(record.clone());
+        self.last_trade_time = Some(time);
         self.price_history.push_back((time, trade.price));
 
         // Create exchange key with market type: "OKX-PERP", "BNC-SPOT", etc.
@@ -1695,10 +1834,45 @@ impl TickerState {
         }
     }
 
-    fn push_funding_rate(&mut self, exchange: &str, rate: f64) {
+    fn push_funding_rate(&mut self, exchange: &str, rate: f64, time: DateTime<Utc>) {
         let exchange_short = abbreviate_exchange(exchange);
         self.funding_rate_by_exchange
             .insert(exchange_short.to_string(), rate);
+
+        // Track aggregated funding history for velocity
+        let current_avg = self.funding_average_rate();
+        self.funding_history.push_back((time, current_avg));
+        let cutoff = time - ChronoDuration::seconds(FUNDING_LOOKBACK_SECS);
+        while let Some((ts, _)) = self.funding_history.front() {
+            if *ts < cutoff {
+                self.funding_history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn funding_average_rate(&self) -> f64 {
+        let (sum, count) = self
+            .funding_rate_by_exchange
+            .values()
+            .fold((0.0, 0usize), |(sum, count), &rate| (sum + rate, count + 1));
+        if count > 0 {
+            sum / count as f64
+        } else {
+            0.0
+        }
+    }
+
+    fn funding_velocity_15m(&self) -> (f64, f64) {
+        if self.funding_history.len() < 2 {
+            let current = self.funding_average_rate();
+            return (current, 0.0);
+        }
+
+        let oldest = self.funding_history.front().map(|(_, r)| *r).unwrap_or(0.0);
+        let newest = self.funding_history.back().map(|(_, r)| *r).unwrap_or(0.0);
+        (oldest, newest - oldest)
     }
 
     fn push_orderbook(
@@ -1770,10 +1944,11 @@ impl TickerState {
         exchange: &str,
         time: DateTime<Utc>,
     ) {
-        // Calculate bid imbalance percentage (0-100%, 50% = balanced)
-        // Use all available levels for imbalance calculation
-        let levels_available = book.bids.levels.len().min(book.asks.levels.len());
-        let imbalance_pct = book.bid_imbalance_pct(levels_available);
+        let imbalance_pct = if let Some(mid) = book.mid_price() {
+            Self::book_imbalance_pct_band(book, mid, L2_IMBALANCE_BAND_PCT)
+        } else {
+            50.0
+        };
 
         // Check for flip (direction change)
         let is_bid_heavy = imbalance_pct > 50.0;
@@ -1808,6 +1983,21 @@ impl TickerState {
         self.book_imbalance_by_exchange
             .insert(exchange_short.to_string(), imbalance_pct);
         self.book_last_update.insert(exchange_short.to_string(), time);
+
+        if let Some(mid) = book.mid_price() {
+            let (bid_walls, ask_walls) = self.nearest_book_walls(book, mid, L2_IMBALANCE_BAND_PCT);
+            if !bid_walls.is_empty() {
+                self.bid_wall_by_exchange
+                    .insert(exchange_short.to_string(), bid_walls);
+            }
+            if !ask_walls.is_empty() {
+                self.ask_wall_by_exchange
+                    .insert(exchange_short.to_string(), ask_walls);
+            }
+        }
+
+        let current_agg = self.aggregated_book_imbalance();
+        self.update_smoothed_book_imbalance(current_agg, time);
     }
 
     fn last_whale(&self, exchange: &str) -> Option<&str> {
@@ -1902,12 +2092,18 @@ impl TickerState {
         let oi_per_exchange = self.oi_by_exchange.clone();
         let (oi_delta_per_exchange_5m, oi_delta_per_exchange_15m) = self.oi_delta_per_exchange();
         let (oi_freshness_secs, oi_freshness_per_exchange) = self.oi_freshness();
+        let trade_lag_secs = self.last_trade_time.map(|t| {
+            let lag_ms = (Utc::now() - t).num_milliseconds().max(0);
+            lag_ms as f64 / 1000.0
+        });
         // P0: Multi-timeframe tick direction (30s, 1m, 5m)
         let tick_direction_30s = self.tick_direction(30);
         let tick_direction = self.tick_direction(60);
         let tick_direction_5m = self.tick_direction(300);
         let (trade_speed, avg_trade_usd) = self.trade_speed(60);
         let (trades_5m, vol_5m, avg_5m) = self.trade_stats(300);
+        let (_, vol_1h, _) = self.trade_stats(3600);
+        let (funding_rate_15m_ago, funding_velocity_15m) = self.funding_velocity_15m();
         let basis = self.basis();
         let cvd_divergence = self.cvd_divergence();
         let cvd_divergence_15s = self.cvd_divergence_15s();
@@ -2026,6 +2222,8 @@ impl TickerState {
             oi_delta_per_exchange_5m,
             oi_delta_per_exchange_15m,
             funding_rate_by_exchange: self.funding_rate_by_exchange.clone(),
+            funding_rate_15m_ago,
+            funding_velocity_15m,
             oi_freshness_secs,
             oi_freshness_per_exchange,
             exchange_health: HashMap::new(),
@@ -2034,8 +2232,10 @@ impl TickerState {
             tick_direction_30s,
             trade_speed,
             avg_trade_usd,
+            trade_lag_secs,
             trades_5m,
             vol_5m,
+            vol_1h,
             avg_trade_usd_5m: avg_5m,
             cvd_divergence,
             cvd_divergence_15s,
@@ -2061,9 +2261,13 @@ impl TickerState {
             realized_vol_30m,
             realized_vol_1h,
             realized_vol_trend,
+            zscore_1m: self.zscore_1m_from_klines(),
             // L2 Orderbook imbalance
             per_exchange_book_imbalance: self.book_imbalance_by_exchange.clone(),
             aggregated_book_imbalance: self.aggregated_book_imbalance(),
+            aggregated_book_imbalance_smoothed: self.smoothed_book_imbalance,
+            bid_walls: self.aggregated_bid_walls(),
+            ask_walls: self.aggregated_ask_walls(),
             book_flip_count: self.book_flip_count_30s(),
             book_freshness: self.book_freshness_seconds(),
         }
@@ -2076,6 +2280,211 @@ impl TickerState {
         }
         let sum: f64 = self.book_imbalance_by_exchange.values().sum();
         sum / self.book_imbalance_by_exchange.len() as f64
+    }
+
+    fn wall_thresholds(&self) -> (bool, f64, f64, f64, f64) {
+        if self.ticker.to_uppercase().contains("BTC") {
+            (
+                true,
+                BTC_WALL_SMALL,
+                BTC_WALL_NORMAL,
+                BTC_WALL_LARGE,
+                BTC_WALL_HUGE,
+            )
+        } else {
+            (
+                false,
+                USD_WALL_SMALL,
+                USD_WALL_NORMAL,
+                USD_WALL_LARGE,
+                USD_WALL_HUGE,
+            )
+        }
+    }
+
+    fn aggregated_bid_walls(&self) -> Vec<BookWall> {
+        let mut walls: Vec<BookWall> = self
+            .bid_wall_by_exchange
+            .values()
+            .flat_map(|w| w.iter().cloned())
+            .collect();
+        Self::sort_walls(&mut walls);
+        walls.truncate(2);
+        walls
+    }
+
+    fn aggregated_ask_walls(&self) -> Vec<BookWall> {
+        let mut walls: Vec<BookWall> = self
+            .ask_wall_by_exchange
+            .values()
+            .flat_map(|w| w.iter().cloned())
+            .collect();
+        Self::sort_walls(&mut walls);
+        walls.truncate(2);
+        walls
+    }
+
+    fn sort_walls(walls: &mut Vec<BookWall>) {
+        walls.sort_by(|a, b| {
+            let rank = b.tier.rank().cmp(&a.tier.rank());
+            if rank == std::cmp::Ordering::Equal {
+                b.notional_usd
+                    .partial_cmp(&a.notional_usd)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                rank
+            }
+        });
+    }
+
+    /// Update smoothed aggregate book imbalance using EMA (~3s)
+    fn update_smoothed_book_imbalance(&mut self, current: f64, time: DateTime<Utc>) {
+        let tau_secs = 3.0;
+        let alpha = if let Some(last) = self.book_imbalance_last_ts {
+            let dt = (time - last).num_milliseconds() as f64 / 1000.0;
+            if dt <= 0.0 {
+                0.0
+            } else {
+                1.0 - (-dt / tau_secs).exp()
+            }
+        } else {
+            1.0
+        };
+        let next = if alpha >= 1.0 {
+            current
+        } else {
+            self.smoothed_book_imbalance + alpha * (current - self.smoothed_book_imbalance)
+        };
+        self.smoothed_book_imbalance = next.clamp(0.0, 100.0);
+        self.book_imbalance_last_ts = Some(time);
+    }
+
+    fn book_imbalance_pct_band(
+        book: &crate::shared::types::OrderBook,
+        mid: f64,
+        band_pct: f64,
+    ) -> f64 {
+        if mid <= 0.0 {
+            return 50.0;
+        }
+        let min_bid = mid * (1.0 - band_pct);
+        let max_ask = mid * (1.0 + band_pct);
+
+        let mut bid_notional = 0.0;
+        for level in &book.bids.levels {
+            let price = level.price_f64();
+            if price < min_bid {
+                break;
+            }
+            bid_notional += price * level.amount_f64();
+        }
+
+        let mut ask_notional = 0.0;
+        for level in &book.asks.levels {
+            let price = level.price_f64();
+            if price > max_ask {
+                break;
+            }
+            ask_notional += price * level.amount_f64();
+        }
+
+        let total = bid_notional + ask_notional;
+        if total > 0.0 {
+            (bid_notional / total) * 100.0
+        } else {
+            50.0
+        }
+    }
+
+    /// Find nearest bid/ask walls within a fixed band around mid
+    fn nearest_book_walls(
+        &self,
+        book: &crate::shared::types::OrderBook,
+        mid: f64,
+        band_pct: f64,
+    ) -> (Vec<BookWall>, Vec<BookWall>) {
+        if mid <= 0.0 {
+            return (Vec::new(), Vec::new());
+        }
+
+        let min_bid = mid * (1.0 - band_pct);
+        let max_ask = mid * (1.0 + band_pct);
+        let (use_base, small, normal, large, huge) = self.wall_thresholds();
+
+        let mut bid_walls: Vec<BookWall> = Vec::new();
+        for level in &book.bids.levels {
+            let price = level.price_f64();
+            if price < min_bid {
+                break;
+            }
+            let distance_pct = ((price - mid) / mid) * 100.0;
+            if distance_pct.abs() < L2_WALL_MIN_DISTANCE_PCT {
+                continue;
+            }
+            let size_base = level.amount_f64();
+            let notional = price * size_base;
+            let metric = if use_base { size_base } else { notional };
+            let tier = if metric >= huge {
+                WallTier::Huge
+            } else if metric >= large {
+                WallTier::Large
+            } else if metric >= normal {
+                WallTier::Normal
+            } else if metric >= small {
+                WallTier::Small
+            } else {
+                continue;
+            };
+            let candidate = BookWall {
+                price,
+                notional_usd: notional,
+                distance_pct,
+                size_base,
+                tier,
+            };
+            bid_walls.push(candidate);
+        }
+
+        let mut ask_walls: Vec<BookWall> = Vec::new();
+        for level in &book.asks.levels {
+            let price = level.price_f64();
+            if price > max_ask {
+                break;
+            }
+            let distance_pct = ((price - mid) / mid) * 100.0;
+            if distance_pct.abs() < L2_WALL_MIN_DISTANCE_PCT {
+                continue;
+            }
+            let size_base = level.amount_f64();
+            let notional = price * size_base;
+            let metric = if use_base { size_base } else { notional };
+            let tier = if metric >= huge {
+                WallTier::Huge
+            } else if metric >= large {
+                WallTier::Large
+            } else if metric >= normal {
+                WallTier::Normal
+            } else if metric >= small {
+                WallTier::Small
+            } else {
+                continue;
+            };
+            let candidate = BookWall {
+                price,
+                notional_usd: notional,
+                distance_pct,
+                size_base,
+                tier,
+            };
+            ask_walls.push(candidate);
+        }
+
+        Self::sort_walls(&mut bid_walls);
+        Self::sort_walls(&mut ask_walls);
+        bid_walls.truncate(2);
+        ask_walls.truncate(2);
+
+        (bid_walls, ask_walls)
     }
 
     /// Count book flips in the last 30 seconds
@@ -2649,15 +3058,10 @@ impl TickerState {
 
     /// Per-exchange short-window stats (CVD/volume/trades) for scalper
     fn per_exchange_short_stats(&self, window_secs: i64) -> HashMap<String, PerExchangeShortStats> {
-        // Use freshest trade time when recent; clamp to local time to avoid future skew.
+        // Window relative to the most recent trade time; clamp to local time to avoid future skew.
         let now_local = Utc::now();
         let latest_trade = self.trades.back().map(|t| t.time).unwrap_or(now_local);
-        let candidate = if (now_local - latest_trade).num_seconds() < 5 {
-            latest_trade
-        } else {
-            now_local
-        };
-        let now = candidate.min(now_local);
+        let now = latest_trade.min(now_local);
         let cutoff = now - ChronoDuration::seconds(window_secs);
         let mut acc: HashMap<String, (f64, f64, usize)> = HashMap::new(); // exchange -> (buy_usd, sell_usd, trades)
 

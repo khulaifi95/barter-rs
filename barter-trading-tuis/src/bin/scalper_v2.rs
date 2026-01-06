@@ -577,6 +577,19 @@ fn render_header(
 
         let basis = t.basis.as_ref().map(|b| b.basis_pct).unwrap_or(0.0);
         let basis_color = if basis > 0.02 { C_BUY } else if basis < -0.02 { C_SELL } else { C_DIM };
+        let (lag_str, lag_color) = match t.trade_lag_secs {
+            Some(lag) => {
+                let color = if lag < 2.0 {
+                    C_BUY
+                } else if lag < 10.0 {
+                    C_NEUTRAL
+                } else {
+                    C_SELL
+                };
+                (format!("Lag:{:.0}s", lag), color)
+            }
+            None => ("Lag:--".to_string(), C_DIM),
+        };
 
         let mut spans: Vec<Span> = Vec::new();
         spans.push(Span::styled(
@@ -594,6 +607,8 @@ fn render_header(
             format!("{:.0}t/s", t.trade_speed),
             Style::default().fg(C_ACCENT),
         ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(lag_str, Style::default().fg(lag_color)));
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("Sprd:{:.2}%", spread),

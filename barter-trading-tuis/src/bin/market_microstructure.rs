@@ -3,7 +3,7 @@
 /// Renders orderflow, basis, liquidation clusters, whales, and CVD signals
 /// using the shared aggregation engine so all TUIs share one source of truth.
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     error::Error,
     io,
     sync::{
@@ -15,7 +15,17 @@ use std::{
 
 use barter_trading_tuis::{
     AggregatedSnapshot, Aggregator, Candle1m, ConnectionStatus, DivergenceSignal,
-    FlowSignal, Side, WebSocketClient, WebSocketConfig, ticker_to_binance_symbol,
+    FlowSignal, OrchestratorResult, Side, WebSocketClient, WebSocketConfig, ticker_to_binance_symbol,
+};
+use barter_trading_tuis::shared::{
+    audit::AuditLogger,
+    config::Config,
+    deribit::DeribitRestClient,
+    market_state::{ConfigProvider, DeribitClient, State, TradingBias, TradMarketStatus, GammaPosition},
+    gamma::GammaCalculator,
+    options_state::OptionsContextBuilder,
+    orchestrator::StateOrchestrator,
+    snapshot_bridge::build_market_data_input,
 };
 use rustls::crypto::ring::default_provider;
 use crossterm::{
@@ -31,7 +41,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use futures::StreamExt;
 
@@ -196,6 +206,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let aggregator = Arc::new(Mutex::new(Aggregator::new()));
     let connected = Arc::new(AtomicBool::new(false));
 
+    // Watch channel for sharing MarketState from orchestrator to UI
+    let (state_tx, state_rx) = watch::channel::<HashMap<String, OrchestratorResult>>(HashMap::new());
+
     // Backfill tvVWAP, ATR, and RV from authoritative Binance 1m klines
     {
         let ticker_list: Vec<&str> = tickers().iter().map(|s| s.as_str()).collect();
@@ -249,6 +262,132 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
+    // Market State Engine - background orchestrator task
+    // Calculates MarketState every 200ms and logs state transitions
+    {
+        let agg = Arc::clone(&aggregator);
+        let state_tx = state_tx.clone();
+        tokio::spawn(async move {
+            // Load config from file with fallback to defaults
+            let config = Config::load().unwrap_or_else(|e| {
+                tracing::warn!("Failed to load config: {}, using defaults", e);
+                Config::default()
+            });
+
+            // Create real audit logger (writes to logs/audit/)
+            let logger = AuditLogger::new(&config.thresholds().audit);
+            let mut orchestrator = StateOrchestrator::new(config, logger);
+
+            // Deribit client for options data (gamma flip calculation)
+            let deribit_client = DeribitRestClient::default();
+            let gamma_calc = GammaCalculator::default();
+            let options_builder = OptionsContextBuilder::new();
+
+            // Cache for options context (refresh every 60s per spec)
+            let mut btc_options_ctx = None;
+            let mut last_options_fetch = Instant::now() - Duration::from_secs(120); // Force initial fetch
+
+            let calc_interval = Duration::from_millis(200);
+            let options_refresh = Duration::from_secs(60);
+            let mut last_calc = Instant::now();
+
+            loop {
+                // Refresh options data every 60 seconds (for BTC only initially)
+                if last_options_fetch.elapsed() >= options_refresh {
+                    // Get spot price first
+                    let spot = {
+                        let guard = agg.lock().await;
+                        guard.snapshot()
+                            .tickers
+                            .get("BTC")
+                            .and_then(|s| s.binance_perp_last)
+                            .unwrap_or(0.0)
+                    };
+
+                    if spot <= 0.0 {
+                        tracing::debug!("Deribit: BTC spot=0, waiting for price data");
+                        // Retry in 5 seconds
+                        last_options_fetch = Instant::now() - options_refresh + Duration::from_secs(5);
+                    } else {
+                        tracing::info!("Fetching Deribit options for BTC (spot=${:.2})", spot);
+                        match deribit_client.fetch_options_chain("BTC").await {
+                            Ok(chain) => {
+                                // Count contracts with greeks for debugging
+                                let with_greeks = chain.contracts.iter()
+                                    .filter(|c| c.gamma > 0.0 || c.delta.abs() > 0.0)
+                                    .count();
+                                let ctx = options_builder.build(&chain, spot);
+                                tracing::info!(
+                                    "Deribit BTC OK: {} contracts ({} with greeks), gamma_flip=${:.0}, gex={:.2}M, dex={:.2}M",
+                                    chain.contracts.len(),
+                                    with_greeks,
+                                    ctx.gamma_flip_price,
+                                    ctx.gexp / 1_000_000.0,
+                                    ctx.dexp / 1_000_000.0
+                                );
+                                btc_options_ctx = Some(ctx);
+                                last_options_fetch = Instant::now();
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to fetch Deribit options: {:?}", e);
+                                // Retry in 10 seconds on error
+                                last_options_fetch = Instant::now() - options_refresh + Duration::from_secs(10);
+                            }
+                        }
+                    }
+                }
+
+                if last_calc.elapsed() >= calc_interval {
+                    let snapshot = {
+                        let guard = agg.lock().await;
+                        guard.snapshot()
+                    };
+
+                    // Collect results for all tickers
+                    let mut state_results = HashMap::new();
+
+                    // Process each ticker through the orchestrator
+                    for (ticker, ticker_snap) in &snapshot.tickers {
+                        // Build input with proper options context
+                        let mut input = build_market_data_input(
+                            ticker_snap,
+                            TradMarketStatus::Unavailable, // No IBKR in this binary
+                        );
+
+                        // Attach options context for BTC
+                        if ticker == "BTC" {
+                            input.options_context = btc_options_ctx.clone();
+                        }
+
+                        let result = orchestrator.calculate(&input);
+
+                        // Log non-Wait state transitions
+                        if result.state.state != barter_trading_tuis::shared::market_state::State::Wait {
+                            tracing::debug!(
+                                ticker = %ticker,
+                                state = ?result.state.state,
+                                bias = ?result.state.bias,
+                                confidence = result.state.confidence,
+                                no_gamma = result.no_gamma_mode,
+                                gamma_flip = result.state.components.gamma_context.gamma_flip_price,
+                                "Market state update"
+                            );
+                        }
+
+                        state_results.insert(ticker.clone(), result);
+                    }
+
+                    // Send updated states to UI (non-blocking)
+                    let _ = state_tx.send(state_results);
+
+                    last_calc = Instant::now();
+                }
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+    }
+
     // UI loop
     let mut last_draw = Instant::now();
     let draw_interval = Duration::from_millis(250);
@@ -268,8 +407,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 guard.snapshot()
             };
 
+            // Get latest market states from orchestrator
+            let market_states = state_rx.borrow().clone();
+
             let connected_now = connected.load(Ordering::Relaxed);
-            terminal.draw(|f| render_ui(f, f.area(), &snapshot, connected_now))?;
+            terminal.draw(|f| render_ui(f, f.area(), &snapshot, &market_states, connected_now))?;
             last_draw = Instant::now();
         }
 
@@ -288,29 +430,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
     result
 }
 
-fn render_ui(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot, connected: bool) {
+fn render_ui(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    snapshot: &AggregatedSnapshot,
+    market_states: &HashMap<String, OrchestratorResult>,
+    connected: bool,
+) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(24), // Top row (reduced from 28%)
-            Constraint::Percentage(44), // Middle row - MARKET PULSE needs more space (increased from 38%)
-            Constraint::Percentage(32), // Bottom row (reduced from 34%)
+            Constraint::Length(5),      // Market State Engine header (compact)
+            Constraint::Percentage(22), // Orderflow + Exchange Intelligence
+            Constraint::Percentage(40), // Liquidation + Market Pulse
+            Constraint::Percentage(30), // Whale + CVD
         ])
         .split(area);
+
+    // Row 0: Market State Engine (full width)
+    render_market_state_panel(f, rows[0], snapshot, market_states);
 
     // 55/45 split - left panels wider for whale/liq detail, right for compact stats
     let row1 = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(rows[0]);
+        .split(rows[1]);
     let row2 = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(rows[1]);
+        .split(rows[2]);
     let row3 = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(rows[2]);
+        .split(rows[3]);
 
     render_orderflow_panel(f, row1[0], snapshot);
     render_exchange_intelligence(f, row1[1], snapshot);
@@ -318,6 +470,128 @@ fn render_ui(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot, 
     render_market_stats_panel(f, row2[1], snapshot);
     render_whale_panel(f, row3[0], snapshot);
     render_cvd_panel(f, row3[1], snapshot, connected);
+}
+
+/// Render the Market State Engine panel (compact header showing state per ticker)
+fn render_market_state_panel(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    snapshot: &AggregatedSnapshot,
+    market_states: &HashMap<String, OrchestratorResult>,
+) {
+    let block = Block::default()
+        .title(" MARKET STATE ENGINE ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+
+    // Split into columns per ticker
+    let ticker_count = tickers().len().max(1);
+    let constraints: Vec<Constraint> = (0..ticker_count)
+        .map(|_| Constraint::Ratio(1, ticker_count as u32))
+        .collect();
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(block.inner(area));
+
+    f.render_widget(block, area);
+
+    for (i, ticker) in tickers().iter().enumerate() {
+        if i >= cols.len() {
+            break;
+        }
+
+        let col_area = cols[i];
+
+        // Get state for this ticker
+        let result_opt = market_states.get(ticker);
+        let price = snapshot
+            .tickers
+            .get(ticker)
+            .and_then(|t| t.binance_perp_last.or(t.latest_price))
+            .unwrap_or(0.0);
+
+        let mut spans = Vec::new();
+
+        // Ticker + Price
+        let price_str = if price >= 1000.0 {
+            format!("${:.1}K", price / 1000.0)
+        } else if price > 0.0 {
+            format!("${:.2}", price)
+        } else {
+            "---".to_string()
+        };
+
+        spans.push(Span::styled(
+            format!("{} {} ", ticker, price_str),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+
+        if let Some(result) = result_opt {
+            let state = &result.state;
+
+            // State badge with color
+            let (state_str, state_color) = match state.state {
+                State::Ready => ("READY", Color::Green),
+                State::Caution => ("CAUTION", Color::Yellow),
+                State::Wait => ("WAIT", Color::Red),
+            };
+
+            spans.push(Span::styled(
+                format!("{} ", state_str),
+                Style::default().fg(state_color).add_modifier(Modifier::BOLD),
+            ));
+
+            // Bias (if present)
+            if let Some(bias) = &state.bias {
+                let bias_str = match bias {
+                    TradingBias::MeanReversion => "MR",
+                    TradingBias::Momentum => "MO",
+                };
+                spans.push(Span::styled(
+                    format!("{} ", bias_str),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+
+            // Confidence
+            if state.confidence > 0 {
+                spans.push(Span::styled(
+                    format!("{}% ", state.confidence),
+                    Style::default().fg(Color::White),
+                ));
+            }
+
+            // Gamma context (compact)
+            let gamma = &state.components.gamma_context;
+            if gamma.gamma_flip_price > 0.0 {
+                let pos_char = match gamma.position {
+                    GammaPosition::AboveFlip => "↑",
+                    GammaPosition::BelowFlip => "↓",
+                    GammaPosition::AtFlip => "~",
+                };
+                spans.push(Span::styled(
+                    format!("γ{}", pos_char),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+
+            // NO-GAMMA/NO-TRAD indicators
+            if result.no_gamma_mode {
+                spans.push(Span::styled(" [NO-γ]", Style::default().fg(Color::DarkGray)));
+            }
+        } else {
+            spans.push(Span::styled(
+                "INIT",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        let line = Line::from(spans);
+        let paragraph = Paragraph::new(vec![line]);
+        f.render_widget(paragraph, col_area);
+    }
 }
 
 fn render_orderflow_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot) {
