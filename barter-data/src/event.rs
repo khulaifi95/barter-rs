@@ -158,6 +158,18 @@ pub enum DataKind {
     CumulativeVolumeDelta(CumulativeVolumeDelta),
 }
 
+/// Versioned envelope for market events.
+///
+/// Used by transport layers (eg WebSocket servers) to add schema metadata
+/// without changing the underlying payload structure.
+#[derive(Clone, PartialEq, Debug, Deserialize, Serialize)]
+pub struct MarketEventEnvelope<T> {
+    pub schema_version: u16,
+    pub source: String,
+    pub time_sent: DateTime<Utc>,
+    pub payload: T,
+}
+
 impl DataKind {
     pub fn kind_name(&self) -> &str {
         match self {

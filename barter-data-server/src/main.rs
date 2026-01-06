@@ -1,6 +1,6 @@
 use barter_data::{
     error::DataError,
-    event::{DataKind, MarketEvent},
+    event::{DataKind, MarketEvent, MarketEventEnvelope},
     streams::{builder::dynamic::DynamicStreams, consumer::MarketStreamResult, reconnect::Event},
     subscription::funding::FundingRate,
     subscription::open_interest::OpenInterest,
@@ -434,6 +434,12 @@ async fn handle_client(
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let mut rx_trades = tx_trades.subscribe();
     let mut rx_l2 = tx_l2.subscribe();
+    let use_envelope = std::env::var("WS_ENVELOPE")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+        .unwrap_or(false);
+    let envelope_source =
+        std::env::var("WS_SOURCE").unwrap_or_else(|_| "barter-data-server".to_string());
 
     // Send welcome message
     let welcome = serde_json::json!({
@@ -457,7 +463,18 @@ async fn handle_client(
                 result = rx_trades.recv() => {
                     match result {
                         Ok(event) => {
-                            if let Ok(json) = serde_json::to_string(&event) {
+                            let json = if use_envelope {
+                                let wrapped = MarketEventEnvelope {
+                                    schema_version: 1,
+                                    source: envelope_source.clone(),
+                                    time_sent: Utc::now(),
+                                    payload: event,
+                                };
+                                serde_json::to_string(&wrapped)
+                            } else {
+                                serde_json::to_string(&event)
+                            };
+                            if let Ok(json) = json {
                                 if ws_sender.send(Message::Text(json.into())).await.is_err() {
                                     break;
                                 }
@@ -479,7 +496,18 @@ async fn handle_client(
                 result = rx_l2.recv() => {
                     match result {
                         Ok(event) => {
-                            if let Ok(json) = serde_json::to_string(&event) {
+                            let json = if use_envelope {
+                                let wrapped = MarketEventEnvelope {
+                                    schema_version: 1,
+                                    source: envelope_source.clone(),
+                                    time_sent: Utc::now(),
+                                    payload: event,
+                                };
+                                serde_json::to_string(&wrapped)
+                            } else {
+                                serde_json::to_string(&event)
+                            };
+                            if let Ok(json) = json {
                                 if ws_sender.send(Message::Text(json.into())).await.is_err() {
                                     break;
                                 }
