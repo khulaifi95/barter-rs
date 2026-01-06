@@ -461,14 +461,20 @@ pub struct FundingThresholds {
 /// Fuel quality thresholds (L3)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FuelThresholds {
-    /// RVOL pass threshold (>=)
-    pub rvol_pass: f64,
-    /// RVOL caution threshold (>=)
-    pub rvol_caution: f64,
+    /// RVOL strong threshold (>=)
+    pub rvol_strong_min: f64,
+    /// RVOL normal threshold (>=)
+    pub rvol_normal_min: f64,
+    /// RVOL thin threshold (>=)
+    pub rvol_thin_min: f64,
     /// OI delta fail threshold for momentum bias (USD, <=)
     pub oi_momentum_fail_usd: f64,
     /// OI delta caution threshold for momentum bias (USD, <=)
     pub oi_momentum_caution_usd: f64,
+    /// OI delta range treated as flat (USD, <= abs)
+    pub oi_flat_usd: f64,
+    /// OI delta threshold to qualify as new money (USD, >=)
+    pub oi_new_money_min_usd: f64,
     /// Liquidation caution threshold (USD/min)
     pub liq_caution_usd_per_min: f64,
     /// Liquidation fail threshold (USD/min)
@@ -927,23 +933,23 @@ impl MarketState {
     ) -> FuelScore {
         let rvol_status = if fuel.rvol_5m <= 0.0 {
             RvolStatus::Normal
-        } else if fuel.rvol_5m >= thresholds.fuel.rvol_pass * 1.5 {
+        } else if fuel.rvol_5m >= thresholds.fuel.rvol_strong_min {
             RvolStatus::Strong
-        } else if fuel.rvol_5m >= thresholds.fuel.rvol_pass {
+        } else if fuel.rvol_5m >= thresholds.fuel.rvol_normal_min {
             RvolStatus::Normal
-        } else if fuel.rvol_5m >= thresholds.fuel.rvol_caution {
+        } else if fuel.rvol_5m >= thresholds.fuel.rvol_thin_min {
             RvolStatus::Thin
         } else {
             RvolStatus::Fail
         };
 
-        let has_oi = fuel.oi_delta_usd_5m.abs() > 1.0;
+        let has_oi = fuel.oi_delta_usd_5m.abs() >= thresholds.fuel.oi_flat_usd;
         let oi_trend = if !has_oi {
             OiTrend::Flat
         } else {
             match bias {
                 TradingBias::Momentum => {
-                    if fuel.oi_delta_usd_5m > 0.0 {
+                    if fuel.oi_delta_usd_5m >= thresholds.fuel.oi_new_money_min_usd {
                         OiTrend::NewMoney
                     } else if fuel.oi_delta_usd_5m <= thresholds.fuel.oi_momentum_fail_usd {
                         OiTrend::Squeeze
@@ -952,10 +958,12 @@ impl MarketState {
                     }
                 }
                 TradingBias::MeanReversion => {
-                    if fuel.oi_delta_usd_5m <= 0.0 {
+                    if fuel.oi_delta_usd_5m <= -thresholds.fuel.oi_flat_usd {
                         OiTrend::Squeeze
-                    } else {
+                    } else if fuel.oi_delta_usd_5m >= thresholds.fuel.oi_new_money_min_usd {
                         OiTrend::NewMoney
+                    } else {
+                        OiTrend::Flat
                     }
                 }
             }
@@ -990,7 +998,7 @@ impl MarketState {
                     }
                 }
                 TradingBias::MeanReversion => {
-                    if fuel.oi_delta_usd_5m > 0.0 {
+                    if fuel.oi_delta_usd_5m >= thresholds.fuel.oi_new_money_min_usd {
                         caution = true;
                     }
                 }
@@ -1336,10 +1344,13 @@ mod tests {
                 extreme_short: -0.0001,
             },
             fuel: FuelThresholds {
-                rvol_pass: 1.2,
-                rvol_caution: 0.8,
+                rvol_strong_min: 2.0,
+                rvol_normal_min: 0.8,
+                rvol_thin_min: 0.5,
                 oi_momentum_fail_usd: -15_000_000.0,
                 oi_momentum_caution_usd: -5_000_000.0,
+                oi_flat_usd: 3_000_000.0,
+                oi_new_money_min_usd: 5_000_000.0,
                 liq_caution_usd_per_min: 150_000.0,
                 liq_fail_usd_per_min: 2_000_000.0,
             },

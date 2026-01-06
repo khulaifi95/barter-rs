@@ -129,11 +129,12 @@ If L1 fails, don't even evaluate L2. This prevents false positives.
 - **Options context**: GEX/DEX/VEX, gamma flip, max pain, put/call walls, bucket summaries.
 - **Liquidation thresholds**: calibrated to real-world rates (LOW < 150K/min, EXHT > 2M/min).
 - **Config-driven thresholds**: all fuel thresholds live in `config/thresholds.toml`.
+- **Centralized feeds**: Deribit options + IBKR trad ticks ingested by `barter-data-server`, TUIs no longer fetch directly.
+- **Server snapshots**: `market_snapshot` events power L1/L3 fuel inputs (RVOL/OI/Funding/Liq) for consistent state decisions.
 
 ### Pending / Gaps
-- **True 7-day percentile**: VolRegimeEngine exists but not yet wired into runtime (currently trend->percentile mapping).
-- **TradFi consolidation**: IBKR/TradFi feeds are not centralized in barter-data-server (see Section 3.3).
-- **Single source of truth**: TUIs compute rolling windows independently; snapshots can drift.
+- **True 7-day percentile**: VolRegimeEngine exists but not yet wired into runtime; server snapshot still reports 0/unknown percentile.
+- **Per-exchange drift**: Flow tables still use per-exchange rolling windows (kept for execution views).
 
 ### Planned (Migration)
 - Centralize **TradFi + Deribit options** into barter-data-server for consistent snapshots across TUIs.
@@ -217,6 +218,13 @@ If L1 fails, don't even evaluate L2. This prevents false positives.
        │              │              │              │              │
        ▼              ▼              ▼              ▼              ▼
 ┌──────────────────────────────────────────────────────────────────┐
+│                   barter-data-server (hub)                        │
+│  • Aggregates raw feeds                                           │
+│  • Emits raw events + market_snapshot                             │
+└──────────────────────────┬───────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────────┐
 │                      MARKET SNAPSHOT                              │
 │  • Per-venue: price, L2, CVD, flow imbalance, OI                  │
 │  • Aggregated: consensus, whale flow, spread                      │
@@ -240,15 +248,16 @@ If L1 fails, don't even evaluate L2. This prevents false positives.
 └─────────────────────────┘  └─────────────────────────┘
 ```
 
-### 3.3 Centralized Data Plan (TradFi + Options)
+### 3.3 Centralized Data Hub (Implemented)
 
-**Current**: each TUI builds its own rolling snapshot from the WS feed; Deribit + IBKR are fetched directly by some binaries.  
-**Planned**: barter-data-server becomes the single aggregation hub for:
+**Now**: barter-data-server is the single aggregation hub for:
 - Crypto perps (Binance/Bybit/OKX)
 - Options (Deribit: gamma/GEX/DEX/VEX, walls, max pain)
 - TradFi (IBKR ES/NQ)
 
-**Goal**: one authoritative snapshot stream so all TUIs show the same state.
+**TUIs**: consume raw events + `market_snapshot` from the server (no direct Deribit/IBKR fetches).
+
+**Note**: per-exchange flow/L2 windows remain local for execution detail; state inputs use the server snapshot.
 
 ---
 
@@ -1105,10 +1114,13 @@ extreme_long = 0.0005      # >0.05% = extreme
 extreme_short = -0.0001    # <-0.01% = extreme
 
 [fuel]
-rvol_pass = 1.2            # >= 1.2x = healthy volume
-rvol_caution = 0.8         # 0.8-1.0x = thin volume
+rvol_strong_min = 2.0      # >= 2.0x = strong conviction
+rvol_normal_min = 0.8      # >= 0.8x = normal activity
+rvol_thin_min = 0.5        # >= 0.5x = thin volume
 oi_momentum_fail_usd = -15000000   # <= -$15M = squeeze risk (momentum)
 oi_momentum_caution_usd = -5000000 # <= -$5M = caution (momentum)
+oi_flat_usd = 3000000              # <= $3M = flat/neutral
+oi_new_money_min_usd = 5000000     # >= $5M = new money
 liq_caution_usd_per_min = 150000   # >= $150K/min = caution (elevated)
 liq_fail_usd_per_min = 2000000     # >= $2M/min = exhaustion
 

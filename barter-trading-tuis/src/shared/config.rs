@@ -128,10 +128,13 @@ impl Default for Config {
                     extreme_short: -0.0001,
                 },
                 fuel: FuelThresholds {
-                    rvol_pass: 1.2,
-                    rvol_caution: 0.8,
+                    rvol_strong_min: 2.0,
+                    rvol_normal_min: 0.8,
+                    rvol_thin_min: 0.5,
                     oi_momentum_fail_usd: -15_000_000.0,
                     oi_momentum_caution_usd: -5_000_000.0,
+                    oi_flat_usd: 3_000_000.0,
+                    oi_new_money_min_usd: 5_000_000.0,
                     liq_caution_usd_per_min: 150_000.0,
                     liq_fail_usd_per_min: 2_000_000.0,
                 },
@@ -326,10 +329,13 @@ extreme_long = 0.0005
 extreme_short = -0.0001
 
 [fuel]
-rvol_pass = 1.2
-rvol_caution = 0.8
+rvol_strong_min = 2.0
+rvol_normal_min = 0.8
+rvol_thin_min = 0.5
 oi_momentum_fail_usd = -15000000
 oi_momentum_caution_usd = -5000000
+oi_flat_usd = 3000000
+oi_new_money_min_usd = 5000000
 liq_caution_usd_per_min = 150000
 liq_fail_usd_per_min = 2000000
 
@@ -664,10 +670,13 @@ extreme_short = -0.0001    # <-0.01% funding = extreme short -> Warning
 # FUEL THRESHOLDS (L3 Quality Filter)
 # =============================================================================
 [fuel]
-rvol_pass = 1.2            # >= 1.2x = healthy volume
-rvol_caution = 0.8         # 0.8-1.0x = thin volume
+rvol_strong_min = 2.0      # >= 2.0x = strong conviction
+rvol_normal_min = 0.8      # >= 0.8x = normal activity
+rvol_thin_min = 0.5        # >= 0.5x = thin volume
 oi_momentum_fail_usd = -15000000   # <= -$15M = squeeze risk (momentum)
 oi_momentum_caution_usd = -5000000 # <= -$5M = caution (momentum)
+oi_flat_usd = 3000000              # <= $3M = flat/neutral
+oi_new_money_min_usd = 5000000     # >= $5M = new money
 liq_caution_usd_per_min = 150000   # >= $150K/min = caution (elevated)
 liq_fail_usd_per_min = 2000000     # >= $2M/min = exhaustion
 
