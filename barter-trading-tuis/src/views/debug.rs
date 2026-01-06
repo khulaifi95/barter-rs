@@ -55,6 +55,56 @@ fn render_body(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
             "EXCHANGE HEALTH: {}",
             snap.exchange_health.len()
         )));
+
+        if let Some(server_snap) = ctx
+            .snapshot
+            .server_snapshot
+            .as_ref()
+            .and_then(|s| s.tickers.get(ticker))
+        {
+            let local_rvol = if snap.vol_1h > 0.0 {
+                snap.vol_5m / (snap.vol_1h / 12.0)
+            } else {
+                0.0
+            };
+            let local_funding = if snap.funding_rate_by_exchange.is_empty() {
+                0.0
+            } else {
+                snap.funding_rate_by_exchange.values().sum::<f64>()
+                    / snap.funding_rate_by_exchange.len() as f64
+            };
+
+            lines.push(Line::from("---- SERVER SNAPSHOT ----"));
+            lines.push(Line::from(format!(
+                "CVD 5m: {} | LOCAL {}",
+                format_compact(server_snap.cvd_5m),
+                format_compact(snap.cvd_5m_total)
+            )));
+            lines.push(Line::from(format!(
+                "CVD 15m: {} | LOCAL {}",
+                format_compact(server_snap.cvd_15m),
+                format_compact(snap.cvd_15m_total)
+            )));
+            lines.push(Line::from(format!(
+                "RVOL 5m: {:.2} | LOCAL {:.2}",
+                server_snap.rvol_5m, local_rvol
+            )));
+            lines.push(Line::from(format!(
+                "OI Δ5m: {} | LOCAL {}",
+                format_compact(server_snap.oi_delta_5m),
+                format_compact(snap.oi_delta_5m)
+            )));
+            lines.push(Line::from(format!(
+                "FUND: {:.4}% | LOCAL {:.4}%",
+                server_snap.funding_rate * 100.0,
+                local_funding * 100.0
+            )));
+            lines.push(Line::from(format!(
+                "LIQ/m: {} | LOCAL {}",
+                format_compact(server_snap.liq_rate_usd_per_min),
+                format_compact(snap.liq_rate_per_min)
+            )));
+        }
     } else {
         lines.push(Line::from("No snapshot data"));
     }

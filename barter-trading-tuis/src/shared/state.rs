@@ -4,8 +4,8 @@
 //! so each TUI can render consistent metrics without duplicating calculations.
 
 use crate::shared::types::{
-    CvdData, FundingRateData, LiquidationData, MarketEventMessage, OpenInterestData,
-    OrderBookL1Data, Side, TradeData,
+    CvdData, FundingRateData, LiquidationData, MarketEventMessage, MarketSnapshotMessage,
+    OpenInterestData, OrderBookL1Data, Side, TradeData,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Datelike, Timelike, Utc};
 use rust_decimal::prelude::ToPrimitive;
@@ -468,6 +468,7 @@ struct WhaleCounters {
 pub struct AggregatedSnapshot {
     pub tickers: HashMap<String, TickerSnapshot>,
     pub correlation: [[f64; 3]; 3],
+    pub server_snapshot: Option<MarketSnapshotMessage>,
 }
 
 #[derive(Clone, Debug)]
@@ -780,6 +781,7 @@ pub struct Aggregator {
     last_whale_log: DateTime<Utc>,
     // Shadow-mode logging: record unseen event kinds once
     unknown_event_kinds: HashSet<String>,
+    server_snapshot: Option<MarketSnapshotMessage>,
 }
 
 impl Aggregator {
@@ -790,6 +792,7 @@ impl Aggregator {
             whale_counts: HashMap::new(),
             last_whale_log: Utc::now(),
             unknown_event_kinds: HashSet::new(),
+            server_snapshot: None,
         }
     }
 
@@ -881,6 +884,13 @@ impl Aggregator {
     }
 
     pub fn process_event(&mut self, event: MarketEventMessage) {
+        if event.kind == "market_snapshot" {
+            if let Ok(snapshot) = serde_json::from_value::<MarketSnapshotMessage>(event.data) {
+                self.server_snapshot = Some(snapshot);
+            }
+            return;
+        }
+
         let ticker = event.instrument.base.to_uppercase();
         let kind = event.instrument.kind.to_lowercase();
 
@@ -1041,6 +1051,7 @@ impl Aggregator {
         AggregatedSnapshot {
             tickers: tickers_out,
             correlation,
+            server_snapshot: self.server_snapshot.clone(),
         }
     }
 
