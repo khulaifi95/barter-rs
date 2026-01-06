@@ -25,7 +25,7 @@ clean git tree and a commit recorded here.
 ## Phase C — Centralize Calculations (derived metrics)
 
 - [x] C1: Define MarketSnapshot schema for derived metrics. (commit: 082d608)
-- [ ] C2: Server-side snapshot builder (RVOL/CVD/vol regime/fuel). (commit: )
+- [x] C2: Server-side snapshot builder (RVOL/CVD/vol regime/fuel). (commit: 8b29a3d)
 - [ ] C3: TUIs consume snapshot + drift debug panel. (commit: )
 
 ## Phase D — Cutover & Cleanup
