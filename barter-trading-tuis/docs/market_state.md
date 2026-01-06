@@ -259,6 +259,12 @@ If L1 fails, don't even evaluate L2. This prevents false positives.
 
 **Note**: per-exchange flow/L2 windows remain local for execution detail; state inputs use the server snapshot.
 
+### 3.4 TUI Roles (Harmonized)
+
+- **trading-terminal** = **Macro cockpit** (state machine + gamma + fuel). Primary go/no-go decision screen.
+- **scalper_v2** = **Execution cockpit** (tape speed, L2, trad markets, micro timing).
+- **market_microstructure** = **Deep dive / debug** (whales, divergences, diagnostics).
+
 ---
 
 ## 4. Data Structures
