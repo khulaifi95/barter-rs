@@ -10,8 +10,9 @@ use crate::shared::types::{
 use chrono::{DateTime, Duration as ChronoDuration, Datelike, Timelike, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
+use tracing::warn;
 
 const L2_IMBALANCE_BAND_PCT: f64 = 0.025; // +/-2.5% band (adjustable)
 const L2_WALL_MIN_DISTANCE_PCT: f64 = 0.10; // ignore near-top-of-book noise
@@ -777,6 +778,8 @@ pub struct Aggregator {
     // Debug-only counters for whales per exchange (sliding window)
     whale_counts: HashMap<String, WhaleCounters>,
     last_whale_log: DateTime<Utc>,
+    // Shadow-mode logging: record unseen event kinds once
+    unknown_event_kinds: HashSet<String>,
 }
 
 impl Aggregator {
@@ -786,6 +789,7 @@ impl Aggregator {
             exchange_last_seen: HashMap::new(),
             whale_counts: HashMap::new(),
             last_whale_log: Utc::now(),
+            unknown_event_kinds: HashSet::new(),
         }
     }
 
@@ -959,7 +963,17 @@ impl Aggregator {
                     state.push_orderbook_l2(book, &event.exchange, event.time_exchange);
                 }
             }
-            _ => {}
+            other => {
+                if std::env::var("SHADOW_LOG_UNKNOWN")
+                    .ok()
+                    .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+                    .unwrap_or(false)
+                {
+                    if self.unknown_event_kinds.insert(other.to_string()) {
+                        warn!("Unknown event kind received: {}", other);
+                    }
+                }
+            }
         }
 
         // Track exchange heartbeat
