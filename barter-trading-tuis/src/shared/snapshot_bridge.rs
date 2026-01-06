@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn test_build_vol_score_stable() {
         let snap = sample_snapshot();
-        let vol = build_vol_score(&snap);
+        let vol = build_vol_score(&snap, None);
 
         assert_eq!(vol.regime, VolRegime::Normal);
         assert!(!vol.is_shock);
@@ -320,7 +320,7 @@ mod tests {
     fn test_build_vol_score_expanding() {
         let mut snap = sample_snapshot();
         snap.realized_vol_trend = VolTrend::Expanding;
-        let vol = build_vol_score(&snap);
+        let vol = build_vol_score(&snap, None);
 
         assert_eq!(vol.regime, VolRegime::High);
     }
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn test_build_flow_score_consensus() {
         let snap = sample_snapshot();
-        let flow = build_flow_score(&snap);
+        let flow = build_flow_score(&snap, None);
 
         // All 3 exchanges have positive CVD
         assert_eq!(flow.venues_total, 3);
@@ -341,7 +341,7 @@ mod tests {
     fn test_build_flow_score_mixed() {
         let mut snap = sample_snapshot();
         snap.cvd_per_exchange_5m.insert("okx".to_string(), -100000.0);
-        let flow = build_flow_score(&snap);
+        let flow = build_flow_score(&snap, None);
 
         // 2 positive, 1 negative = 2/3 consensus
         assert_eq!(flow.venues_agreeing, 2);
@@ -359,7 +359,7 @@ mod tests {
             m.insert("okx".to_string(), -50000.0);
             m
         };
-        let flow = build_flow_score(&snap);
+        let flow = build_flow_score(&snap, None);
 
         // 1 positive, 2 negative
         assert_eq!(flow.venues_agreeing, 2);
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn test_build_funding_score() {
         let snap = sample_snapshot();
-        let funding = build_funding_score(&snap);
+        let funding = build_funding_score(&snap, None);
 
         // Average of 0.0001 and 0.00012 = 0.00011
         assert!((funding.current_rate - 0.00011).abs() < 0.00001);
@@ -393,6 +393,7 @@ mod tests {
         let mut agg_snap = AggregatedSnapshot {
             tickers: HashMap::new(),
             correlation: [[0.0; 3]; 3],
+            server_snapshot: None,
         };
         agg_snap
             .tickers
@@ -410,7 +411,7 @@ mod tests {
     fn test_absorption_detection_distribution() {
         let mut snap = sample_snapshot();
         snap.flow_signal = FlowSignal::Distribution;
-        let flow = build_flow_score(&snap);
+        let flow = build_flow_score(&snap, None);
 
         assert!(flow.absorption_detected);
     }
@@ -419,7 +420,7 @@ mod tests {
     fn test_absorption_detection_exhaustion() {
         let mut snap = sample_snapshot();
         snap.flow_signal = FlowSignal::Exhaustion;
-        let flow = build_flow_score(&snap);
+        let flow = build_flow_score(&snap, None);
 
         assert!(flow.absorption_detected);
     }
@@ -427,7 +428,7 @@ mod tests {
     #[test]
     fn test_no_absorption_neutral() {
         let snap = sample_snapshot();
-        let flow = build_flow_score(&snap);
+        let flow = build_flow_score(&snap, None);
 
         assert!(!flow.absorption_detected);
     }

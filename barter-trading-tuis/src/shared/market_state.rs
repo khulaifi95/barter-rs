@@ -1569,6 +1569,7 @@ mod tests {
             &default_gamma_score(),
             &low_consensus_flow,
             &spiking_funding_score(), // Funding also failing
+            &FuelInput::default(),
             &thresholds,
             0,
         );

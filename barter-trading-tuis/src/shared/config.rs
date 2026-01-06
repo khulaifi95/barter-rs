@@ -548,6 +548,17 @@ spike_threshold = 0.0002
 extreme_long = 0.0005
 extreme_short = -0.0001
 
+[fuel]
+rvol_strong_min = 2.0
+rvol_normal_min = 0.8
+rvol_thin_min = 0.5
+oi_momentum_fail_usd = -15000000
+oi_momentum_caution_usd = -5000000
+oi_flat_usd = 3000000
+oi_new_money_min_usd = 5000000
+liq_caution_usd_per_min = 150000
+liq_fail_usd_per_min = 2000000
+
 [freshness_ms]
 price = 1000
 cvd = 2000
@@ -604,6 +615,17 @@ min_agreement_pct = 66
 spike_threshold = 0.0002
 extreme_long = 0.0005
 extreme_short = -0.0001
+
+[fuel]
+rvol_strong_min = 2.0
+rvol_normal_min = 0.8
+rvol_thin_min = 0.5
+oi_momentum_fail_usd = -15000000
+oi_momentum_caution_usd = -5000000
+oi_flat_usd = 3000000
+oi_new_money_min_usd = 5000000
+liq_caution_usd_per_min = 150000
+liq_fail_usd_per_min = 2000000
 
 [freshness_ms]
 price = 1000
