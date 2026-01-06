@@ -20,7 +20,7 @@ clean git tree and a commit recorded here.
 
 - [x] B1: IBKR feed ingestion in barter-data-server + new event type. (commit: 168c6b0)
 - [x] B2: Deribit options poller in barter-data-server + options snapshot event. (commit: 6bc0a44)
-- [ ] B3: TUIs parse new event types with fallback paths. (commit: )
+- [x] B3: TUIs parse new event types with fallback paths. (commit: e332526)
 
 ## Phase C — Centralize Calculations (derived metrics)
 
