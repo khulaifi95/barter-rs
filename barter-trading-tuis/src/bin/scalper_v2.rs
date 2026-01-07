@@ -189,6 +189,26 @@ fn whale_threshold() -> f64 {
     configured.max(500_000.0)
 }
 
+/// Exchange-specific color for visual scanning (full exchange name).
+fn exchange_color(exchange: &str) -> Color {
+    match exchange {
+        "BinanceFuturesUsd" | "BinanceSpot" => Color::Yellow,
+        "BybitPerpetualsUsd" | "BybitSpot" => Color::Magenta,
+        "Okx" => Color::LightBlue,
+        _ => Color::DarkGray,
+    }
+}
+
+/// Exchange color by short name (BNC, BBT, OKX) for consistent styling.
+fn exchange_color_short(short: &str) -> Color {
+    match short {
+        "BNC" => Color::Yellow,
+        "BBT" => Color::Magenta,
+        "OKX" => Color::LightBlue,
+        _ => Color::DarkGray,
+    }
+}
+
 async fn fetch_bvol24h(client: &Client) -> Result<f64, reqwest::Error> {
     let url = "https://www.bitmex.com/api/v1/instrument?symbol=.BVOL24H";
     let resp = client.get(url).send().await?.error_for_status()?;
@@ -587,16 +607,21 @@ fn render_header(
 
         let basis = t.basis.as_ref().map(|b| b.basis_pct).unwrap_or(0.0);
         let basis_color = if basis > 0.02 { C_BUY } else if basis < -0.02 { C_SELL } else { C_DIM };
+        let lag_stale_secs = std::env::var("LAG_STALE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(15.0);
         let (lag_str, lag_color) = match t.trade_lag_secs {
             Some(lag) => {
                 let color = if lag < 2.0 {
                     C_BUY
-                } else if lag < 10.0 {
+                } else if lag < lag_stale_secs {
                     C_NEUTRAL
                 } else {
                     C_SELL
                 };
-                (format!("Lag:{:.0}s", lag), color)
+                let label = if lag >= lag_stale_secs { " STALE" } else { "" };
+                (format!("Lag:{:.0}s{}", lag, label), color)
             }
             None => ("Lag:--".to_string(), C_DIM),
         };
@@ -627,7 +652,7 @@ fn render_header(
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("LEAD:{}", lead),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(exchange_color_short(lead)),
         ));
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
@@ -840,18 +865,19 @@ fn render_book(
         let venues = [("BNC", bnc), ("BBT", bbt), ("OKX", okx)];
 
         for (label, imb) in venues {
+            let label_color = exchange_color_short(label);
             if imb > 1.0 {
                 let (bar, color) = bidir_bar(imb, bar_width);
                 let dir = if imb > 55.0 { "BID" } else if imb < 45.0 { "ASK" } else { "BAL" };
 
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{}: ", label), Style::default().fg(C_DIM)),
+                    Span::styled(format!("{}: ", label), Style::default().fg(label_color)),
                     Span::styled(bar, Style::default().fg(color)),
                     Span::styled(format!(" {:>2.0}% {}", imb, dir), Style::default().fg(color)),
                 ]));
             } else {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{}: ", label), Style::default().fg(C_DIM)),
+                    Span::styled(format!("{}: ", label), Style::default().fg(label_color)),
                     Span::styled("-- no L2 --", Style::default().fg(C_DIM)),
                 ]));
             }
@@ -891,12 +917,12 @@ fn render_exchanges(
     let mut lines = Vec::new();
 
     if let Some(t) = snapshot.tickers.get(ticker) {
-        // Header
+        // Header (colors match whale tape for consistency)
         lines.push(Line::from(vec![
             Span::styled("         ", Style::default()),
-            Span::styled(format!("{:^10}", "OKX"), Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{:^10}", "BNC"), Style::default().fg(C_ACCENT)),
-            Span::styled(format!("{:^10}", "BBT"), Style::default().fg(Color::Magenta)),
+            Span::styled(format!("{:^10}", "OKX"), Style::default().fg(exchange_color_short("OKX"))),
+            Span::styled(format!("{:^10}", "BNC"), Style::default().fg(exchange_color_short("BNC"))),
+            Span::styled(format!("{:^10}", "BBT"), Style::default().fg(exchange_color_short("BBT"))),
         ]));
 
         let norm = |n: &str| -> &'static str {
@@ -1050,12 +1076,21 @@ fn render_whales(
                     else { format!("${:.0}K", w.volume_usd / 1_000.0) };
                 let price = if w.price >= 1000.0 { format!("@{:.0}", w.price) } else { format!("@{:.2}", w.price) };
 
+                // Hybrid coloring: BUY/SELL stays green/red, exchange gets distinct color
+                let exch_color = exchange_color_short(ex);
+
                 lines.push(Line::from(vec![
-                    Span::raw("→ "),
+                    // Exchange-colored arrow for quick visual scan
+                    Span::styled("→ ", Style::default().fg(exch_color)),
+                    // Volume in BUY/SELL color (critical distinction)
                     Span::styled(format!("{:>7} ", vol), Style::default().fg(side_color).add_modifier(Modifier::BOLD)),
+                    // Side in BUY/SELL color (critical distinction)
                     Span::styled(format!("{:4} ", w.side.as_str().to_uppercase()), Style::default().fg(side_color)),
+                    // Price stays neutral
                     Span::styled(format!("{} ", price), Style::default().fg(C_BRIGHT)),
-                    Span::styled(format!("[{}] ", ex), Style::default().fg(C_ACCENT)),
+                    // Exchange label in exchange color (scannable)
+                    Span::styled(format!("[{}] ", ex), Style::default().fg(exch_color).add_modifier(Modifier::BOLD)),
+                    // Age stays dim
                     Span::styled(format!("{:.0}s", age), Style::default().fg(C_DIM)),
                 ]));
             }

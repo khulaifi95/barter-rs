@@ -2091,8 +2091,8 @@ impl TickerState {
         let vwap_5m = self.vwap(300);
         // Per-exchange fairness: ensure all exchanges represented in whale display
         // Show more recent whales while keeping cross-exchange fairness.
-        // Bump to 80 so the tape captures more of the last 5m without losing venue balance.
-        let whales: Vec<WhaleRecord> = self.fair_whale_selection(80);
+        // Bump to 120 so the tape captures more of the last 5m without losing venue balance.
+        let whales: Vec<WhaleRecord> = self.fair_whale_selection(120);
         let (clusters, cascade_risk, next_level, protection_level) = self.liquidation_clusters();
         let liq_rate_per_min = self.liquidation_rate_per_min();
         let liq_bucket = self.liquidation_bucket_size();
@@ -3004,7 +3004,13 @@ impl TickerState {
         let now_local = Utc::now();
         let latest_trade_time = self.trades.back().map(|t| t.time).unwrap_or(now_local);
         // Clamp to local time to avoid future exchange timestamps shrinking the window.
-        let now_ref = latest_trade_time.min(now_local);
+        // If exchange time is lagging badly, use wall-clock to keep a strict 5m window.
+        let lag_secs = (now_local - latest_trade_time).num_seconds();
+        let now_ref = if lag_secs > 10 {
+            now_local
+        } else {
+            latest_trade_time.min(now_local)
+        };
         let cutoff = now_ref - ChronoDuration::seconds(300);
 
         let mut active_exchange_count = 0usize;

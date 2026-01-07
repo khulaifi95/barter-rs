@@ -994,7 +994,24 @@ Every signal has a **maximum allowed staleness**. If exceeded, the signal is mar
 | ES/NQ (Trad Markets) | 2 minutes | **NO-TRAD mode** - bypass macro filter |
 | Volatility History | 1 hour | Fallback to trend-based percentile until VolRegimeEngine wired |
 
-### 9.2 NO-TRAD Fallback Mode
+### 9.2 Latency vs Freshness (Operational Metrics)
+
+We expose **freshness** and **exchange-timestamp lag**, not a strict end-to-end latency number:
+
+- **Trade lag (exchange timestamp)**: `now - last_trade_time` using exchange time.
+  Shown in scalper headers as `Lag: Xs` and used for STALE detection.
+- **Exchange health**: seconds since the last event was received per exchange
+  (receipt-time freshness, not exchange-time).
+- **Book freshness / OI freshness**: seconds since last L2 / OI updates per exchange.
+
+These metrics indicate **data recency**, not system processing latency. If true
+end-to-end latency is needed, instrument:
+
+1) Exchange → server ingest (`time_received - time_exchange`)
+2) Server → client transport (`client_now - time_received`)
+3) Client render time (optional)
+
+### 9.3 NO-TRAD Fallback Mode
 
 If traditional market data (ES/NQ) is stale or unavailable:
 
@@ -1013,7 +1030,7 @@ if trad_status != TradMarketStatus::Live {
 }
 ```
 
-### 9.3 NO-GAMMA Fallback Mode
+### 9.4 NO-GAMMA Fallback Mode
 
 If Deribit options data is stale or unavailable:
 

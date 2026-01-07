@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
+use std::collections::HashMap;
 
 pub fn render(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
     let chunks = Layout::default()
@@ -31,6 +32,25 @@ fn render_body(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
     if let Some(snap) = snapshot {
         let price = resolve_display_price(Some(snap));
         lines.push(Line::from(format!("SPOT: ${}", format_price(price))));
+        lines.push(Line::from(format!(
+            "LAG (trade ts): {}",
+            snap.trade_lag_secs
+                .map(|v| format!("{:.1}s", v))
+                .unwrap_or_else(|| "--".to_string())
+        )));
+        lines.push(Line::from(format!(
+            "EXCH AGE: {}",
+            format_age_map(&snap.exchange_health)
+        )));
+        lines.push(Line::from(format!(
+            "BOOK AGE: {}",
+            format_age_map(&snap.book_freshness)
+        )));
+        lines.push(Line::from(format!(
+            "OI AGE: {:.1}s | {}",
+            snap.oi_freshness_secs,
+            format_age_map(&snap.oi_freshness_per_exchange)
+        )));
         lines.push(Line::from(format!(
             "CVD 5m: {} | CVD 1m: {}",
             format_compact(snap.cvd_5m_total),
@@ -145,6 +165,37 @@ fn render_body(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
         .borders(Borders::ALL)
         .title(" DEBUG ");
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }).block(block), area);
+}
+
+fn format_age_map(map: &HashMap<String, f64>) -> String {
+    if map.is_empty() {
+        return "--".to_string();
+    }
+    let mut items: Vec<(&str, f64)> = Vec::new();
+    let mut other: Vec<(&str, f64)> = Vec::new();
+    for (k, v) in map {
+        let abbrev = if k.to_lowercase().contains("binance") {
+            "BNC"
+        } else if k.to_lowercase().contains("bybit") {
+            "BBT"
+        } else if k.to_lowercase().contains("okx") {
+            "OKX"
+        } else {
+            "OTH"
+        };
+        if abbrev == "OTH" {
+            other.push((abbrev, *v));
+        } else {
+            items.push((abbrev, *v));
+        }
+    }
+    items.sort_by_key(|(k, _)| *k);
+    items.extend(other);
+    let parts: Vec<String> = items
+        .into_iter()
+        .map(|(k, v)| format!("{} {:.1}s", k, v))
+        .collect();
+    parts.join(" ")
 }
 
 fn render_footer(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {

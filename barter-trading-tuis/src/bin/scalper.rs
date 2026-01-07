@@ -295,6 +295,27 @@ fn whale_threshold() -> f64 {
     configured.max(200_000.0)
 }
 
+/// Exchange-specific color for whale tape visual scanning.
+/// Preserves BUY/SELL green/red distinction while allowing quick exchange identification.
+fn exchange_color(exchange: &str) -> Color {
+    match exchange {
+        "BinanceFuturesUsd" | "BinanceSpot" => Color::Yellow,
+        "BybitPerpetualsUsd" | "BybitSpot" => Color::Magenta,
+        "Okx" => Color::LightBlue,
+        _ => Color::DarkGray,
+    }
+}
+
+/// Exchange color by short name (BNC, BBT, OKX) for consistent header styling.
+fn exchange_color_short(short: &str) -> Color {
+    match short {
+        "BNC" => Color::Yellow,
+        "BBT" => Color::Magenta,
+        "OKX" => Color::LightBlue,
+        _ => Color::DarkGray,
+    }
+}
+
 /// Fetch BitMEX 24h historical volatility index (.BVOL24H)
 async fn fetch_bvol24h(client: &Client) -> Result<f64, reqwest::Error> {
     let url = "https://www.bitmex.com/api/v1/instrument?symbol=.BVOL24H";
@@ -838,7 +859,7 @@ fn render_header_extended(
             // Leader is first (highest abs CVD)
             let leader = venue_data[0].0;
             venue_spans.push(Span::raw(" "));
-            venue_spans.push(Span::styled(format!("LEAD:{}", leader), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+            venue_spans.push(Span::styled(format!("LEAD:{}", leader), Style::default().fg(exchange_color_short(leader)).add_modifier(Modifier::BOLD)));
 
             // Check divergence: if venues disagree on direction
             let directions: Vec<bool> = venue_data.iter()
@@ -1287,18 +1308,27 @@ fn render_whale_tape(
                     format!("@{:.2}", whale.price)
                 };
 
+                // Hybrid coloring: BUY/SELL stays green/red, exchange gets distinct color
+                let exch_color = exchange_color(&whale.exchange);
+
                 lines.push(Line::from(vec![
-                    Span::raw("→ "),
+                    // Exchange-colored arrow for quick visual scan
+                    Span::styled("→ ", Style::default().fg(exch_color)),
+                    // Volume in BUY/SELL color (critical distinction)
                     Span::styled(
                         format!("{} ", vol_str),
                         Style::default().fg(side_color).add_modifier(Modifier::BOLD),
                     ),
+                    // Side in BUY/SELL color (critical distinction)
                     Span::styled(
                         format!("{:4} ", whale.side.as_str().to_uppercase()),
                         Style::default().fg(side_color),
                     ),
+                    // Price stays neutral
                     Span::raw(format!("{} ", price_str)),
-                    Span::styled(format!("{} ", exch_label), Style::default().fg(Color::Cyan)),
+                    // Exchange label in exchange color (scannable)
+                    Span::styled(format!("{} ", exch_label), Style::default().fg(exch_color).add_modifier(Modifier::BOLD)),
+                    // Age stays gray
                     Span::styled(
                         format!("← {:.1}s", age),
                         Style::default().fg(Color::DarkGray),
@@ -1549,16 +1579,21 @@ fn render_header_compact_new(
         let spread_pct = t.latest_spread_pct.unwrap_or(0.0);
         let basis = t.basis.as_ref().map(|b| b.basis_pct).unwrap_or(0.0);
         let tps = t.trade_speed;
+        let lag_stale_secs = std::env::var("LAG_STALE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(15.0);
         let (lag_str, lag_color) = match t.trade_lag_secs {
             Some(lag) => {
                 let color = if lag < 2.0 {
                     Color::Green
-                } else if lag < 10.0 {
+                } else if lag < lag_stale_secs {
                     Color::Yellow
                 } else {
                     Color::Red
                 };
-                (format!("Lag:{:.0}s", lag), color)
+                let label = if lag >= lag_stale_secs { " STALE" } else { "" };
+                (format!("Lag:{:.0}s{}", lag, label), color)
             }
             None => ("Lag:--".to_string(), Color::DarkGray),
         };
@@ -1619,7 +1654,7 @@ fn render_header_compact_new(
         spans.push(Span::raw("  "));
         spans.push(Span::styled(format!("Sprd:{:.2}%", spread_pct), Style::default().fg(Color::Gray)));
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(format!("LEAD:{}", lead_short), Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(format!("LEAD:{}", lead_short), Style::default().fg(exchange_color_short(lead_short))));
         spans.push(Span::raw("  "));
         spans.push(Span::styled(format!("OI:{}{} ", oi_arrow, oi_delta_str), Style::default().fg(oi_color)));
         spans.push(Span::styled(oi_age_str, Style::default().fg(oi_age_color)));
@@ -1849,6 +1884,7 @@ fn render_l2_book_new(
         let venues = [("BNC", bnc, bnc > 1.0), ("BBT", bbt, bbt > 1.0), ("OKX", okx, okx > 1.0)];
 
         for (label, imb, has_data) in venues {
+            let label_color = exchange_color_short(label);
             if has_data {  // has_data = throttled > 1.0, already implies valid
                 let dir = if imb > 55.0 { "BID" } else if imb < 45.0 { "ASK" } else { "BAL" };
                 let color = if imb > 55.0 { Color::Green } else if imb < 45.0 { Color::Red } else { Color::Yellow };
@@ -1857,14 +1893,14 @@ fn render_l2_book_new(
                 let bar = format!("{}{}", "█".repeat(fill), "░".repeat(bar_w.saturating_sub(fill)));
 
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{}: ", label), Style::default().fg(Color::Gray)),
+                    Span::styled(format!("{}: ", label), Style::default().fg(label_color)),
                     Span::styled(format!("{:>3.0}% {}", imb, dir), Style::default().fg(color)),
                     Span::raw(" "),
                     Span::styled(bar, Style::default().fg(color)),
                 ]));
             } else {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{}: ", label), Style::default().fg(Color::Gray)),
+                    Span::styled(format!("{}: ", label), Style::default().fg(label_color)),
                     Span::styled("-- (no L2)", Style::default().fg(Color::DarkGray)),
                 ]));
             }
@@ -1903,12 +1939,12 @@ fn render_exchanges_table_new(
     let mut lines = Vec::new();
 
     if let Some(t) = snapshot.tickers.get(focused_ticker) {
-        // Header row - align with data columns below
+        // Header row - align with data columns below (colors match whale tape)
         lines.push(Line::from(vec![
             Span::styled("            ", Style::default()),
-            Span::styled(format!("{:^12}", "OKX"), Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{:^12}", "BNC"), Style::default().fg(Color::Cyan)),
-            Span::styled(format!("{:^12}", "BBT"), Style::default().fg(Color::Magenta)),
+            Span::styled(format!("{:^12}", "OKX"), Style::default().fg(exchange_color_short("OKX"))),
+            Span::styled(format!("{:^12}", "BNC"), Style::default().fg(exchange_color_short("BNC"))),
+            Span::styled(format!("{:^12}", "BBT"), Style::default().fg(exchange_color_short("BBT"))),
         ]));
 
         // Helper to get stats with raw values for coloring
@@ -2137,7 +2173,7 @@ fn render_footer_new(
                 else if ex_upper.starts_with("OKX") { "OKX" }
                 else { "OTH" };
             spans.push(Span::raw(" | "));
-            spans.push(Span::styled(format!("LEAD:{}", short), Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled(format!("LEAD:{}", short), Style::default().fg(exchange_color_short(short))));
         }
     }
 
