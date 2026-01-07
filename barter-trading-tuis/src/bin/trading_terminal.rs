@@ -7,7 +7,7 @@ use std::{
     error::Error,
     io,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc, OnceLock,
     },
     time::{Duration, Instant},
@@ -15,15 +15,17 @@ use std::{
 
 use barter_trading_tuis::{
     Aggregator, ConnectionStatus, OrchestratorResult, WebSocketClient, WebSocketConfig,
-    ticker_to_binance_symbol, Candle1m,
+    ticker_to_binance_symbol, Candle1m, TradMarketState, TradeData,
 };
 use barter_trading_tuis::shared::{
     audit::AuditLogger,
     config::Config,
-    market_state::{ConfigProvider, TradMarketStatus},
+    market_state::{ConfigProvider, Signal, TradMarketStatus},
     options_state::OptionsContextBuilder,
     orchestrator::StateOrchestrator,
     snapshot_bridge::build_market_data_input,
+    state::TickerSnapshot,
+    types::TradTickData,
 };
 use barter_trading_tuis::views::{ActiveView, ViewContext};
 use crossterm::{
@@ -54,6 +56,54 @@ fn get_tickers() -> Vec<String> {
 /// Get WebSocket URL from WS_URL env var (default: ws://127.0.0.1:9001)
 fn get_ws_url() -> String {
     std::env::var("WS_URL").unwrap_or_else(|_| "ws://127.0.0.1:9001".to_string())
+}
+
+const BINANCE_PRICE_STALE_SECS: f64 = 2.0;
+
+fn binance_perp_age(snapshot: &TickerSnapshot) -> Option<f64> {
+    snapshot
+        .exchange_health
+        .iter()
+        .filter_map(|(name, age)| {
+            let name = name.to_lowercase();
+            if name.contains("binancefutures")
+                || name.contains("binancefuturesusd")
+                || (name.contains("binance") && name.contains("futures"))
+            {
+                Some(*age)
+            } else {
+                None
+            }
+        })
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .or_else(|| {
+            snapshot
+                .exchange_health
+                .iter()
+                .filter_map(|(name, age)| {
+                    if name.to_lowercase().contains("binance") {
+                        Some(*age)
+                    } else {
+                        None
+                    }
+                })
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        })
+}
+
+fn resolve_spot_price(snapshot: &TickerSnapshot) -> f64 {
+    let binance_fresh = binance_perp_age(snapshot)
+        .map(|age| age <= BINANCE_PRICE_STALE_SECS)
+        .unwrap_or(true);
+    if binance_fresh {
+        snapshot
+            .binance_perp_last
+            .filter(|&p| p > 0.0)
+            .or(snapshot.latest_price)
+            .unwrap_or(0.0)
+    } else {
+        snapshot.latest_price.unwrap_or(0.0)
+    }
 }
 
 fn tickers() -> &'static [String] {
@@ -178,15 +228,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (mut event_rx, mut status_rx) = client.start();
 
     let options_cache = Arc::new(Mutex::new(HashMap::new()));
+    let trad_state = Arc::new(Mutex::new(TradMarketState::new()));
+    let trad_last_ms = Arc::new(AtomicI64::new(0));
 
     {
         let agg = Arc::clone(&aggregator);
         let options_cache = Arc::clone(&options_cache);
+        let trad_state = Arc::clone(&trad_state);
+        let trad_last_ms = Arc::clone(&trad_last_ms);
         tokio::spawn(async move {
             let options_builder = OptionsContextBuilder::new();
             while let Some(event) = event_rx.recv().await {
                 if event.kind == "trad_tick" {
-                    // TradFi ticks are not consumed in this TUI yet.
+                    if let Ok(tick) = serde_json::from_value::<TradTickData>(event.data.clone()) {
+                        if tick.ts > 0 {
+                            trad_last_ms.store(tick.ts, Ordering::Relaxed);
+                        }
+                        let size = if tick.sz > 0.0 { tick.sz } else { 1.0 };
+                        let mut trad_guard = trad_state.lock().await;
+                        match tick.symbol.as_str() {
+                            "ES" => trad_guard.update_es_tick(tick.px, size, tick.ts),
+                            "NQ" => trad_guard.update_nq_tick(tick.px, size, tick.ts),
+                            _ => {}
+                        }
+                    }
                     continue;
                 }
                 if event.kind == "options_chain" {
@@ -198,7 +263,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 .snapshot()
                                 .tickers
                                 .get(&ticker)
-                                .and_then(|s| s.binance_perp_last)
+                                .map(resolve_spot_price)
                                 .unwrap_or(0.0)
                         };
                         if spot > 0.0 {
@@ -208,6 +273,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     continue;
+                }
+
+                if event.kind == "trade" && event.instrument.base.to_lowercase() == "btc" {
+                    if let Ok(trade) = serde_json::from_value::<TradeData>(event.data.clone()) {
+                        let ts = event.time_exchange.timestamp_millis();
+                        trad_state
+                            .lock()
+                            .await
+                            .update_btc_trade(trade.price, trade.amount, ts);
+                    }
                 }
 
                 let mut guard = agg.lock().await;
@@ -234,6 +309,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         let agg = Arc::clone(&aggregator);
         let options_cache = Arc::clone(&options_cache);
+        let trad_last_ms = Arc::clone(&trad_last_ms);
         let state_tx = state_tx.clone();
         tokio::spawn(async move {
             let config = Config::load().unwrap_or_else(|e| {
@@ -241,12 +317,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 Config::default()
             });
             let logger = AuditLogger::new(&config.thresholds().audit);
+            let trad_fresh_ms = config.freshness(Signal::TradMarkets).as_millis() as u64;
             let mut orchestrator = StateOrchestrator::new(config, logger);
             let calc_interval = Duration::from_millis(200);
             let mut last_calc = Instant::now();
 
             loop {
                 if last_calc.elapsed() >= calc_interval {
+                    let trad_ts = trad_last_ms.load(Ordering::Relaxed);
+                    let trad_status = if trad_ts <= 0 {
+                        TradMarketStatus::Unavailable
+                    } else {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let age_ms = (now_ms - trad_ts).max(0) as u64;
+                        let max_age = trad_fresh_ms;
+                        if age_ms > max_age {
+                            TradMarketStatus::Stale
+                        } else {
+                            TradMarketStatus::Live
+                        }
+                    };
+
                     let snapshot = {
                         let guard = agg.lock().await;
                         guard.snapshot()
@@ -262,8 +353,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let mut input = build_market_data_input(
                             ticker_snap,
                             server_ticker,
-                            TradMarketStatus::Unavailable,
+                            trad_status,
                         );
+                        input.timestamps.trad_markets_ts = trad_ts;
                         if let Some(ctx) = options_cache.get(ticker) {
                             input.options_context = Some(ctx.clone());
                         }
@@ -297,11 +389,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let state_map = state_rx.borrow();
             let state = state_map.get(focused_ticker);
 
+            let trad_signals = {
+                let trad_guard = trad_state.lock().await;
+                trad_guard.get_signals()
+            };
             let ctx = ViewContext {
                 snapshot: &snapshot,
                 state,
                 focused_ticker,
                 connected: connected.load(Ordering::Relaxed),
+                trad_signals: Some(trad_signals),
             };
 
             terminal.draw(|f| {

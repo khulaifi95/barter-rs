@@ -6,7 +6,7 @@
 //! - Flow + L2 Depth integration
 
 use crate::shared::market_state::{Direction, GammaPosition, State, TradingBias, VolRegime, Warning};
-use crate::views::{format_compact, render_header, ActiveView, ViewContext};
+use crate::views::{format_compact, render_header, resolve_display_price, ActiveView, ViewContext};
 use ratatui::{
     layout::{Constraint, Direction as LayoutDir, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -83,6 +83,18 @@ fn render_state_banner(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
             Span::styled(format!("{}%", state.confidence), Style::default().fg(Color::White)),
         ]);
 
+        let reason = state.reason.trim();
+        let max_len = area.width.saturating_sub(12) as usize;
+        let reason_short = if reason.len() > max_len && max_len > 3 {
+            format!("{}...", &reason[..max_len - 3])
+        } else {
+            reason.to_string()
+        };
+        let line3 = Line::from(vec![
+            Span::raw("  Reason: "),
+            Span::styled(reason_short, Style::default().fg(Color::Gray)),
+        ]);
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(match state.state {
@@ -91,7 +103,7 @@ fn render_state_banner(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
                 State::Wait => Color::Red,
             }));
 
-        f.render_widget(Paragraph::new(vec![line1, line2]).block(block), area);
+        f.render_widget(Paragraph::new(vec![line1, line2, line3]).block(block), area);
     } else {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -143,7 +155,7 @@ fn render_filter_cards(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
                 Span::raw("  "),
                 Span::styled(vol_regime_str, Style::default().fg(l1_color)),
             ]),
-            Line::from(format!("  Pctl: {:.0}th  RV: {:.2}%", vol.percentile, vol.current_rv * 100.0)),
+            Line::from(format!("  Pctl: {:.0}th  RV: {:.2}%", vol.percentile, vol.current_rv)),
             Line::from(vec![
                 Span::raw("  σ: "),
                 Span::styled(format!("{:.1}", vol.zscore_1m), Style::default().fg(zscore_color)),
@@ -272,6 +284,9 @@ fn render_filter_cards(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
         f.render_widget(Paragraph::new(l3_lines).block(l3_block), cols[2]);
 
         // L3: FUEL
+        let fuel_warming =
+            fuel.rvol <= 0.0 && fuel.oi_delta_usd_5m == 0.0 && fuel.liq_rate_usd_per_min == 0.0;
+
         let rvol_line = match fuel.rvol_status {
             crate::shared::market_state::RvolStatus::Strong => ("✓", Color::Green, "STRONG"),
             crate::shared::market_state::RvolStatus::Normal => ("✓", Color::Green, "OK"),
@@ -296,32 +311,57 @@ fn render_filter_cards(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
             crate::shared::market_state::FuelQuality::Fail => ("FAIL", Color::Red),
         };
 
-        let fuel_lines = vec![
-            Line::from(vec![
-                Span::styled(rvol_line.0, Style::default().fg(rvol_line.1)),
-                Span::raw(format!(" RVOL: {:.2}x ", fuel.rvol)),
-                Span::styled(rvol_line.2, Style::default().fg(rvol_line.1)),
-            ]),
-            Line::from(vec![
-                Span::styled(oi_icon, Style::default().fg(oi_color)),
-                Span::raw(" OI Δ: $"),
-                Span::styled(format_compact(fuel.oi_delta_usd_5m), Style::default().fg(oi_color)),
-                Span::raw(" "),
-                Span::styled(oi_label, Style::default().fg(oi_color)),
-            ]),
-            Line::from(vec![
-                Span::styled(liq_icon, Style::default().fg(liq_color)),
-                Span::raw(" LIQ: "),
-                Span::styled(liq_label, Style::default().fg(liq_color)),
-                Span::raw(" "),
-                Span::styled(format_compact(fuel.liq_rate_usd_per_min), Style::default().fg(liq_color)),
-                Span::raw("/m"),
-            ]),
-            Line::from(Span::styled(
-                format!("  Quality: {}", quality_label),
-                Style::default().fg(quality_color).add_modifier(Modifier::BOLD),
-            )),
-        ];
+        let fuel_lines = if fuel_warming {
+            let warm_color = Color::DarkGray;
+            vec![
+                Line::from(vec![
+                    Span::styled("•", Style::default().fg(warm_color)),
+                    Span::raw(" RVOL: -- "),
+                    Span::styled("WARM", Style::default().fg(warm_color)),
+                ]),
+                Line::from(vec![
+                    Span::styled("•", Style::default().fg(warm_color)),
+                    Span::raw(" OI Δ: -- "),
+                    Span::styled("WARM", Style::default().fg(warm_color)),
+                ]),
+                Line::from(vec![
+                    Span::styled("•", Style::default().fg(warm_color)),
+                    Span::raw(" LIQ: -- "),
+                    Span::styled("WARM", Style::default().fg(warm_color)),
+                ]),
+                Line::from(Span::styled(
+                    "  Quality: WARM",
+                    Style::default().fg(warm_color),
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(vec![
+                    Span::styled(rvol_line.0, Style::default().fg(rvol_line.1)),
+                    Span::raw(format!(" RVOL: {:.2}x ", fuel.rvol)),
+                    Span::styled(rvol_line.2, Style::default().fg(rvol_line.1)),
+                ]),
+                Line::from(vec![
+                    Span::styled(oi_icon, Style::default().fg(oi_color)),
+                    Span::raw(" OI Δ: $"),
+                    Span::styled(format_compact(fuel.oi_delta_usd_5m), Style::default().fg(oi_color)),
+                    Span::raw(" "),
+                    Span::styled(oi_label, Style::default().fg(oi_color)),
+                ]),
+                Line::from(vec![
+                    Span::styled(liq_icon, Style::default().fg(liq_color)),
+                    Span::raw(" LIQ: "),
+                    Span::styled(liq_label, Style::default().fg(liq_color)),
+                    Span::raw(" "),
+                    Span::styled(format_compact(fuel.liq_rate_usd_per_min), Style::default().fg(liq_color)),
+                    Span::raw("/m"),
+                ]),
+                Line::from(Span::styled(
+                    format!("  Quality: {}", quality_label),
+                    Style::default().fg(quality_color).add_modifier(Modifier::BOLD),
+                )),
+            ]
+        };
         let fuel_block = Block::default()
             .borders(Borders::ALL)
             .title(" L3 FUEL ")
@@ -846,13 +886,76 @@ fn render_warnings_strip(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
         warn_spans.push(Span::styled("--", Style::default().fg(Color::Gray)));
     }
 
-    f.render_widget(Paragraph::new(Line::from(warn_spans)), area);
+    let trad_line = build_trad_line(ctx);
+    f.render_widget(Paragraph::new(vec![Line::from(warn_spans), trad_line]), area);
+}
+
+fn build_trad_line(ctx: &ViewContext<'_>) -> Line<'static> {
+    let mut spans: Vec<Span> = vec![Span::styled(
+        " TRAD: ",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )];
+
+    let no_trad = ctx.state.map(|s| s.no_trad_mode).unwrap_or(true);
+    let signals = ctx.trad_signals.as_ref();
+    let has_prices = signals
+        .map(|s| s.es_price > 0.0 || s.nq_price > 0.0)
+        .unwrap_or(false);
+
+    if no_trad || !has_prices {
+        spans.push(Span::styled(
+            if no_trad { "NO-T" } else { "--" },
+            Style::default().fg(Color::Yellow),
+        ));
+        return Line::from(spans);
+    }
+
+    if let Some(s) = signals {
+        spans.push(Span::styled(
+            format!("ES {:.2} ", s.es_price),
+            Style::default().fg(Color::White),
+        ));
+        spans.push(Span::styled(
+            format!("NQ {:.2}", s.nq_price),
+            Style::default().fg(Color::White),
+        ));
+
+        let btc_es_pct = s.btc_es_spread * 100.0;
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(
+            format!("ΔBTC-ES {:+.2}%", btc_es_pct),
+            Style::default().fg(if btc_es_pct >= 0.0 { Color::Green } else { Color::Red }),
+        ));
+
+        let lead_corr_ok = s.lead_lag_corr.map(|c| c.abs() >= 0.50).unwrap_or(false);
+        let lead_val = if !lead_corr_ok {
+            "N/A".to_string()
+        } else if s.lead_lag_secs > 0 {
+            "ES".to_string()
+        } else if s.lead_lag_secs < 0 {
+            "BTC".to_string()
+        } else {
+            "SYNC".to_string()
+        };
+        let lead_time = if lead_corr_ok && s.lead_lag_secs != 0 {
+            format!(" +{}s", s.lead_lag_secs.abs())
+        } else {
+            "".to_string()
+        };
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(
+            format!("LEAD {}{}", lead_val, lead_time),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
+    Line::from(spans)
 }
 
 fn render_footer(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
     let ticker = ctx.focused_ticker;
     let snapshot = ctx.snapshot.tickers.get(ticker);
-    let price = snapshot.and_then(|t| t.binance_perp_last).unwrap_or(0.0);
+    let price = resolve_display_price(snapshot).unwrap_or(0.0);
     let price_str = if price >= 1000.0 {
         format!("${:.2}", price)
     } else if price > 0.0 {

@@ -131,14 +131,24 @@ If L1 fails, don't even evaluate L2. This prevents false positives.
 - **Config-driven thresholds**: all fuel thresholds live in `config/thresholds.toml`.
 - **Centralized feeds**: Deribit options + IBKR trad ticks ingested by `barter-data-server`, TUIs no longer fetch directly.
 - **Server snapshots**: `market_snapshot` events power L1/L3 fuel inputs (RVOL/OI/Funding/Liq) for consistent state decisions.
+- **State reason**: human-readable reason displayed in state banner (READY/CAUTION/WAIT rationale).
+- **Warnings strip**: renders Warning types + freshness ages + compact TradFi summary line.
+- **Fuel warm-up**: L3 Fuel shows WARM (not 0.00) until sufficient history is available.
+- **Price display**: prefer Binance perp last; fallback to snapshot price if stale.
+- **IBKR logging**: tick throughput + silent disconnect detection in data server.
 
 ### Pending / Gaps
 - **True 7-day percentile**: VolRegimeEngine exists but not yet wired into runtime; server snapshot still reports 0/unknown percentile.
 - **Per-exchange drift**: Flow tables still use per-exchange rolling windows (kept for execution views).
 
-### Planned (Migration)
-- Centralize **TradFi + Deribit options** into barter-data-server for consistent snapshots across TUIs.
+### Trade-offs (Intentional)
+- **L2 imbalance / walls** are context only (not part of state gating).
+- **NO-OPTS / NO-T** mode: bias and state proceed from flow-only inputs when options/trad data unavailable.
+- **Vol percentile fallback**: use trend-derived percentile when server does not provide history-backed percentile.
+
+### Planned (Next)
 - Replace trend-based percentile with **VolRegimeEngine** (168 hourly samples + 60 1m returns).
+- Add IBKR health endpoint / liveness reporting (optional monitoring).
 
 ### Review Checkpoints (Thresholds)
 - **Pre-centralization:** Re-validate RVOL/OI/liquidation/funding thresholds against live data in each TUI to ensure no drift.

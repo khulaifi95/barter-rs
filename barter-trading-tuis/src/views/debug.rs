@@ -1,6 +1,6 @@
 //! Debug view - raw state and snapshot signals for diagnostics.
 
-use crate::views::{format_compact, format_price, render_header, ActiveView, ViewContext};
+use crate::views::{format_compact, format_price, render_header, resolve_display_price, ActiveView, ViewContext};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     text::Line,
@@ -29,10 +29,8 @@ fn render_body(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
     let mut lines = Vec::new();
 
     if let Some(snap) = snapshot {
-        lines.push(Line::from(format!(
-            "SPOT: ${}",
-            format_price(snap.binance_perp_last)
-        )));
+        let price = resolve_display_price(Some(snap));
+        lines.push(Line::from(format!("SPOT: ${}", format_price(price))));
         lines.push(Line::from(format!(
             "CVD 5m: {} | CVD 1m: {}",
             format_compact(snap.cvd_5m_total),

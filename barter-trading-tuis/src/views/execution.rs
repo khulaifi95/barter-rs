@@ -1,6 +1,6 @@
 //! Execution view - focused on trade-ready context.
 
-use crate::views::{format_optional_price, format_price, render_header, ActiveView, ViewContext};
+use crate::views::{format_optional_price, format_price, render_header, resolve_display_price, ActiveView, ViewContext};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     text::Line,
@@ -36,7 +36,7 @@ fn render_body(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
 fn render_execution_context(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
     let ticker = ctx.focused_ticker;
     let snapshot = ctx.snapshot.tickers.get(ticker);
-    let price = snapshot.and_then(|t| t.binance_perp_last);
+    let price = resolve_display_price(snapshot);
     let best_bid = snapshot.and_then(|t| t.best_bid).map(|(p, _)| p);
     let best_ask = snapshot.and_then(|t| t.best_ask).map(|(p, _)| p);
 

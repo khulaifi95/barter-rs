@@ -6,6 +6,7 @@ pub mod execution;
 pub mod global_radar;
 
 use crate::shared::orchestrator::OrchestratorResult;
+use crate::shared::trad_markets::CorrelationSignals;
 use crate::shared::state::{AggregatedSnapshot, TickerSnapshot};
 use chrono::Utc;
 use ratatui::{
@@ -38,6 +39,7 @@ pub struct ViewContext<'a> {
     pub state: Option<&'a OrchestratorResult>,
     pub focused_ticker: &'a str,
     pub connected: bool,
+    pub trad_signals: Option<CorrelationSignals>,
 }
 
 pub fn render(f: &mut Frame, area: Rect, view: ActiveView, ctx: &ViewContext<'_>) {
@@ -51,7 +53,7 @@ pub fn render(f: &mut Frame, area: Rect, view: ActiveView, ctx: &ViewContext<'_>
 pub(crate) fn render_header(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>, view: ActiveView) {
     let ticker = ctx.focused_ticker;
     let snapshot = ctx.snapshot.tickers.get(ticker);
-    let price = snapshot.and_then(|t| t.binance_perp_last);
+    let price = resolve_display_price(snapshot);
     let tabs = format!(
         "[1]{} [2]{} [3]{}",
         ActiveView::GlobalRadar.label(),
@@ -178,6 +180,28 @@ pub(crate) fn format_price(value: Option<f64>) -> String {
     match value {
         Some(v) if v > 0.0 => format!("{:.2}", v),
         _ => "--".to_string(),
+    }
+}
+
+const BINANCE_PRICE_STALE_SECS: f64 = 2.0;
+
+pub(crate) fn resolve_display_price(snapshot: Option<&TickerSnapshot>) -> Option<f64> {
+    let snapshot = snapshot?;
+    let binance_age = exchange_age(snapshot, "binancefutures")
+        .or_else(|| exchange_age(snapshot, "binancefuturesusd"))
+        .or_else(|| exchange_age(snapshot, "binance-perp"))
+        .or_else(|| exchange_age(snapshot, "binance"));
+    let binance_fresh = binance_age
+        .map(|age| age <= BINANCE_PRICE_STALE_SECS)
+        .unwrap_or(true);
+
+    if binance_fresh {
+        snapshot
+            .binance_perp_last
+            .filter(|&p| p > 0.0)
+            .or(snapshot.latest_price)
+    } else {
+        snapshot.latest_price
     }
 }
 

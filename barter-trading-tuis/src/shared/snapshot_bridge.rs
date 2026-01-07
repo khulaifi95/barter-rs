@@ -214,7 +214,12 @@ fn build_timestamps(snapshot: &TickerSnapshot, now_ms: i64) -> DataTimestamps {
             let ms = (secs.max(0.0) * 1000.0) as i64;
             Some(min.map_or(ms, |cur| cur.min(ms)))
         });
-    let data_age_ms = trade_lag_ms.or(min_exchange_age_ms);
+    let data_age_ms = match (trade_lag_ms, min_exchange_age_ms) {
+        (Some(trade_ms), Some(ex_ms)) => Some(trade_ms.min(ex_ms)),
+        (Some(trade_ms), None) => Some(trade_ms),
+        (None, Some(ex_ms)) => Some(ex_ms),
+        (None, None) => None,
+    };
     let data_ts = data_age_ms.map(|age| now_ms - age).unwrap_or(0);
 
     DataTimestamps {

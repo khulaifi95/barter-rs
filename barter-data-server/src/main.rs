@@ -822,39 +822,56 @@ async fn start_ibkr_bridge_feed(tx_trades: Arc<broadcast::Sender<MarketEventMess
                 info!("Connected to ibkr-bridge at {}", url);
                 let (_, mut read) = ws_stream.split();
 
-                while let Some(msg) = read.next().await {
-                    match msg {
-                        Ok(Message::Text(text)) => {
-                            match serde_json::from_str::<IbkrMessage>(&text) {
-                                Ok(IbkrMessage::Tick(tick)) => {
-                                    let _ = tx_trades.send(trad_tick_event(tick));
-                                }
-                                Ok(IbkrMessage::TickBackfill { ticks, .. }) => {
-                                    for tick in ticks {
-                                        let _ = tx_trades.send(trad_tick_event(tick));
+                let mut tick_count: u64 = 0;
+                let mut tick_log = interval(Duration::from_secs(60));
+                tick_log.tick().await;
+
+                loop {
+                    tokio::select! {
+                        _ = tick_log.tick() => {
+                            info!("ibkr-bridge: {} ticks forwarded in last 60s", tick_count);
+                            tick_count = 0;
+                        }
+                        msg = read.next() => {
+                            match msg {
+                                Some(Ok(Message::Text(text))) => {
+                                    match serde_json::from_str::<IbkrMessage>(&text) {
+                                        Ok(IbkrMessage::Tick(tick)) => {
+                                            let _ = tx_trades.send(trad_tick_event(tick));
+                                            tick_count += 1;
+                                        }
+                                        Ok(IbkrMessage::TickBackfill { ticks, .. }) => {
+                                            for tick in ticks {
+                                                let _ = tx_trades.send(trad_tick_event(tick));
+                                            }
+                                        }
+                                        Ok(IbkrMessage::Welcome { .. }) => {
+                                            debug!("IBKR bridge welcome received");
+                                        }
+                                        Ok(IbkrMessage::Status { .. }) => {
+                                            debug!("IBKR bridge status received");
+                                        }
+                                        Err(e) => {
+                                            debug!("IBKR parse error: {}", e);
+                                        }
                                     }
                                 }
-                                Ok(IbkrMessage::Welcome { .. }) => {
-                                    debug!("IBKR bridge welcome received");
+                                Some(Ok(Message::Close(_))) => {
+                                    warn!("ibkr-bridge connection closed");
+                                    break;
                                 }
-                                Ok(IbkrMessage::Status { .. }) => {
-                                    debug!("IBKR bridge status received");
+                                Some(Ok(Message::Ping(_)) | Ok(Message::Pong(_))) => {}
+                                Some(Err(e)) => {
+                                    warn!("ibkr-bridge websocket error: {}", e);
+                                    break;
                                 }
-                                Err(e) => {
-                                    debug!("IBKR parse error: {}", e);
+                                Some(Ok(_)) => {}
+                                None => {
+                                    warn!("ibkr-bridge stream ended (no close frame), reconnecting...");
+                                    break;
                                 }
                             }
                         }
-                        Ok(Message::Close(_)) => {
-                            warn!("ibkr-bridge connection closed");
-                            break;
-                        }
-                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
-                        Err(e) => {
-                            warn!("ibkr-bridge websocket error: {}", e);
-                            break;
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -863,6 +880,7 @@ async fn start_ibkr_bridge_feed(tx_trades: Arc<broadcast::Sender<MarketEventMess
             }
         }
 
+        info!("ibkr-bridge: reconnecting in 5 seconds...");
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
