@@ -7,6 +7,9 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+fn default_snapshot_version() -> u16 {
+    1
+}
 /// Market event message envelope from the server
 ///
 /// This is the top-level message structure that wraps all event types
@@ -41,8 +44,17 @@ pub struct MarketEventEnvelope {
 /// Derived metrics snapshot from the centralized server.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MarketSnapshotMessage {
+    #[serde(default = "default_snapshot_version")]
+    pub snapshot_version: u16,
     pub timestamp: i64,
     pub tickers: HashMap<String, SnapshotTicker>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SnapshotPerExchangeShort {
+    pub cvd_30s: f64,
+    pub total_30s: f64,
+    pub trades_30s: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -57,6 +69,10 @@ pub struct SnapshotTicker {
     pub liq_rate_usd_per_min: f64,
     pub vol_percentile: f64,
     pub vol_regime: String,
+    #[serde(default)]
+    pub vol_samples: u16,
+    #[serde(default)]
+    pub per_exchange_30s: HashMap<String, SnapshotPerExchangeShort>,
 }
 
 /// Instrument information

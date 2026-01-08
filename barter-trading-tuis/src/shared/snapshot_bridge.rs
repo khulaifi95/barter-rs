@@ -52,6 +52,9 @@ fn build_vol_score(snapshot: &TickerSnapshot, server_snapshot: Option<&SnapshotT
         crate::shared::state::VolTrend::Expanding => (75.0, VolRegime::High),
     };
 
+    let mut rv_samples = 0_u16;
+    let rv_samples_required = 168_u16;
+
     if let Some(server) = server_snapshot {
         if server.vol_percentile > 0.0 {
             percentile = server.vol_percentile;
@@ -59,6 +62,7 @@ fn build_vol_score(snapshot: &TickerSnapshot, server_snapshot: Option<&SnapshotT
         if let Some(server_regime) = parse_vol_regime(&server.vol_regime) {
             regime = server_regime;
         }
+        rv_samples = server.vol_samples;
     }
 
     // Check for shock based on ATR or 1m return Z-score
@@ -73,6 +77,8 @@ fn build_vol_score(snapshot: &TickerSnapshot, server_snapshot: Option<&SnapshotT
         current_rv,
         percentile,
         regime,
+        rv_samples,
+        rv_samples_required,
         zscore_1m: snapshot.zscore_1m,
         is_shock,
         passed: !is_shock && percentile < 95.0,

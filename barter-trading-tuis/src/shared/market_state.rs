@@ -112,6 +112,10 @@ pub struct VolRegimeScore {
     pub percentile: f64,
     /// Current regime classification
     pub regime: VolRegime,
+    /// Number of hourly RV samples available
+    pub rv_samples: u16,
+    /// Target sample count for full percentile history
+    pub rv_samples_required: u16,
     /// 1-minute return Z-score for shock detection
     pub zscore_1m: f64,
     /// Is there a shock (flash crash) in progress?
@@ -1380,6 +1384,8 @@ mod tests {
             current_rv: 0.02,
             percentile: 50.0,
             regime: VolRegime::Normal,
+            rv_samples: 168,
+            rv_samples_required: 168,
             zscore_1m: 0.5,
             is_shock: false,
             passed: true,
@@ -1391,6 +1397,8 @@ mod tests {
             current_rv: 0.08,
             percentile: 97.0,
             regime: VolRegime::Extreme,
+            rv_samples: 168,
+            rv_samples_required: 168,
             zscore_1m: 4.0,
             is_shock: true,
             passed: false,

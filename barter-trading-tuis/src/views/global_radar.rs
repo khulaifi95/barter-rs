@@ -146,6 +146,14 @@ fn render_filter_cards(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
         } else {
             Color::Green
         };
+        let warmup_span = if vol.rv_samples < vol.rv_samples_required {
+            Span::styled(
+                format!("  WARMUP: {}/{}", vol.rv_samples, vol.rv_samples_required),
+                Style::default().fg(Color::Yellow),
+            )
+        } else {
+            Span::raw("")
+        };
         let l1_lines = vec![
             Line::from(vec![
                 Span::styled(
@@ -155,7 +163,13 @@ fn render_filter_cards(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
                 Span::raw("  "),
                 Span::styled(vol_regime_str, Style::default().fg(l1_color)),
             ]),
-            Line::from(format!("  Pctl: {:.0}th  RV: {:.2}%", vol.percentile, vol.current_rv)),
+            Line::from(vec![
+                Span::raw(format!(
+                    "  Pctl: {:.0}th  RV: {:.2}%",
+                    vol.percentile, vol.current_rv
+                )),
+                warmup_span,
+            ]),
             Line::from(vec![
                 Span::raw("  σ: "),
                 Span::styled(format!("{:.1}", vol.zscore_1m), Style::default().fg(zscore_color)),

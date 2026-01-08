@@ -1,7 +1,7 @@
 use barter_data::{
     error::DataError,
     event::{DataKind, MarketEvent, MarketEventEnvelope},
-    snapshot::{MarketSnapshot, SnapshotTicker},
+    snapshot::{MarketSnapshot, SnapshotPerExchangeShort, SnapshotTicker},
     streams::{builder::dynamic::DynamicStreams, consumer::MarketStreamResult, reconnect::Event},
     subscription::funding::FundingRate,
     subscription::open_interest::OpenInterest,
@@ -9,14 +9,26 @@ use barter_data::{
 use barter_instrument::{
     exchange::ExchangeId,
     instrument::market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
+    Side,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use barter_trading_tuis::shared::{
+    audit::AuditLogger,
+    config::Config,
+    market_state::{ConfigProvider, OptionContract, OptionsChain, Signal, TradMarketStatus, VolRegime, VolatilityEngine},
+    options_state::{OptionsContext, OptionsContextBuilder},
+    orchestrator::{OrchestratorResult, StateOrchestrator},
+    snapshot_bridge::build_market_data_input,
+    state::{Aggregator, Candle1m, CandleBackfill, fetch_binance_1m_candles, ticker_to_binance_symbol},
+    types::{InstrumentInfo, MarketEventMessage},
+    vol_regime::VolRegimeEngine,
+};
+use chrono::{DateTime, TimeZone, Utc, Duration as ChronoDuration};
 use futures::{SinkExt, StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
 use std::time::Instant;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -30,6 +42,7 @@ use tracing::{debug, error, info, warn};
 const L2_THROTTLE_BINANCE_MS: u64 = 100;
 const L2_THROTTLE_BYBIT_MS: u64 = 100;
 const L2_THROTTLE_OKX_MS: u64 = 150;
+const SNAPSHOT_VERSION: u16 = 2;
 
 /// Get L2 throttle interval for a given exchange
 fn get_l2_throttle_ms(exchange: &str) -> u64 {
@@ -67,24 +80,6 @@ fn trad_tick_event(tick: TradMarketTick) -> MarketEventMessage {
     }
 }
 
-/// Market event wrapper for JSON serialization
-#[derive(Debug, Clone, Serialize)]
-struct MarketEventMessage {
-    time_exchange: DateTime<Utc>,
-    time_received: DateTime<Utc>,
-    exchange: String,
-    instrument: InstrumentInfo,
-    kind: String,
-    data: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct InstrumentInfo {
-    base: String,
-    quote: String,
-    kind: String,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct TradMarketTick {
     symbol: String,
@@ -98,23 +93,15 @@ struct TradMarketTick {
     ask: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OptionsChainMessage {
-    contracts: Vec<OptionContract>,
-    timestamp: i64,
+#[derive(Debug, Clone, Serialize)]
+struct OrchestratorMessage {
+    ticker: String,
+    result: OrchestratorResult,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OptionContract {
-    instrument_name: String,
-    strike: f64,
-    expiry: i64,
-    is_call: bool,
-    open_interest: f64,
-    mark_iv: f64,
-    delta: f64,
-    gamma: f64,
-    vega: f64,
+struct VolRegimeState {
+    engine: VolRegimeEngine,
+    last_hour: Option<i64>,
 }
 
 struct SnapshotBuilder {
@@ -142,6 +129,7 @@ impl SnapshotBuilder {
             tickers.insert(symbol.clone(), state.snapshot(now));
         }
         MarketSnapshot {
+            snapshot_version: SNAPSHOT_VERSION,
             timestamp: now.timestamp_millis(),
             tickers,
         }
@@ -152,6 +140,7 @@ struct TickerDerivedState {
     last_price: f64,
     last_price_ts: DateTime<Utc>,
     trade_volumes: VecDeque<(DateTime<Utc>, f64)>,
+    trade_flows_by_exchange: HashMap<String, VecDeque<(DateTime<Utc>, f64, f64)>>,
     cvd_by_exchange: HashMap<String, VecDeque<(DateTime<Utc>, f64)>>,
     oi_by_exchange: HashMap<String, VecDeque<(DateTime<Utc>, f64)>>,
     funding_by_exchange: HashMap<String, VecDeque<(DateTime<Utc>, f64)>>,
@@ -164,6 +153,7 @@ impl TickerDerivedState {
             last_price: 0.0,
             last_price_ts: Utc::now(),
             trade_volumes: VecDeque::new(),
+            trade_flows_by_exchange: HashMap::new(),
             cvd_by_exchange: HashMap::new(),
             oi_by_exchange: HashMap::new(),
             funding_by_exchange: HashMap::new(),
@@ -177,8 +167,16 @@ impl TickerDerivedState {
             DataKind::Trade(trade) => {
                 self.last_price = trade.price;
                 self.last_price_ts = now;
-                self.trade_volumes.push_back((now, trade.price * trade.amount));
+                let notional = trade.price * trade.amount;
+                self.trade_volumes.push_back((now, notional));
+                let exchange = format!("{:?}", event.exchange);
+                let signed = if trade.side == Side::Buy { notional } else { -notional };
+                self.trade_flows_by_exchange
+                    .entry(exchange)
+                    .or_insert_with(VecDeque::new)
+                    .push_back((now, signed, notional));
                 self.prune_trade_volumes(now);
+                self.prune_trade_flows(now);
             }
             DataKind::CumulativeVolumeDelta(cvd) => {
                 let entry = self
@@ -216,6 +214,7 @@ impl TickerDerivedState {
 
     fn snapshot(&mut self, now: DateTime<Utc>) -> SnapshotTicker {
         self.prune_trade_volumes(now);
+        self.prune_trade_flows(now);
         self.prune_cvd(now);
         self.prune_oi(now);
         self.prune_funding(now);
@@ -236,6 +235,7 @@ impl TickerDerivedState {
         let funding_rate = self.funding_latest();
         let funding_velocity = self.funding_velocity(now, 900);
         let liq_rate_usd_per_min = self.sum_window(&self.liq_notional, now, 60);
+        let per_exchange_30s = self.per_exchange_short_stats(now, 30);
 
         SnapshotTicker {
             price: self.last_price,
@@ -248,6 +248,8 @@ impl TickerDerivedState {
             liq_rate_usd_per_min,
             vol_percentile: 0.0,
             vol_regime: "unknown".to_string(),
+            vol_samples: 0,
+            per_exchange_30s,
         }
     }
 
@@ -323,8 +325,57 @@ impl TickerDerivedState {
         if count > 0.0 { total / count } else { 0.0 }
     }
 
+    fn per_exchange_short_stats(
+        &self,
+        now: DateTime<Utc>,
+        window_secs: i64,
+    ) -> HashMap<String, SnapshotPerExchangeShort> {
+        let cutoff = now - ChronoDuration::seconds(window_secs);
+        let mut out = HashMap::new();
+
+        for (ex, trades) in &self.trade_flows_by_exchange {
+            let mut signed = 0.0;
+            let mut total = 0.0;
+            let mut count = 0;
+
+            for (ts, signed_usd, abs_usd) in trades.iter().rev() {
+                if *ts < cutoff {
+                    break;
+                }
+                signed += *signed_usd;
+                total += *abs_usd;
+                count += 1;
+            }
+
+            out.insert(
+                ex.clone(),
+                SnapshotPerExchangeShort {
+                    cvd_30s: signed,
+                    total_30s: total,
+                    trades_30s: count,
+                },
+            );
+        }
+
+        out
+    }
+
     fn prune_trade_volumes(&mut self, now: DateTime<Utc>) {
         Self::prune_queue(&mut self.trade_volumes, now, 3600);
+    }
+
+    fn prune_trade_flows(&mut self, now: DateTime<Utc>) {
+        let cutoff = now - ChronoDuration::seconds(120);
+        self.trade_flows_by_exchange.retain(|_, trades| {
+            while let Some((ts, _, _)) = trades.front() {
+                if *ts < cutoff {
+                    trades.pop_front();
+                } else {
+                    break;
+                }
+            }
+            !trades.is_empty()
+        });
     }
 
     fn prune_cvd(&mut self, now: DateTime<Utc>) {
@@ -360,52 +411,51 @@ impl TickerDerivedState {
     }
 }
 
-impl From<MarketEvent<MarketDataInstrument, DataKind>> for MarketEventMessage {
-    fn from(event: MarketEvent<MarketDataInstrument, DataKind>) -> Self {
-        let (kind_name, data) = match &event.kind {
-            DataKind::Trade(trade) => ("trade", serde_json::to_value(trade).unwrap_or_default()),
-            DataKind::Liquidation(liq) => {
-                ("liquidation", serde_json::to_value(liq).unwrap_or_default())
-            }
-            DataKind::OpenInterest(oi) => (
-                "open_interest",
-                serde_json::to_value(oi).unwrap_or_default(),
-            ),
-            DataKind::FundingRate(fr) => (
-                "funding_rate",
-                serde_json::to_value(fr).unwrap_or_default(),
-            ),
-            DataKind::CumulativeVolumeDelta(cvd) => (
-                "cumulative_volume_delta",
-                serde_json::to_value(cvd).unwrap_or_default(),
-            ),
-            DataKind::OrderBookL1(ob) => (
-                "order_book_l1",
-                serde_json::to_value(ob).unwrap_or_default(),
-            ),
-            DataKind::OrderBook(ob_event) => (
-                "order_book_l2",
-                serde_json::to_value(ob_event).unwrap_or_default(),
-            ),
-            _ => ("other", serde_json::Value::Null),
-        };
+fn market_event_to_message(event: MarketEvent<MarketDataInstrument, DataKind>) -> MarketEventMessage {
+    let (kind_name, data) = match &event.kind {
+        DataKind::Trade(trade) => ("trade", serde_json::to_value(trade).unwrap_or_default()),
+        DataKind::Liquidation(liq) => (
+            "liquidation",
+            serde_json::to_value(liq).unwrap_or_default(),
+        ),
+        DataKind::OpenInterest(oi) => (
+            "open_interest",
+            serde_json::to_value(oi).unwrap_or_default(),
+        ),
+        DataKind::FundingRate(fr) => (
+            "funding_rate",
+            serde_json::to_value(fr).unwrap_or_default(),
+        ),
+        DataKind::CumulativeVolumeDelta(cvd) => (
+            "cumulative_volume_delta",
+            serde_json::to_value(cvd).unwrap_or_default(),
+        ),
+        DataKind::OrderBookL1(ob) => (
+            "order_book_l1",
+            serde_json::to_value(ob).unwrap_or_default(),
+        ),
+        DataKind::OrderBook(ob_event) => (
+            "order_book_l2",
+            serde_json::to_value(ob_event).unwrap_or_default(),
+        ),
+        _ => ("other", serde_json::Value::Null),
+    };
 
-        Self {
-            time_exchange: event.time_exchange,
-            time_received: event.time_received,
-            exchange: format!("{:?}", event.exchange),
-            instrument: InstrumentInfo {
-                base: event.instrument.base.to_string(),
-                quote: event.instrument.quote.to_string(),
-                kind: match event.instrument.kind {
-                    MarketDataInstrumentKind::Spot => "Spot".to_string(),
-                    MarketDataInstrumentKind::Perpetual => "Perpetual".to_string(),
-                    _ => format!("{:?}", event.instrument.kind),
-                },
+    MarketEventMessage {
+        time_exchange: event.time_exchange,
+        time_received: event.time_received,
+        exchange: format!("{:?}", event.exchange),
+        instrument: InstrumentInfo {
+            base: event.instrument.base.to_string(),
+            quote: event.instrument.quote.to_string(),
+            kind: match event.instrument.kind {
+                MarketDataInstrumentKind::Spot => "Spot".to_string(),
+                MarketDataInstrumentKind::Perpetual => "Perpetual".to_string(),
+                _ => format!("{:?}", event.instrument.kind),
             },
-            kind: kind_name.to_string(),
-            data,
-        }
+        },
+        kind: kind_name.to_string(),
+        data,
     }
 }
 
@@ -457,6 +507,22 @@ struct DeribitTicker {
     greeks: Option<DeribitGreeks>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BinanceKline(
+    i64,    // 0: Open time
+    String, // 1: Open
+    String, // 2: High
+    String, // 3: Low
+    String, // 4: Close
+    String, // 5: Volume
+    i64,    // 6: Close time
+    String, // 7: Quote asset volume
+    i64,    // 8: Number of trades
+    String, // 9: Taker buy base asset volume
+    String, // 10: Taker buy quote asset volume
+    String, // 11: Ignore
+);
+
 #[tokio::main]
 async fn main() {
     // Initialize logging
@@ -488,6 +554,12 @@ async fn main() {
     let tx_l2 = Arc::new(tx_l2);
 
     let snapshot_builder = Arc::new(tokio::sync::Mutex::new(SnapshotBuilder::new()));
+    let shared_agg = Arc::new(tokio::sync::Mutex::new(Aggregator::new()));
+    let vol_states = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let spot_cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let options_cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let trad_last_ms = Arc::new(AtomicI64::new(0));
+    let kline_cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     // Start WebSocket server
     // Configurable via WS_ADDR env var (default: 0.0.0.0:9001)
@@ -497,29 +569,64 @@ async fn main() {
         .unwrap_or_else(|_| "0.0.0.0:9001".parse().unwrap());
     let tx_trades_clone = tx_trades.clone();
     let tx_l2_clone = tx_l2.clone();
+    let kline_cache_clone = Arc::clone(&kline_cache);
     tokio::spawn(async move {
-        start_websocket_server(server_addr, tx_trades_clone, tx_l2_clone).await;
+        start_websocket_server(server_addr, tx_trades_clone, tx_l2_clone, kline_cache_clone).await;
     });
 
     // IBKR bridge feed (ES/NQ) -> trad_tick events
     {
         let tx_trades = tx_trades.clone();
+        let trad_last_ms = Arc::clone(&trad_last_ms);
         tokio::spawn(async move {
-            start_ibkr_bridge_feed(tx_trades).await;
+            start_ibkr_bridge_feed(tx_trades, trad_last_ms).await;
         });
     }
 
     // Deribit options feed (options_chain events)
     {
         let tx_trades = tx_trades.clone();
+        let spot_cache = Arc::clone(&spot_cache);
+        let options_cache = Arc::clone(&options_cache);
         tokio::spawn(async move {
-            start_deribit_options_feed(tx_trades).await;
+            start_deribit_options_feed(tx_trades, spot_cache, options_cache).await;
+        });
+    }
+
+    let tickers: Vec<String> = std::env::var("TICKERS")
+        .unwrap_or_else(|_| "BTC,ETH,SOL".to_string())
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Seed volatility regime history (7-day hourly RV from 5m klines)
+    {
+        let vol_states = Arc::clone(&vol_states);
+        seed_vol_regime(vol_states, &tickers).await;
+    }
+
+    // Binance kline feed (authoritative 1m candles for RV/ATR/tvVWAP)
+    {
+        let kline_cache = Arc::clone(&kline_cache);
+        let shared_agg = Arc::clone(&shared_agg);
+        seed_binance_klines(kline_cache, shared_agg, &tickers).await;
+    }
+    for ticker in &tickers {
+        let tx_trades = tx_trades.clone();
+        let kline_cache = Arc::clone(&kline_cache);
+        let shared_agg = Arc::clone(&shared_agg);
+        let ticker = ticker.clone();
+        tokio::spawn(async move {
+            run_binance_kline_stream(ticker, tx_trades, kline_cache, shared_agg).await;
         });
     }
 
     {
         let tx_trades = tx_trades.clone();
         let snapshot_builder = Arc::clone(&snapshot_builder);
+        let shared_agg = Arc::clone(&shared_agg);
+        let vol_states = Arc::clone(&vol_states);
         let snapshot_secs: u64 = std::env::var("SNAPSHOT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -528,7 +635,33 @@ async fn main() {
             let mut tick = interval(Duration::from_secs(snapshot_secs));
             loop {
                 tick.tick().await;
-                let snapshot = snapshot_builder.lock().await.snapshot();
+                let mut snapshot = snapshot_builder.lock().await.snapshot();
+                let agg_snapshot = {
+                    let guard = shared_agg.lock().await;
+                    guard.snapshot()
+                };
+                let mut engines = vol_states.lock().await;
+                for (ticker, snap) in snapshot.tickers.iter_mut() {
+                    let rv = agg_snapshot
+                        .tickers
+                        .get(ticker)
+                        .and_then(|t| t.realized_vol_1h)
+                        .unwrap_or(0.0);
+                    let state = engines.entry(ticker.clone()).or_insert_with(|| VolRegimeState {
+                        engine: VolRegimeEngine::default(),
+                        last_hour: None,
+                    });
+                    let sample_count = state.engine.rv_sample_count().min(RV_TARGET_SAMPLES);
+                    snap.vol_samples = sample_count as u16;
+                    if sample_count < RV_MIN_SAMPLES || rv <= 0.0 {
+                        snap.vol_percentile = 50.0;
+                        snap.vol_regime = "warmup".to_string();
+                    } else {
+                        let pct = state.engine.percentile_for(rv);
+                        snap.vol_percentile = pct;
+                        snap.vol_regime = vol_regime_label(state.engine.regime_for(rv)).to_string();
+                    }
+                }
                 let event = MarketEventMessage {
                     time_exchange: Utc::now(),
                     time_received: Utc::now(),
@@ -542,6 +675,112 @@ async fn main() {
                     data: serde_json::to_value(&snapshot).unwrap_or_default(),
                 };
                 let _ = tx_trades.send(event);
+            }
+        });
+    }
+
+    // Centralized orchestrator (MarketState) - broadcasts orchestrator_result
+    {
+        let tx_trades = tx_trades.clone();
+        let shared_agg = Arc::clone(&shared_agg);
+        let options_cache = Arc::clone(&options_cache);
+        let trad_last_ms = Arc::clone(&trad_last_ms);
+        tokio::spawn(async move {
+            let config = Config::load().unwrap_or_else(|e| {
+                warn!("Failed to load config: {}, using defaults", e);
+                Config::default()
+            });
+            let logger = AuditLogger::no_op();
+            let trad_fresh_ms = config.freshness(Signal::TradMarkets).as_millis() as u64;
+            let mut orchestrator = StateOrchestrator::new(config, logger);
+            let mut tick = interval(Duration::from_millis(200));
+            loop {
+                tick.tick().await;
+                let snapshot = {
+                    let guard = shared_agg.lock().await;
+                    guard.snapshot()
+                };
+                let options_snapshot = { options_cache.lock().await.clone() };
+                let trad_ts = trad_last_ms.load(Ordering::Relaxed);
+                let trad_status = if trad_ts <= 0 {
+                    TradMarketStatus::Unavailable
+                } else {
+                    let now_ms = Utc::now().timestamp_millis();
+                    let age_ms = (now_ms - trad_ts).max(0) as u64;
+                    if age_ms > trad_fresh_ms {
+                        TradMarketStatus::Stale
+                    } else {
+                        TradMarketStatus::Live
+                    }
+                };
+
+                for (ticker, ticker_snap) in &snapshot.tickers {
+                    let server_ticker = snapshot
+                        .server_snapshot
+                        .as_ref()
+                        .and_then(|snap| snap.tickers.get(ticker));
+                    let mut input = build_market_data_input(
+                        ticker_snap,
+                        server_ticker,
+                        trad_status,
+                    );
+                    input.timestamps.trad_markets_ts = trad_ts;
+                    if let Some(ctx) = options_snapshot.get(ticker) {
+                        input.options_context = Some(ctx.clone());
+                    }
+                    let result = orchestrator.calculate(&input);
+                    let payload = OrchestratorMessage {
+                        ticker: ticker.clone(),
+                        result,
+                    };
+                    let event = MarketEventMessage {
+                        time_exchange: Utc::now(),
+                        time_received: Utc::now(),
+                        exchange: "barter-data-server".to_string(),
+                        instrument: InstrumentInfo {
+                            base: ticker.clone(),
+                            quote: "USD".to_string(),
+                            kind: "Orchestrator".to_string(),
+                        },
+                        kind: "orchestrator_result".to_string(),
+                        data: serde_json::to_value(&payload).unwrap_or_default(),
+                    };
+                    let _ = tx_trades.send(event);
+                }
+            }
+        });
+    }
+
+    // Volatility regime updater: push hourly RV samples into engines
+    {
+        let shared_agg = Arc::clone(&shared_agg);
+        let vol_states = Arc::clone(&vol_states);
+        tokio::spawn(async move {
+            let mut tick = interval(Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                let now_hour = Utc::now().timestamp() / 3600;
+                let snapshot = {
+                    let guard = shared_agg.lock().await;
+                    guard.snapshot()
+                };
+                let mut states = vol_states.lock().await;
+                for (ticker, snap) in &snapshot.tickers {
+                    let rv = snap.realized_vol_1h.unwrap_or(0.0);
+                    if rv <= 0.0 {
+                        continue;
+                    }
+                    let state = states
+                        .entry(ticker.clone())
+                        .or_insert_with(|| VolRegimeState {
+                            engine: VolRegimeEngine::default(),
+                            last_hour: None,
+                        });
+                    if state.last_hour != Some(now_hour) {
+                        state.engine.push_rv(rv);
+                        state.last_hour = Some(now_hour);
+                    }
+                }
             }
         });
     }
@@ -563,6 +802,9 @@ async fn main() {
 
     futures::pin_mut!(combined_stream);
 
+    let shared_agg = Arc::clone(&shared_agg);
+    let spot_cache = Arc::clone(&spot_cache);
+
     // Throttle state: per-instrument last broadcast time (L2 and Binance L1)
     let mut l2_last_broadcast: HashMap<String, Instant> = HashMap::new();
     let mut l1_last_broadcast: HashMap<String, Instant> = HashMap::new();
@@ -576,6 +818,15 @@ async fn main() {
             Event::Item(result) => match result {
                 Ok(market_event) => {
                     snapshot_builder.lock().await.update(&market_event);
+                    if let DataKind::Trade(trade) = &market_event.kind {
+                        if matches!(market_event.instrument.kind, MarketDataInstrumentKind::Perpetual) {
+                            let mut cache = spot_cache.lock().await;
+                            cache.insert(
+                                market_event.instrument.base.to_string().to_uppercase(),
+                                trade.price,
+                            );
+                        }
+                    }
                     // Debug logging for large spot trades to verify spot streams
                     // Threshold configurable via SPOT_LOG_THRESHOLD env var (default: $50,000)
                     if let DataKind::Trade(trade) = &market_event.kind {
@@ -673,12 +924,14 @@ async fn main() {
                         l2_last_broadcast.insert(key, now);
 
                         // Send to L2 channel (separate from trades)
-                        let message = MarketEventMessage::from(market_event);
+                        let message = market_event_to_message(market_event);
+                        shared_agg.lock().await.process_event(message.clone());
                         let _ = tx_l2.send(message); // Ignore errors if no receivers
                         continue; // Don't fall through to trade channel
                     }
 
-                    let message = MarketEventMessage::from(market_event);
+                    let message = market_event_to_message(market_event);
+                    shared_agg.lock().await.process_event(message.clone());
 
                     // Binance L1: apply light throttle (~100ms per instrument) to reduce flood
                     if is_orderbook_l1 {
@@ -787,6 +1040,7 @@ async fn start_websocket_server(
     addr: SocketAddr,
     tx_trades: Arc<broadcast::Sender<MarketEventMessage>>,
     tx_l2: Arc<broadcast::Sender<MarketEventMessage>>,
+    kline_cache: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Candle1m>>>>,
 ) {
     let listener = TcpListener::bind(&addr)
         .await
@@ -798,11 +1052,21 @@ async fn start_websocket_server(
         info!("New WebSocket connection from {}", peer_addr);
         let tx_trades = tx_trades.clone();
         let tx_l2 = tx_l2.clone();
-        tokio::spawn(handle_client(stream, peer_addr, tx_trades, tx_l2));
+        let kline_cache = Arc::clone(&kline_cache);
+        tokio::spawn(handle_client(
+            stream,
+            peer_addr,
+            tx_trades,
+            tx_l2,
+            kline_cache,
+        ));
     }
 }
 
-async fn start_ibkr_bridge_feed(tx_trades: Arc<broadcast::Sender<MarketEventMessage>>) {
+async fn start_ibkr_bridge_feed(
+    tx_trades: Arc<broadcast::Sender<MarketEventMessage>>,
+    trad_last_ms: Arc<AtomicI64>,
+) {
     if std::env::var("IBKR_BRIDGE_ENABLED")
         .ok()
         .map(|v| matches!(v.as_str(), "0" | "false" | "FALSE"))
@@ -837,11 +1101,17 @@ async fn start_ibkr_bridge_feed(tx_trades: Arc<broadcast::Sender<MarketEventMess
                                 Some(Ok(Message::Text(text))) => {
                                     match serde_json::from_str::<IbkrMessage>(&text) {
                                         Ok(IbkrMessage::Tick(tick)) => {
+                                            if tick.ts > 0 {
+                                                trad_last_ms.store(tick.ts, Ordering::Relaxed);
+                                            }
                                             let _ = tx_trades.send(trad_tick_event(tick));
                                             tick_count += 1;
                                         }
                                         Ok(IbkrMessage::TickBackfill { ticks, .. }) => {
                                             for tick in ticks {
+                                                if tick.ts > 0 {
+                                                    trad_last_ms.store(tick.ts, Ordering::Relaxed);
+                                                }
                                                 let _ = tx_trades.send(trad_tick_event(tick));
                                             }
                                         }
@@ -885,7 +1155,11 @@ async fn start_ibkr_bridge_feed(tx_trades: Arc<broadcast::Sender<MarketEventMess
     }
 }
 
-async fn start_deribit_options_feed(tx_trades: Arc<broadcast::Sender<MarketEventMessage>>) {
+async fn start_deribit_options_feed(
+    tx_trades: Arc<broadcast::Sender<MarketEventMessage>>,
+    spot_cache: Arc<tokio::sync::Mutex<HashMap<String, f64>>>,
+    options_cache: Arc<tokio::sync::Mutex<HashMap<String, OptionsContext>>>,
+) {
     if std::env::var("DERIBIT_ENABLED")
         .ok()
         .map(|v| matches!(v.as_str(), "0" | "false" | "FALSE"))
@@ -908,6 +1182,7 @@ async fn start_deribit_options_feed(tx_trades: Arc<broadcast::Sender<MarketEvent
         .unwrap_or(60);
 
     let client = Client::new();
+    let options_builder = OptionsContextBuilder::new();
     let ticker_list: Vec<String> = tickers
         .split(',')
         .map(|s| s.trim().to_uppercase())
@@ -938,6 +1213,30 @@ async fn start_deribit_options_feed(tx_trades: Arc<broadcast::Sender<MarketEvent
                         data: serde_json::to_value(&chain).unwrap_or_default(),
                     };
                     let _ = tx_trades.send(event);
+
+                    let spot = spot_cache
+                        .lock()
+                        .await
+                        .get(ticker)
+                        .copied()
+                        .unwrap_or(0.0);
+                    if spot > 0.0 {
+                        let ctx = options_builder.build(&chain, spot);
+                        options_cache.lock().await.insert(ticker.clone(), ctx.clone());
+                        let ctx_event = MarketEventMessage {
+                            time_exchange: Utc::now(),
+                            time_received: Utc::now(),
+                            exchange: "Deribit".to_string(),
+                            instrument: InstrumentInfo {
+                                base: ticker.clone(),
+                                quote: "USD".to_string(),
+                                kind: "Options".to_string(),
+                            },
+                            kind: "options_context".to_string(),
+                            data: serde_json::to_value(&ctx).unwrap_or_default(),
+                        };
+                        let _ = tx_trades.send(ctx_event);
+                    }
                 }
                 Err(e) => {
                     warn!("Deribit options fetch failed for {}: {}", ticker, e);
@@ -947,12 +1246,292 @@ async fn start_deribit_options_feed(tx_trades: Arc<broadcast::Sender<MarketEvent
     }
 }
 
+async fn seed_binance_klines(
+    kline_cache: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Candle1m>>>>,
+    shared_agg: Arc<tokio::sync::Mutex<Aggregator>>,
+    tickers: &[String],
+) {
+    for ticker in tickers {
+        let symbol = ticker_to_binance_symbol(ticker);
+        match fetch_binance_1m_candles(symbol).await {
+            Ok(candles) => {
+                let mut cache = kline_cache.lock().await;
+                let entry = cache.entry(ticker.clone()).or_insert_with(VecDeque::new);
+                entry.clear();
+                for candle in &candles {
+                    entry.push_back(candle.clone());
+                }
+                while entry.len() > 300 {
+                    entry.pop_front();
+                }
+                info!("Seeded {} klines for {}", entry.len(), ticker);
+
+                // Warm the server-side aggregator using the same backfill
+                let payload = CandleBackfill {
+                    ticker: ticker.clone(),
+                    candles,
+                };
+                let event = MarketEventMessage {
+                    time_exchange: Utc::now(),
+                    time_received: Utc::now(),
+                    exchange: "barter-data-server".to_string(),
+                    instrument: InstrumentInfo {
+                        base: ticker.clone(),
+                        quote: "USD".to_string(),
+                        kind: "Kline".to_string(),
+                    },
+                    kind: "candle_backfill".to_string(),
+                    data: serde_json::to_value(&payload).unwrap_or_default(),
+                };
+                shared_agg.lock().await.process_event(event);
+            }
+            Err(e) => {
+                warn!("Failed to seed klines for {}: {}", ticker, e);
+            }
+        }
+    }
+}
+
+const RV_HISTORY_DAYS: i64 = 7;
+const RV_MIN_SAMPLES: usize = 24;
+const RV_TARGET_SAMPLES: usize = 168;
+
+async fn fetch_binance_5m_history(symbol: &str, days: i64) -> Result<Vec<(i64, f64)>, String> {
+    let client = reqwest::Client::new();
+    let mut start_ms = (Utc::now() - ChronoDuration::days(days)).timestamp_millis();
+    let end_ms = Utc::now().timestamp_millis();
+    let mut output: Vec<(i64, f64)> = Vec::new();
+
+    loop {
+        let url = format!(
+            "https://fapi.binance.com/fapi/v1/klines?symbol={}&interval=5m&startTime={}&limit=1000",
+            symbol, start_ms
+        );
+        let resp = client
+            .get(&url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("HTTP error: {}", resp.status()));
+        }
+
+        let klines: Vec<BinanceKline> = resp
+            .json()
+            .await
+            .map_err(|e| format!("JSON parse failed: {}", e))?;
+
+        if klines.is_empty() {
+            break;
+        }
+
+        for k in &klines {
+            if let Ok(close) = k.4.parse::<f64>() {
+                output.push((k.0, close));
+            }
+        }
+
+        let last_open = klines.last().map(|k| k.0).unwrap_or(start_ms);
+        let next_start = last_open + 5 * 60 * 1000;
+        if next_start <= start_ms || next_start >= end_ms {
+            break;
+        }
+        start_ms = next_start;
+
+        if klines.len() < 1000 {
+            break;
+        }
+    }
+
+    output.sort_by_key(|(ts, _)| *ts);
+    Ok(output)
+}
+
+fn realized_vol_from_closes(closes: &[f64]) -> Option<f64> {
+    if closes.len() < 2 {
+        return None;
+    }
+    let mut returns = Vec::with_capacity(closes.len() - 1);
+    for i in 1..closes.len() {
+        let prev = closes[i - 1];
+        let cur = closes[i];
+        if prev > 0.0 {
+            returns.push((cur - prev) / prev);
+        }
+    }
+    if returns.len() < 2 {
+        return None;
+    }
+    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+    let variance = returns
+        .iter()
+        .map(|r| {
+            let diff = r - mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / returns.len() as f64;
+    Some(variance.sqrt() * 100.0)
+}
+
+fn hourly_rv_from_5m(candles: &[(i64, f64)]) -> Vec<f64> {
+    let mut samples = Vec::new();
+    let start_idx = candles
+        .iter()
+        .position(|(ts, _)| ts % (60 * 60 * 1000) == 0)
+        .unwrap_or(0);
+
+    let mut idx = start_idx;
+    while idx + 12 <= candles.len() {
+        let closes: Vec<f64> = candles[idx..idx + 12].iter().map(|(_, c)| *c).collect();
+        if let Some(rv) = realized_vol_from_closes(&closes) {
+            samples.push(rv);
+        }
+        idx += 12;
+    }
+
+    samples
+}
+
+async fn seed_vol_regime(
+    vol_states: Arc<tokio::sync::Mutex<HashMap<String, VolRegimeState>>>,
+    tickers: &[String],
+) {
+    for ticker in tickers {
+        let symbol = ticker_to_binance_symbol(ticker);
+        match fetch_binance_5m_history(symbol, RV_HISTORY_DAYS).await {
+            Ok(candles) => {
+                let samples = hourly_rv_from_5m(&candles);
+                if samples.is_empty() {
+                    warn!("vol-regime seed: no samples for {}", ticker);
+                    continue;
+                }
+                let mut state = VolRegimeState {
+                    engine: VolRegimeEngine::default(),
+                    last_hour: Some(Utc::now().timestamp() / 3600),
+                };
+                for rv in samples {
+                    state.engine.push_rv(rv);
+                }
+                let sample_count = state.engine.rv_sample_count();
+                info!(
+                    "vol-regime seed: {} samples for {}",
+                    sample_count, ticker
+                );
+                vol_states.lock().await.insert(ticker.clone(), state);
+            }
+            Err(e) => {
+                warn!("vol-regime seed failed for {}: {}", ticker, e);
+            }
+        }
+    }
+}
+
+fn vol_regime_label(regime: VolRegime) -> &'static str {
+    match regime {
+        VolRegime::Low => "low",
+        VolRegime::Normal => "normal",
+        VolRegime::High => "high",
+        VolRegime::Extreme => "extreme",
+    }
+}
+
+async fn run_binance_kline_stream(
+    ticker: String,
+    tx_trades: Arc<broadcast::Sender<MarketEventMessage>>,
+    kline_cache: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Candle1m>>>>,
+    shared_agg: Arc<tokio::sync::Mutex<Aggregator>>,
+) {
+    let symbol = ticker_to_binance_symbol(&ticker).to_lowercase();
+    let url = format!("wss://fstream.binance.com/ws/{}@kline_1m", symbol);
+
+    loop {
+        match connect_async(&url).await {
+            Ok((ws_stream, _)) => {
+                let (_, mut read) = ws_stream.split();
+                while let Some(msg) = read.next().await {
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if let Some(k) = v.get("k") {
+                                    let is_final = k.get("x").and_then(|b| b.as_bool()).unwrap_or(false);
+                                    if !is_final {
+                                        continue;
+                                    }
+                                    if let (Some(start_ms), Some(open), Some(high), Some(low), Some(close), Some(vol)) = (
+                                        k.get("t").and_then(|v| v.as_i64()),
+                                        k.get("o").and_then(|v| v.as_str()),
+                                        k.get("h").and_then(|v| v.as_str()),
+                                        k.get("l").and_then(|v| v.as_str()),
+                                        k.get("c").and_then(|v| v.as_str()),
+                                        k.get("v").and_then(|v| v.as_str()),
+                                    ) {
+                                        if let Some(start_time) = chrono::DateTime::from_timestamp_millis(start_ms) {
+                                            if let (Ok(o), Ok(h), Ok(l), Ok(c), Ok(volume)) =
+                                                (open.parse::<f64>(), high.parse::<f64>(), low.parse::<f64>(), close.parse::<f64>(), vol.parse::<f64>())
+                                            {
+                                                let candle = Candle1m {
+                                                    open: o,
+                                                    high: h,
+                                                    low: l,
+                                                    close: c,
+                                                    volume,
+                                                    start_time,
+                                                    is_complete: true,
+                                                };
+                                                {
+                                                    let mut cache = kline_cache.lock().await;
+                                                    let entry = cache.entry(ticker.clone()).or_insert_with(VecDeque::new);
+                                                    entry.push_back(candle.clone());
+                                                    while entry.len() > 300 {
+                                                        entry.pop_front();
+                                                    }
+                                                }
+
+                                                let event = MarketEventMessage {
+                                                    time_exchange: Utc::now(),
+                                                    time_received: Utc::now(),
+                                                    exchange: "BinanceFuturesUsd".to_string(),
+                                                    instrument: InstrumentInfo {
+                                                        base: ticker.clone(),
+                                                        quote: "USDT".to_string(),
+                                                        kind: "Perpetual".to_string(),
+                                                    },
+                                                    kind: "candle_1m".to_string(),
+                                                    data: serde_json::to_value(&candle).unwrap_or_default(),
+                                                };
+                                                let _ = tx_trades.send(event.clone());
+                                                shared_agg.lock().await.process_event(event);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
+                        Ok(Message::Close(_)) => break,
+                        Err(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("[kline-ws] {} connect error: {}", ticker, e);
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
 async fn fetch_deribit_options_chain(
     client: &Client,
     base_url: &str,
     currency: &str,
     top_n: usize,
-) -> Result<OptionsChainMessage, String> {
+) -> Result<OptionsChain, String> {
     let instruments = fetch_deribit_instruments(client, base_url, currency).await?;
     let summaries = fetch_deribit_book_summaries(client, base_url, currency).await?;
 
@@ -1015,7 +1594,7 @@ async fn fetch_deribit_options_chain(
         }
     }
 
-    Ok(OptionsChainMessage {
+    Ok(OptionsChain {
         contracts,
         timestamp: Utc::now().timestamp_millis(),
     })
@@ -1087,6 +1666,7 @@ async fn handle_client(
     peer_addr: SocketAddr,
     tx_trades: Arc<broadcast::Sender<MarketEventMessage>>,
     tx_l2: Arc<broadcast::Sender<MarketEventMessage>>,
+    kline_cache: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Candle1m>>>>,
 ) {
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
@@ -1116,6 +1696,32 @@ async fn handle_client(
     });
     if let Ok(msg) = serde_json::to_string(&welcome) {
         let _ = ws_sender.send(Message::Text(msg.into())).await;
+    }
+
+    // Send kline backfill to align RV/ATR across clients
+    {
+        let cache = kline_cache.lock().await;
+        for (ticker, candles) in cache.iter() {
+            let payload = CandleBackfill {
+                ticker: ticker.clone(),
+                candles: candles.iter().cloned().collect(),
+            };
+            let event = MarketEventMessage {
+                time_exchange: Utc::now(),
+                time_received: Utc::now(),
+                exchange: "barter-data-server".to_string(),
+                instrument: InstrumentInfo {
+                    base: ticker.clone(),
+                    quote: "USD".to_string(),
+                    kind: "Kline".to_string(),
+                },
+                kind: "candle_backfill".to_string(),
+                data: serde_json::to_value(&payload).unwrap_or_default(),
+            };
+            if let Ok(json) = serde_json::to_string(&event) {
+                let _ = ws_sender.send(Message::Text(json.into())).await;
+            }
+        }
     }
 
     // Spawn task to send market events to this client

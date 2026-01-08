@@ -204,6 +204,7 @@ dependencies = [
  "barter-data",
  "barter-instrument",
  "barter-integration",
+ "barter-trading-tuis",
  "chrono",
  "futures",
  "reqwest 0.12.24",

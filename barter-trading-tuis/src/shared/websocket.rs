@@ -17,6 +17,8 @@ pub struct WebSocketConfig {
     pub ping_interval: Duration,
     /// Stale timeout - reconnect if no messages arrive within this duration
     pub stale_timeout: Duration,
+    /// Trade stale timeout - reconnect if no trade events arrive within this duration
+    pub trade_stale_timeout: Duration,
     /// Stale lag threshold - reconnect if trade lag exceeds this
     pub lag_stale_threshold: Duration,
     /// Stale lag duration - how long lag must persist before reconnecting
@@ -33,6 +35,7 @@ impl Default for WebSocketConfig {
             url: "ws://127.0.0.1:9001".to_string(),
             ping_interval: Duration::from_secs(30),
             stale_timeout: Duration::from_secs(15),
+            trade_stale_timeout: Duration::from_secs(15),
             lag_stale_threshold: Duration::from_secs(15),
             lag_stale_duration: Duration::from_secs(10),
             reconnect_delay: Duration::from_secs(2),
@@ -65,6 +68,12 @@ impl WebSocketConfig {
     /// Set stale timeout
     pub fn with_stale_timeout(mut self, timeout: Duration) -> Self {
         self.stale_timeout = timeout;
+        self
+    }
+
+    /// Set trade stale timeout
+    pub fn with_trade_stale_timeout(mut self, timeout: Duration) -> Self {
+        self.trade_stale_timeout = timeout;
         self
     }
 
@@ -193,6 +202,7 @@ async fn run_websocket_loop(
                 });
 
                 let mut last_event = std::time::Instant::now();
+                let mut last_trade_event = std::time::Instant::now();
                 let mut stale_interval = tokio::time::interval(config.stale_timeout);
                 stale_interval.tick().await;
                 let mut lag_breach_since: Option<std::time::Instant> = None;
@@ -206,6 +216,14 @@ async fn run_websocket_loop(
                                 warn!(
                                     "WebSocket stale (no data for {:?}), reconnecting...",
                                     config.stale_timeout
+                                );
+                                should_break = true;
+                                break;
+                            }
+                            if last_trade_event.elapsed() > config.trade_stale_timeout {
+                                warn!(
+                                    "WebSocket trade stale (no trades for {:?}), reconnecting...",
+                                    config.trade_stale_timeout
                                 );
                                 should_break = true;
                                 break;
@@ -230,6 +248,7 @@ async fn run_websocket_loop(
                                             if let Ok(envelope) = serde_json::from_str::<MarketEventEnvelope>(&text)
                                             {
                                                 if envelope.payload.kind == "trade" {
+                                                    last_trade_event = std::time::Instant::now();
                                                     let lag_ms = chrono::Utc::now().timestamp_millis()
                                                         - envelope.payload.time_exchange.timestamp_millis();
                                                     if lag_ms >= config.lag_stale_threshold.as_millis() as i64 {
@@ -261,6 +280,7 @@ async fn run_websocket_loop(
                                             match serde_json::from_str::<MarketEventMessage>(&text) {
                                                 Ok(event) => {
                                                     if event.kind == "trade" {
+                                                        last_trade_event = std::time::Instant::now();
                                                         let lag_ms = chrono::Utc::now().timestamp_millis()
                                                             - event.time_exchange.timestamp_millis();
                                                         if lag_ms >= config.lag_stale_threshold.as_millis() as i64 {
@@ -354,6 +374,7 @@ mod tests {
             .with_ping_interval(Duration::from_secs(15))
             .with_reconnect_delay(Duration::from_secs(5))
             .with_stale_timeout(Duration::from_secs(12))
+            .with_trade_stale_timeout(Duration::from_secs(9))
             .with_lag_stale_threshold(Duration::from_secs(20))
             .with_lag_stale_duration(Duration::from_secs(8))
             .with_channel_buffer_size(500);
@@ -362,6 +383,7 @@ mod tests {
         assert_eq!(config.ping_interval, Duration::from_secs(15));
         assert_eq!(config.reconnect_delay, Duration::from_secs(5));
         assert_eq!(config.stale_timeout, Duration::from_secs(12));
+        assert_eq!(config.trade_stale_timeout, Duration::from_secs(9));
         assert_eq!(config.lag_stale_threshold, Duration::from_secs(20));
         assert_eq!(config.lag_stale_duration, Duration::from_secs(8));
         assert_eq!(config.channel_buffer_size, 500);
@@ -373,6 +395,7 @@ mod tests {
         assert_eq!(config.url, "ws://127.0.0.1:9001");
         assert_eq!(config.ping_interval, Duration::from_secs(30));
         assert_eq!(config.stale_timeout, Duration::from_secs(15));
+        assert_eq!(config.trade_stale_timeout, Duration::from_secs(15));
         assert_eq!(config.lag_stale_threshold, Duration::from_secs(15));
         assert_eq!(config.lag_stale_duration, Duration::from_secs(10));
         assert_eq!(config.reconnect_delay, Duration::from_secs(2));

@@ -611,6 +611,42 @@ pub struct BucketSummary {
 
 ## 6. Implementation Phases (Revised per Gemini/Codex)
 
+### Migration Tracker (Centralized Aggregation)
+
+This checklist lives here (in the main spec) so we can track progress in one place.
+
+- [x] Phase 0: Snapshot contract + safety
+  - [x] Add snapshot_version and #[serde(default)] for new fields
+  - [x] Keep backward compatibility for old TUIs
+  - [x] Log snapshot_version in clients
+- [x] Phase 1: Centralize short-window flow (per-exchange 30s)
+  - [x] Add per_exchange_30s (cvd_30s, total_30s, trades_30s) to snapshot
+  - [x] Compute once in data server and broadcast
+  - [x] scalper + scalper_v2 render from snapshot when available
+- [x] Phase 2: TUI alignment + price source consistency
+  - [x] Standardize price source (Binance perp last with stale fallback)
+  - [x] Remove local 30s flow computation where snapshot is present
+- [x] Phase 3: Klines centralized (server-side stream + backfill)
+  - [x] Single kline stream per ticker in data server
+  - [x] `candle_1m` + `candle_backfill` events broadcast to clients
+  - [x] TUIs stop opening redundant kline connections
+  - [ ] BVOL/OI rollups moved to server snapshots (pending)
+  - [x] Volatility history warmup tracking (`vol_samples` in snapshots)
+- [x] Phase 4: Options + Orchestrator centralized
+  - [x] Server runs Deribit options polling + OptionsContextBuilder
+  - [x] Server runs StateOrchestrator and broadcasts results
+  - [x] TUIs render gamma + state from server (no local polling)
+- [ ] Phase 5: Cleanup + validation
+  - [ ] Remove unused local aggregators (after snapshot parity verified)
+  - [ ] Update docs to final data flow diagram
+  - [ ] Validate: scalper v1/v2 + microstructure + trading-terminal match
+
+Current server broadcast additions:
+- `candle_1m` (Binance 1m kline stream, authoritative for RV/ATR/tvVWAP)
+- `candle_backfill` (1m seed on connect for warm-up parity)
+- `options_context` (OptionsContextBuilder output per ticker)
+- `orchestrator_result` (MarketState from centralized StateOrchestrator)
+
 ### Phase 1: The Core Brain (P0) ⬅ START HERE
 **Duration: 3-4 days**
 

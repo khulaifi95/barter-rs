@@ -11,6 +11,7 @@ description = "WebSocket server for broadcasting real-time market data from bart
 barter-data = { workspace = true }
 barter-instrument = { workspace = true }
 barter-integration = { workspace = true }
+barter-trading-tuis = { path = "../barter-trading-tuis" }
 
 # Logging
 tracing = { workspace = true }

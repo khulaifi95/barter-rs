@@ -108,6 +108,31 @@ impl VolRegimeEngine {
         self.current_rv
     }
 
+    /// Calculate percentile for an arbitrary RV value against history
+    pub fn percentile_for(&self, rv: f64) -> f64 {
+        if self.hourly_rv.is_empty() {
+            return 50.0;
+        }
+        let count_below = self.hourly_rv.iter().filter(|&&v| v < rv).count();
+        (count_below as f64 / self.hourly_rv.len() as f64) * 100.0
+    }
+
+    /// Determine volatility regime for an arbitrary RV value
+    pub fn regime_for(&self, rv: f64) -> VolRegime {
+        let pct = self.percentile_for(rv);
+
+        if pct >= self.extreme_threshold {
+            VolRegime::Extreme
+        } else if pct >= self.high_threshold {
+            VolRegime::High
+        } else if pct >= self.low_threshold {
+            VolRegime::Normal
+        } else {
+            VolRegime::Low
+        }
+    }
+
+
     /// Calculate mean of 1-minute returns
     fn returns_mean(&self) -> f64 {
         if self.returns_1m.is_empty() {

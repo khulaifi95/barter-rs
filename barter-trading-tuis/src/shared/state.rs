@@ -5,14 +5,14 @@
 
 use crate::shared::types::{
     CvdData, FundingRateData, LiquidationData, MarketEventMessage, MarketSnapshotMessage,
-    OpenInterestData, OrderBookL1Data, Side, TradeData,
+    OpenInterestData, OrderBookL1Data, Side, SnapshotPerExchangeShort, TradeData,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Datelike, Timelike, Utc};
 use rust_decimal::prelude::ToPrimitive;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
-use tracing::warn;
+use tracing::{info, warn};
 
 const L2_IMBALANCE_BAND_PCT: f64 = 0.025; // +/-2.5% band (adjustable)
 const L2_WALL_MIN_DISTANCE_PCT: f64 = 0.10; // ignore near-top-of-book noise
@@ -35,7 +35,7 @@ const FUNDING_LOOKBACK_SECS: i64 = 15 * 60;
 // Future consideration: If EMA proves too noisy, revisit SMA or use shorter period (ATR-10).
 
 /// 1-minute candle from Binance kline stream (authoritative source)
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Candle1m {
     pub open: f64,
     pub high: f64,
@@ -44,6 +44,12 @@ pub struct Candle1m {
     pub volume: f64,
     pub start_time: DateTime<Utc>,
     pub is_complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CandleBackfill {
+    pub ticker: String,
+    pub candles: Vec<Candle1m>,
 }
 
 /// 5-minute candle for ATR calculation (aggregated from 1m candles)
@@ -758,6 +764,16 @@ pub struct PerExchangeShortStats {
     pub trades_30s: usize,
 }
 
+impl From<&SnapshotPerExchangeShort> for PerExchangeShortStats {
+    fn from(value: &SnapshotPerExchangeShort) -> Self {
+        Self {
+            cvd_30s: value.cvd_30s,
+            total_30s: value.total_30s,
+            trades_30s: value.trades_30s,
+        }
+    }
+}
+
 /// P1: Basis trend direction
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum BasisTrend {
@@ -886,13 +902,33 @@ impl Aggregator {
     pub fn process_event(&mut self, event: MarketEventMessage) {
         if event.kind == "market_snapshot" {
             if let Ok(snapshot) = serde_json::from_value::<MarketSnapshotMessage>(event.data) {
+                let previous = self.server_snapshot.as_ref().map(|s| s.snapshot_version);
+                if previous.is_none() || previous != Some(snapshot.snapshot_version) {
+                    info!("market_snapshot version: {}", snapshot.snapshot_version);
+                }
                 self.server_snapshot = Some(snapshot);
+            }
+            return;
+        }
+
+        if event.kind == "candle_backfill" {
+            if let Ok(backfill) = serde_json::from_value::<CandleBackfill>(event.data) {
+                for candle in backfill.candles {
+                    self.push_1m_candle(&backfill.ticker, candle);
+                }
             }
             return;
         }
 
         let ticker = event.instrument.base.to_uppercase();
         let kind = event.instrument.kind.to_lowercase();
+
+        if event.kind == "candle_1m" {
+            if let Ok(candle) = serde_json::from_value::<Candle1m>(event.data) {
+                self.push_1m_candle(&ticker, candle);
+            }
+            return;
+        }
 
         // Hardened spot/perp classifier
         let mut is_spot = kind.contains("spot");
@@ -1041,6 +1077,19 @@ impl Aggregator {
         let mut tickers_out = HashMap::new();
         for (ticker, state) in &self.tickers {
             let mut snap = state.to_snapshot();
+            if let Some(server) = self
+                .server_snapshot
+                .as_ref()
+                .and_then(|s| s.tickers.get(ticker))
+            {
+                if !server.per_exchange_30s.is_empty() {
+                    snap.per_exchange_30s = server
+                        .per_exchange_30s
+                        .iter()
+                        .map(|(ex, stats)| (ex.clone(), PerExchangeShortStats::from(stats)))
+                        .collect();
+                }
+            }
             // Inject exchange freshness into each ticker snapshot
             snap.exchange_health = exchange_ages.clone();
             tickers_out.insert(ticker.clone(), snap);

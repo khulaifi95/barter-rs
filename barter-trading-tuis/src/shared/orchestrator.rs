@@ -22,6 +22,7 @@ use crate::shared::market_state::{
 };
 use crate::shared::options_state::{no_gamma_score, OptionsContext};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -90,7 +91,7 @@ pub struct MarketDataInput {
 }
 
 /// Result of orchestrated state calculation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorResult {
     /// The calculated market state
     pub state: MarketState,
@@ -542,6 +543,8 @@ mod tests {
             current_rv: 0.02,
             percentile: 50.0,
             regime: VolRegime::Normal,
+            rv_samples: 168,
+            rv_samples_required: 168,
             zscore_1m: 0.5,
             is_shock: false,
             passed: true,

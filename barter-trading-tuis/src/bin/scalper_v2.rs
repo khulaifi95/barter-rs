@@ -17,8 +17,8 @@ use std::{
 };
 
 use barter_trading_tuis::{
-    AggregatedSnapshot, Aggregator, Candle1m, ConnectionStatus, DivergenceSignal, FlowSignal,
-    Side, VolTrend, WebSocketClient, WebSocketConfig, ticker_to_binance_symbol,
+    AggregatedSnapshot, Aggregator, ConnectionStatus, DivergenceSignal, FlowSignal,
+    Side, VolTrend, WebSocketClient, WebSocketConfig,
     // Trad markets (ES/NQ) correlation
     IbkrConnectionStatus, TradMarketState, render_trad_markets_panel,
 };
@@ -37,10 +37,8 @@ use ratatui::{
     Terminal,
 };
 use tokio::sync::Mutex;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
 use reqwest::Client;
 use serde_json::Value;
-use futures::StreamExt;
 
 // ============================================================================
 // COLORS - Balanced palette for easy reading
@@ -261,51 +259,6 @@ fn bidir_bar_labeled(value: f64, width: usize, show_pct: bool) -> Vec<Span<'stat
     }
 }
 
-async fn run_binance_kline_stream(ticker: &str, agg: Arc<Mutex<Aggregator>>) {
-    let symbol = ticker_to_binance_symbol(ticker).to_lowercase();
-    let url = format!("wss://fstream.binance.com/ws/{}@kline_1m", symbol);
-    loop {
-        { let mut g = agg.lock().await; let _ = g.backfill_1m_klines(&[ticker]).await; }
-        match connect_async(&url).await {
-            Ok((ws, _)) => {
-                let (_, mut read) = ws.split();
-                while let Some(msg) = read.next().await {
-                    match msg {
-                        Ok(Message::Text(text)) => {
-                            if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                                if let Some(k) = v.get("k") {
-                                    let is_final = k.get("x").and_then(|b| b.as_bool()).unwrap_or(false);
-                                    if !is_final { continue; }
-                                    if let (Some(t), Some(o), Some(h), Some(l), Some(c), Some(vol)) = (
-                                        k.get("t").and_then(|v| v.as_i64()),
-                                        k.get("o").and_then(|v| v.as_str()),
-                                        k.get("h").and_then(|v| v.as_str()),
-                                        k.get("l").and_then(|v| v.as_str()),
-                                        k.get("c").and_then(|v| v.as_str()),
-                                        k.get("v").and_then(|v| v.as_str()),
-                                    ) {
-                                        if let Some(st) = chrono::DateTime::from_timestamp_millis(t) {
-                                            if let (Ok(o), Ok(h), Ok(l), Ok(c), Ok(v)) =
-                                                (o.parse::<f64>(), h.parse::<f64>(), l.parse::<f64>(), c.parse::<f64>(), vol.parse::<f64>()) {
-                                                let candle = Candle1m { open: o, high: h, low: l, close: c, volume: v, start_time: st, is_complete: true };
-                                                agg.lock().await.push_1m_candle(ticker, candle);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(Message::Close(_)) | Err(_) => break,
-                        _ => {}
-                    }
-                }
-            }
-            Err(_e) => { /* Silent reconnect - kline connection will retry */ }
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    }
-}
-
 // ============================================================================
 // MAIN
 // ============================================================================
@@ -330,8 +283,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let connected = Arc::new(AtomicBool::new(false));
     let focus_index = Arc::new(AtomicUsize::new(0));
 
-    { let mut g = aggregator.lock().await; let _ = g.backfill_1m_klines(&TICKERS).await; }
-
     let bvol24h = Arc::new(Mutex::new(None::<f64>));
     {
         let bvol = Arc::clone(&bvol24h);
@@ -347,11 +298,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Trad markets (ES/NQ) correlation state
     let trad_state = Arc::new(Mutex::new(TradMarketState::new()));
     let (ibkr_status_tx, ibkr_status_rx) = tokio::sync::watch::channel(IbkrConnectionStatus::Disconnected);
-
-    for &ticker in &TICKERS {
-        let agg = Arc::clone(&aggregator);
-        tokio::spawn(async move { run_binance_kline_stream(ticker, agg).await; });
-    }
 
     let config = WebSocketConfig::new(get_ws_url())
         .with_ping_interval(Duration::from_secs(30))

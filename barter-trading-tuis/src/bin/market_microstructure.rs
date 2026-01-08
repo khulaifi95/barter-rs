@@ -14,17 +14,10 @@ use std::{
 };
 
 use barter_trading_tuis::{
-    AggregatedSnapshot, Aggregator, Candle1m, ConnectionStatus, DivergenceSignal,
-    FlowSignal, OrchestratorResult, Side, WebSocketClient, WebSocketConfig, ticker_to_binance_symbol,
+    AggregatedSnapshot, Aggregator, ConnectionStatus, DivergenceSignal, FlowSignal,
+    OrchestratorResult, Side, WebSocketClient, WebSocketConfig,
 };
-use barter_trading_tuis::shared::{
-    audit::AuditLogger,
-    config::Config,
-    market_state::{ConfigProvider, Direction as FlowDirection, State, TradingBias, TradMarketStatus},
-    options_state::OptionsContextBuilder,
-    orchestrator::StateOrchestrator,
-    snapshot_bridge::build_market_data_input,
-};
+use barter_trading_tuis::shared::market_state::{Direction as FlowDirection, State, TradingBias};
 use rustls::crypto::ring::default_provider;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -39,11 +32,16 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
+use serde::Deserialize;
 use tokio::sync::{Mutex, watch};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use futures::StreamExt;
 
 static TICKERS: OnceLock<Vec<String>> = OnceLock::new();
+
+#[derive(Debug, Clone, Deserialize)]
+struct OrchestratorMessage {
+    ticker: String,
+    result: OrchestratorResult,
+}
 
 /// Get tickers from TICKERS env var (default: BTC,ETH,SOL)
 fn get_tickers() -> Vec<String> {
@@ -108,76 +106,6 @@ fn tickers() -> &'static [String] {
     TICKERS.get_or_init(get_tickers)
 }
 
-/// Spawn a Binance 1m kline stream for a ticker (perps)
-async fn run_binance_kline_stream(ticker: &str, agg: Arc<Mutex<Aggregator>>) {
-    let symbol = ticker_to_binance_symbol(ticker).to_lowercase();
-    let url = format!("wss://fstream.binance.com/ws/{}@kline_1m", symbol);
-
-    loop {
-        // Resync from REST on reconnect to avoid drift
-        {
-            let mut guard = agg.lock().await;
-            let _ = guard.backfill_1m_klines(&[ticker]).await;
-        }
-
-        match connect_async(&url).await {
-            Ok((ws_stream, _)) => {
-                let (_, mut read) = ws_stream.split();
-                while let Some(msg) = read.next().await {
-                    match msg {
-                        Ok(Message::Text(text)) => {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                if let Some(k) = v.get("k") {
-                                    let is_final = k.get("x").and_then(|b| b.as_bool()).unwrap_or(false);
-                                    if !is_final {
-                                        continue;
-                                    }
-                                    if let (Some(start_ms), Some(open), Some(high), Some(low), Some(close), Some(vol)) = (
-                                        k.get("t").and_then(|v| v.as_i64()),
-                                        k.get("o").and_then(|v| v.as_str()),
-                                        k.get("h").and_then(|v| v.as_str()),
-                                        k.get("l").and_then(|v| v.as_str()),
-                                        k.get("c").and_then(|v| v.as_str()),
-                                        k.get("v").and_then(|v| v.as_str()),
-                                    ) {
-                                        if let Some(start_time) = chrono::DateTime::from_timestamp_millis(start_ms) {
-                                            if let (Ok(o), Ok(h), Ok(l), Ok(c), Ok(volume)) =
-                                                (open.parse::<f64>(), high.parse::<f64>(), low.parse::<f64>(), close.parse::<f64>(), vol.parse::<f64>())
-                                            {
-                                                let candle = Candle1m {
-                                                    open: o,
-                                                    high: h,
-                                                    low: l,
-                                                    close: c,
-                                                    volume,
-                                                    start_time,
-                                                    is_complete: true,
-                                                };
-                                                let mut guard = agg.lock().await;
-                                                guard.push_1m_candle(ticker, candle);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
-                        Ok(Message::Close(_)) => break,
-                        Err(_) => break,
-                        _ => {}
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[kline-ws] {} connect error: {}", ticker, e);
-            }
-        }
-
-        // Backoff before reconnect
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Install rustls crypto provider (required for TLS fetches / wss)
@@ -203,28 +131,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Shared aggregation engine
     let aggregator = Arc::new(Mutex::new(Aggregator::new()));
     let connected = Arc::new(AtomicBool::new(false));
-    let options_cache = Arc::new(Mutex::new(HashMap::new()));
-
     // Watch channel for sharing MarketState from orchestrator to UI
     let (state_tx, state_rx) = watch::channel::<HashMap<String, OrchestratorResult>>(HashMap::new());
-
-    // Backfill tvVWAP, ATR, and RV from authoritative Binance 1m klines
-    {
-        let ticker_list: Vec<&str> = tickers().iter().map(|s| s.as_str()).collect();
-        let mut guard = aggregator.lock().await;
-        let _ = guard.backfill_1m_klines(&ticker_list).await;
-    }
-
-    // Binance 1m kline WebSocket streams (authoritative candles)
-    {
-        let agg = Arc::clone(&aggregator);
-        for ticker in tickers().iter().cloned() {
-            let agg_clone = Arc::clone(&agg);
-            tokio::spawn(async move {
-                run_binance_kline_stream(&ticker, agg_clone).await;
-            });
-        }
-    }
 
     // WebSocket client
     let ws_url = get_ws_url();
@@ -238,32 +146,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Event processor
     {
         let agg = Arc::clone(&aggregator);
-        let options_cache = Arc::clone(&options_cache);
         tokio::spawn(async move {
-            let options_builder = OptionsContextBuilder::new();
+            let mut state_map: HashMap<String, OrchestratorResult> = HashMap::new();
             while let Some(event) = event_rx.recv().await {
+                if event.kind == "orchestrator_result" {
+                    if let Ok(msg) = serde_json::from_value::<OrchestratorMessage>(event.data.clone()) {
+                        state_map.insert(msg.ticker, msg.result);
+                        let _ = state_tx.send(state_map.clone());
+                    }
+                    continue;
+                }
                 if event.kind == "trad_tick" {
                     // TradFi ticks are not consumed in this TUI yet.
                     continue;
                 }
-                if event.kind == "options_chain" {
-                    if let Ok(chain) = serde_json::from_value::<barter_trading_tuis::shared::market_state::OptionsChain>(event.data.clone()) {
-                        let ticker = event.instrument.base.to_uppercase();
-                        let spot = {
-                            let guard = agg.lock().await;
-                            guard
-                                .snapshot()
-                                .tickers
-                                .get(&ticker)
-                                .and_then(|s| s.binance_perp_last)
-                                .unwrap_or(0.0)
-                        };
-                        if spot > 0.0 {
-                            let ctx = options_builder.build(&chain, spot);
-                            let mut cache = options_cache.lock().await;
-                            cache.insert(ticker, ctx);
-                        }
-                    }
+                if event.kind == "options_context" {
                     continue;
                 }
 
@@ -284,81 +181,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         connected_flag.store(false, Ordering::Relaxed)
                     }
                 }
-            }
-        });
-    }
-
-    // Market State Engine - background orchestrator task
-    // Calculates MarketState every 200ms and logs state transitions
-    {
-        let agg = Arc::clone(&aggregator);
-        let options_cache = Arc::clone(&options_cache);
-        let state_tx = state_tx.clone();
-        tokio::spawn(async move {
-            // Load config from file with fallback to defaults
-            let config = Config::load().unwrap_or_else(|e| {
-                tracing::warn!("Failed to load config: {}, using defaults", e);
-                Config::default()
-            });
-
-            // Create real audit logger (writes to logs/audit/)
-            let logger = AuditLogger::new(&config.thresholds().audit);
-            let mut orchestrator = StateOrchestrator::new(config, logger);
-            let calc_interval = Duration::from_millis(200);
-            let mut last_calc = Instant::now();
-
-            loop {
-                if last_calc.elapsed() >= calc_interval {
-                    let snapshot = {
-                        let guard = agg.lock().await;
-                        guard.snapshot()
-                    };
-
-                    // Collect results for all tickers
-                    let mut state_results = HashMap::new();
-
-                    // Process each ticker through the orchestrator
-                    for (ticker, ticker_snap) in &snapshot.tickers {
-                        let server_ticker = snapshot
-                            .server_snapshot
-                            .as_ref()
-                            .and_then(|snap| snap.tickers.get(ticker));
-                        // Build input with proper options context
-                        let mut input = build_market_data_input(
-                            ticker_snap,
-                            server_ticker,
-                            TradMarketStatus::Unavailable, // No IBKR in this binary
-                        );
-
-                        if let Some(ctx) = options_cache.lock().await.get(ticker).cloned() {
-                            input.options_context = Some(ctx);
-                        }
-
-                        let result = orchestrator.calculate(&input);
-
-                        // Log non-Wait state transitions
-                        if result.state.state != barter_trading_tuis::shared::market_state::State::Wait {
-                            tracing::debug!(
-                                ticker = %ticker,
-                                state = ?result.state.state,
-                                bias = ?result.state.bias,
-                                confidence = result.state.confidence,
-                                no_gamma = result.no_gamma_mode,
-                                gamma_flip = result.state.components.gamma_context.gamma_flip_price,
-                                "Market state update"
-                            );
-                        }
-
-                        state_results.insert(ticker.clone(), result);
-                    }
-
-                    // Send updated states to UI (non-blocking)
-                    let _ = state_tx.send(state_results);
-
-                    last_calc = Instant::now();
-                }
-
-                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         });
     }
