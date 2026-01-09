@@ -1699,7 +1699,41 @@ async fn handle_client(
     }
 
     // Send kline backfill to align RV/ATR across clients
+    // First check for stale cache (last candle date != today) and refresh if needed
     {
+        let today = Utc::now().date_naive();
+        let mut stale_tickers: Vec<String> = Vec::new();
+
+        // Check which tickers have stale cache
+        {
+            let cache = kline_cache.lock().await;
+            for (ticker, candles) in cache.iter() {
+                let is_stale = candles.is_empty()
+                    || candles.back().map(|c| c.start_time.date_naive() != today).unwrap_or(true);
+                if is_stale {
+                    stale_tickers.push(ticker.clone());
+                }
+            }
+        }
+
+        // Refresh stale tickers
+        for ticker in &stale_tickers {
+            let symbol = ticker_to_binance_symbol(ticker);
+            if let Ok(fresh_candles) = fetch_binance_1m_candles(symbol).await {
+                let mut cache = kline_cache.lock().await;
+                let entry = cache.entry(ticker.clone()).or_insert_with(VecDeque::new);
+                entry.clear();
+                for candle in fresh_candles {
+                    entry.push_back(candle);
+                }
+                while entry.len() > 300 {
+                    entry.pop_front();
+                }
+                info!("Refreshed stale kline cache for {} (had {} candles)", ticker, entry.len());
+            }
+        }
+
+        // Now send backfill for all tickers
         let cache = kline_cache.lock().await;
         for (ticker, candles) in cache.iter() {
             let payload = CandleBackfill {

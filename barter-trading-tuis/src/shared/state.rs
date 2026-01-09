@@ -913,9 +913,11 @@ impl Aggregator {
 
         if event.kind == "candle_backfill" {
             if let Ok(backfill) = serde_json::from_value::<CandleBackfill>(event.data) {
-                for candle in backfill.candles {
-                    self.push_1m_candle(&backfill.ticker, candle);
-                }
+                let state = self
+                    .tickers
+                    .entry(backfill.ticker.clone())
+                    .or_insert_with(|| TickerState::new(backfill.ticker.clone()));
+                state.backfill_from_1m_candles(backfill.candles);
             }
             return;
         }

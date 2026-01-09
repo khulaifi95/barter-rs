@@ -81,14 +81,14 @@ async fn main() {
             );
 
             // Determine trade direction
-            let side_emoji = if market_event.kind.side.is_buy() {
+            let side_emoji = if matches!(market_event.kind.side, barter_instrument::Side::Buy) {
                 "🟢"  // Buy trade (taker bought)
             } else {
                 "🔴"  // Sell trade (taker sold)
             };
 
             // Format volume
-            let volume_usd = market_event.kind.quantity * market_event.kind.price;
+            let volume_usd = market_event.kind.amount * market_event.kind.price;
             let volume_display = if volume_usd >= 100_000.0 {
                 format!(" 💰 ${:.0}K", volume_usd / 1_000.0)
             } else {
@@ -103,7 +103,7 @@ async fn main() {
                     exchange,
                     symbol,
                     market_event.kind.price,
-                    market_event.kind.quantity,
+                    market_event.kind.amount,
                     volume_display
                 );
             }
@@ -157,13 +157,13 @@ impl TradeStats {
             event.instrument.base.as_ref().to_uppercase(),
             event.instrument.quote.as_ref().to_uppercase()
         );
-        let volume_usd = event.kind.quantity * event.kind.price;
+        let volume_usd = event.kind.amount * event.kind.price;
 
         *self.exchange_counts.entry(exchange).or_insert(0) += 1;
         *self.symbol_counts.entry(symbol).or_insert(0) += 1;
         self.total_volume_usd += volume_usd;
 
-        if event.kind.side.is_buy() {
+        if matches!(event.kind.side, barter_instrument::Side::Buy) {
             self.buy_count += 1;
         } else {
             self.sell_count += 1;
