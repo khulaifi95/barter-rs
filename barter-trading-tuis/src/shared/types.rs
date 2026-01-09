@@ -172,6 +172,8 @@ pub struct TradTickData {
     pub bid: Option<f64>,
     #[serde(default)]
     pub ask: Option<f64>,
+    #[serde(default)]
+    pub vwap: Option<f64>,
 }
 
 /// Cumulative Volume Delta (CVD) event data

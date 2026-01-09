@@ -85,6 +85,21 @@ If L1 fails, don't even evaluate L2. This prevents false positives.
 
 ---
 
+## 1.1 Implementation Tracker
+
+### Volatility Regime (L1) - 7‑Day Percentile
+- [x] Seed VolRegimeEngine from 7‑day 5m history on server start.
+- [x] Update percentile hourly from live 1h RV (server snapshot loop).
+- [x] Broadcast `vol_percentile`, `vol_regime`, `vol_samples` in `market_snapshot`.
+- [x] TUI consumes server values when available; fallback to trend mapping if not.
+- [ ] Add UI indicator for warmup state (vol_samples < 24) if needed.
+
+### Notes
+- Server updates RV history once per hour to keep percentile current.
+- Warmup uses 24 samples minimum before percentile is considered stable.
+
+---
+
 ## 2. Requirements
 
 ### 2.1 Functional Requirements

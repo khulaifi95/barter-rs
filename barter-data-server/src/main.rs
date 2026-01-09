@@ -91,6 +91,8 @@ struct TradMarketTick {
     bid: Option<f64>,
     #[serde(default)]
     ask: Option<f64>,
+    #[serde(default)]
+    vwap: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -651,6 +653,11 @@ async fn main() {
                         engine: VolRegimeEngine::default(),
                         last_hour: None,
                     });
+                    let now_hour = Utc::now().timestamp() / 3600;
+                    if rv > 0.0 && state.last_hour != Some(now_hour) {
+                        state.engine.push_rv(rv);
+                        state.last_hour = Some(now_hour);
+                    }
                     let sample_count = state.engine.rv_sample_count().min(RV_TARGET_SAMPLES);
                     snap.vol_samples = sample_count as u16;
                     if sample_count < RV_MIN_SAMPLES || rv <= 0.0 {

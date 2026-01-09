@@ -319,11 +319,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     if let Ok(tick) = serde_json::from_value::<barter_trading_tuis::shared::types::TradTickData>(event.data.clone()) {
                         let size = if tick.sz > 0.0 { tick.sz } else { 1.0 };
                         let mut trad_guard = trad.lock().await;
-                        match tick.symbol.as_str() {
-                            "ES" => trad_guard.update_es_tick(tick.px, size, tick.ts),
-                            "NQ" => trad_guard.update_nq_tick(tick.px, size, tick.ts),
-                            _ => {}
-                        }
+                            match tick.symbol.as_str() {
+                                "ES" => trad_guard.update_es_tick(tick.px, size, tick.ts, tick.bid, tick.ask, tick.vwap),
+                                "NQ" => trad_guard.update_nq_tick(tick.px, size, tick.ts, tick.bid, tick.ask, tick.vwap),
+                                _ => {}
+                            }
                     }
                     let _ = ibkr_status_tx.send(IbkrConnectionStatus::Connected);
                     continue;

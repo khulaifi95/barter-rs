@@ -34,6 +34,8 @@ enum IbkrMessage {
         bid: Option<f64>,
         #[serde(default)]
         ask: Option<f64>,
+        #[serde(default)]
+        vwap: Option<f64>,
     },
     #[serde(rename = "tick_backfill")]
     TickBackfill {
@@ -94,11 +96,11 @@ pub fn spawn_ibkr_feed(
                                     Ok(ibkr_msg) => {
                                         let mut state_guard = state.lock().await;
                                         match ibkr_msg {
-                                            IbkrMessage::Tick { symbol, ts, px, sz, .. } => {
+                                            IbkrMessage::Tick { symbol, ts, px, sz, bid, ask, vwap } => {
                                                 let size = if sz > 0.0 { sz } else { 1.0 };
                                                 match symbol.as_str() {
-                                                    "ES" => state_guard.update_es_tick(px, size, ts),
-                                                    "NQ" => state_guard.update_nq_tick(px, size, ts),
+                                                    "ES" => state_guard.update_es_tick(px, size, ts, bid, ask, vwap),
+                                                    "NQ" => state_guard.update_nq_tick(px, size, ts, bid, ask, vwap),
                                                     _ => {}
                                                 }
                                             }
@@ -107,8 +109,8 @@ pub fn spawn_ibkr_feed(
                                                 for tick in ticks {
                                                     let size = if tick.sz > 0.0 { tick.sz } else { 1.0 };
                                                     match symbol.as_str() {
-                                                        "ES" => state_guard.update_es_tick(tick.px, size, tick.ts),
-                                                        "NQ" => state_guard.update_nq_tick(tick.px, size, tick.ts),
+                                                        "ES" => state_guard.update_es_tick(tick.px, size, tick.ts, None, None, None),
+                                                        "NQ" => state_guard.update_nq_tick(tick.px, size, tick.ts, None, None, None),
                                                         _ => {}
                                                     }
                                                 }

@@ -38,6 +38,16 @@ pub struct CorrelationSignals {
     // Derived
     pub eq_sync: bool,        // ES/NQ corr > 0.85
 
+    // TradFi flow (contracts)
+    pub es_delta: f64,
+    pub nq_delta: f64,
+    pub es_buy_pct: f64,
+    pub nq_buy_pct: f64,
+
+    // VWAP (provider)
+    pub es_vwap: Option<f64>,
+    pub nq_vwap: Option<f64>,
+
     // Data quality
     pub es_bars_count: usize,
     pub nq_bars_count: usize,
@@ -66,6 +76,10 @@ pub struct TradMarketState {
     nq_price: f64,
     btc_price: f64,
 
+    // Latest VWAP values from provider
+    es_vwap: Option<f64>,
+    nq_vwap: Option<f64>,
+
     // Last update times for staleness detection
     es_last_update: Option<Instant>,
     nq_last_update: Option<Instant>,
@@ -91,6 +105,8 @@ impl TradMarketState {
             es_price: 0.0,
             nq_price: 0.0,
             btc_price: 0.0,
+            es_vwap: None,
+            nq_vwap: None,
             es_last_update: None,
             nq_last_update: None,
             btc_last_update: None,
@@ -100,26 +116,48 @@ impl TradMarketState {
     }
 
     /// Update with ES tick from ibkr-bridge
-    pub fn update_es_tick(&mut self, price: f64, size: f64, ts: i64) {
+    pub fn update_es_tick(
+        &mut self,
+        price: f64,
+        size: f64,
+        ts: i64,
+        bid: Option<f64>,
+        ask: Option<f64>,
+        vwap: Option<f64>,
+    ) {
         if price <= 0.0 {
             return;
         }
         self.es_price = price;
         self.es_last_update = Some(Instant::now());
-        if let Some(bar) = self.es_aggregator.update(price, size, ts) {
+        if let Some(vwap_val) = vwap {
+            self.es_vwap = Some(vwap_val);
+        }
+        if let Some(bar) = self.es_aggregator.update(price, size, ts, bid, ask) {
             self.es_bars.push(bar);
             self.recompute_signals();
         }
     }
 
     /// Update with NQ tick from ibkr-bridge
-    pub fn update_nq_tick(&mut self, price: f64, size: f64, ts: i64) {
+    pub fn update_nq_tick(
+        &mut self,
+        price: f64,
+        size: f64,
+        ts: i64,
+        bid: Option<f64>,
+        ask: Option<f64>,
+        vwap: Option<f64>,
+    ) {
         if price <= 0.0 {
             return;
         }
         self.nq_price = price;
         self.nq_last_update = Some(Instant::now());
-        if let Some(bar) = self.nq_aggregator.update(price, size, ts) {
+        if let Some(vwap_val) = vwap {
+            self.nq_vwap = Some(vwap_val);
+        }
+        if let Some(bar) = self.nq_aggregator.update(price, size, ts, bid, ask) {
             self.nq_bars.push(bar);
         }
     }
@@ -131,7 +169,7 @@ impl TradMarketState {
         }
         self.btc_price = price;
         self.btc_last_update = Some(Instant::now());
-        if let Some(bar) = self.btc_aggregator.update(price, size, ts) {
+        if let Some(bar) = self.btc_aggregator.update(price, size, ts, None, None) {
             self.btc_bars.push(bar);
         }
     }
@@ -152,6 +190,27 @@ impl TradMarketState {
         let es_return = calc_return(&es_bars);
         let nq_return = calc_return(&nq_bars);
         let btc_return = calc_return(&btc_bars);
+
+        // Flow delta (contracts) over window
+        let es_buy: f64 = es_bars.iter().map(|b| b.buy_volume).sum();
+        let es_sell: f64 = es_bars.iter().map(|b| b.sell_volume).sum();
+        let es_total = es_buy + es_sell;
+        let es_delta = es_buy - es_sell;
+        let es_buy_pct = if es_total > 0.0 {
+            es_buy / es_total * 100.0
+        } else {
+            50.0
+        };
+
+        let nq_buy: f64 = nq_bars.iter().map(|b| b.buy_volume).sum();
+        let nq_sell: f64 = nq_bars.iter().map(|b| b.sell_volume).sum();
+        let nq_total = nq_buy + nq_sell;
+        let nq_delta = nq_buy - nq_sell;
+        let nq_buy_pct = if nq_total > 0.0 {
+            nq_buy / nq_total * 100.0
+        } else {
+            50.0
+        };
 
         // Spreads
         let nq_es_spread = nq_return - es_return;
@@ -208,6 +267,12 @@ impl TradMarketState {
             lead_lag_secs,
             lead_lag_corr,
             eq_sync,
+            es_delta,
+            nq_delta,
+            es_buy_pct,
+            nq_buy_pct,
+            es_vwap: self.es_vwap,
+            nq_vwap: self.nq_vwap,
             es_bars_count: self.es_bars.len(),
             nq_bars_count: self.nq_bars.len(),
             btc_bars_count: self.btc_bars.len(),
@@ -233,6 +298,8 @@ impl TradMarketState {
             es_price: self.es_price,
             nq_price: self.nq_price,
             btc_price: self.btc_price,
+            es_vwap: self.es_vwap,
+            nq_vwap: self.nq_vwap,
             ..self.signals.clone()
         }
     }

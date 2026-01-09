@@ -162,11 +162,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         let size = if tick.sz > 0.0 { tick.sz } else { 1.0 };
                         let mut trad_guard = trad_state.lock().await;
-                        match tick.symbol.as_str() {
-                            "ES" => trad_guard.update_es_tick(tick.px, size, tick.ts),
-                            "NQ" => trad_guard.update_nq_tick(tick.px, size, tick.ts),
-                            _ => {}
-                        }
+                            match tick.symbol.as_str() {
+                                "ES" => trad_guard.update_es_tick(tick.px, size, tick.ts, tick.bid, tick.ask, tick.vwap),
+                                "NQ" => trad_guard.update_nq_tick(tick.px, size, tick.ts, tick.bid, tick.ask, tick.vwap),
+                                _ => {}
+                            }
                     }
                     continue;
                 }

@@ -17,6 +17,8 @@ pub struct MicroBar {
     pub low: f64,
     pub close: f64,
     pub volume: f64,
+    pub buy_volume: f64,
+    pub sell_volume: f64,
 }
 
 /// Aggregates ticks into 5-second OHLC bars
@@ -29,6 +31,8 @@ pub struct MicroBarAggregator {
     low: f64,
     close: f64,
     volume: f64,
+    buy_volume: f64,
+    sell_volume: f64,
     bar_ts: i64,
 }
 
@@ -41,6 +45,8 @@ impl MicroBarAggregator {
             low: f64::MAX,
             close: 0.0,
             volume: 0.0,
+            buy_volume: 0.0,
+            sell_volume: 0.0,
             bar_ts: 0,
         }
     }
@@ -51,15 +57,31 @@ impl MicroBarAggregator {
         (ts / BAR_DURATION_MS) * BAR_DURATION_MS
     }
 
+    #[inline]
+    fn classify_side(price: f64, bid: Option<f64>, ask: Option<f64>) -> bool {
+        match (bid, ask) {
+            (Some(b), Some(a)) if price >= a => true,
+            (Some(b), Some(a)) if price <= b => false,
+            (Some(b), Some(a)) => price >= (b + a) / 2.0,
+            _ => true, // Default to buy if no quote
+        }
+    }
+
     /// Returns Some(bar) when a 5-second bar completes
     /// Uses tick timestamp (ts) for bar boundaries, not wall clock
-    pub fn update(&mut self, price: f64, size: f64, ts: i64) -> Option<MicroBar> {
+    pub fn update(&mut self, price: f64, size: f64, ts: i64, bid: Option<f64>, ask: Option<f64>) -> Option<MicroBar> {
         // Guard: ignore invalid prices or timestamps
         if price <= 0.0 || ts <= 0 {
             return None;
         }
 
         let tick_bar_start = Self::align_to_bar(ts);
+        let is_buy = Self::classify_side(price, bid, ask);
+        let (buy_inc, sell_inc) = if is_buy {
+            (size, 0.0)
+        } else {
+            (0.0, size)
+        };
 
         match self.current_bar_start_ts {
             None => {
@@ -71,6 +93,8 @@ impl MicroBarAggregator {
                 self.low = price;
                 self.close = price;
                 self.volume = size;
+                self.buy_volume = buy_inc;
+                self.sell_volume = sell_inc;
                 None
             }
             Some(bar_start) if tick_bar_start > bar_start => {
@@ -82,6 +106,8 @@ impl MicroBarAggregator {
                     low: self.low,
                     close: self.close,
                     volume: self.volume,
+                    buy_volume: self.buy_volume,
+                    sell_volume: self.sell_volume,
                 };
 
                 // Reset for new bar
@@ -92,6 +118,8 @@ impl MicroBarAggregator {
                 self.low = price;
                 self.close = price;
                 self.volume = size;
+                self.buy_volume = buy_inc;
+                self.sell_volume = sell_inc;
 
                 Some(bar)
             }
@@ -102,6 +130,8 @@ impl MicroBarAggregator {
                 self.low = self.low.min(price);
                 self.close = price;
                 self.volume += size;
+                self.buy_volume += buy_inc;
+                self.sell_volume += sell_inc;
                 None
             }
         }
@@ -192,9 +222,9 @@ mod tests {
         let mut buffer = BarBuffer::new(10);
 
         // Add bars with known closes: 100, 101, 102
-        buffer.push(MicroBar { ts: 1, open: 100.0, high: 100.0, low: 100.0, close: 100.0, volume: 1.0 });
-        buffer.push(MicroBar { ts: 2, open: 101.0, high: 101.0, low: 101.0, close: 101.0, volume: 1.0 });
-        buffer.push(MicroBar { ts: 3, open: 102.0, high: 102.0, low: 102.0, close: 102.0, volume: 1.0 });
+        buffer.push(MicroBar { ts: 1, open: 100.0, high: 100.0, low: 100.0, close: 100.0, volume: 1.0, buy_volume: 0.0, sell_volume: 0.0 });
+        buffer.push(MicroBar { ts: 2, open: 101.0, high: 101.0, low: 101.0, close: 101.0, volume: 1.0, buy_volume: 0.0, sell_volume: 0.0 });
+        buffer.push(MicroBar { ts: 3, open: 102.0, high: 102.0, low: 102.0, close: 102.0, volume: 1.0, buy_volume: 0.0, sell_volume: 0.0 });
 
         let returns = buffer.returns(3);
         assert_eq!(returns.len(), 2);
@@ -213,7 +243,9 @@ mod tests {
                 high: i as f64,
                 low: i as f64,
                 close: i as f64,
-                volume: 1.0
+                volume: 1.0,
+                buy_volume: 0.0,
+                sell_volume: 0.0,
             });
         }
 
@@ -235,7 +267,7 @@ mod tests {
             let ts = base_ts + (i * 720);
             let price = 5000.0 + (i as f64 * 0.1);
 
-            if agg.update(price, 1.0, ts).is_some() {
+            if agg.update(price, 1.0, ts, None, None).is_some() {
                 bars_produced += 1;
             }
         }
@@ -250,13 +282,13 @@ mod tests {
         let mut agg = MicroBarAggregator::new();
 
         // First tick at ts=1000
-        assert!(agg.update(100.0, 1.0, 1000).is_none());
+        assert!(agg.update(100.0, 1.0, 1000, None, None).is_none());
 
         // Tick at 4999ms (same 5s window: 0-4999)
-        assert!(agg.update(101.0, 1.0, 4999).is_none());
+        assert!(agg.update(101.0, 1.0, 4999, None, None).is_none());
 
         // Tick at 5000ms (new window: 5000-9999) - should emit bar
-        let bar = agg.update(102.0, 1.0, 5000);
+        let bar = agg.update(102.0, 1.0, 5000, None, None);
         assert!(bar.is_some(), "Should emit bar when crossing 5s boundary");
 
         let bar = bar.unwrap();
