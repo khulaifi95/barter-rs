@@ -10,7 +10,7 @@ use std::{
     error::Error,
     io,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -298,11 +298,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Trad markets (ES/NQ) correlation state
     let trad_state = Arc::new(Mutex::new(TradMarketState::new()));
     let (ibkr_status_tx, ibkr_status_rx) = tokio::sync::watch::channel(IbkrConnectionStatus::Disconnected);
+    let trad_last_ms = Arc::new(AtomicI64::new(0));
+
+    let stale_timeout_secs = std::env::var("WS_STALE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(15.0);
+    let trade_stale_secs = std::env::var("TRADE_STALE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(10.0);
+    let lag_stale_secs = std::env::var("LAG_STALE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(15.0);
+    let lag_stale_duration_secs = std::env::var("LAG_STALE_DURATION_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(8.0);
 
     let config = WebSocketConfig::new(get_ws_url())
         .with_ping_interval(Duration::from_secs(30))
         .with_reconnect_delay(Duration::from_secs(2))
-        .with_channel_buffer_size(100_000);
+        .with_channel_buffer_size(100_000)
+        .with_stale_timeout(Duration::from_secs_f64(stale_timeout_secs))
+        .with_trade_stale_timeout(Duration::from_secs_f64(trade_stale_secs))
+        .with_lag_stale_threshold(Duration::from_secs_f64(lag_stale_secs))
+        .with_lag_stale_duration(Duration::from_secs_f64(lag_stale_duration_secs));
     let client = WebSocketClient::with_config(config);
     let (mut event_rx, mut status_rx) = client.start();
 
@@ -310,6 +332,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let agg = Arc::clone(&aggregator);
         let trad = Arc::clone(&trad_state);
         let ibkr_status_tx = ibkr_status_tx.clone();
+        let trad_last_ms = Arc::clone(&trad_last_ms);
         tokio::spawn(async move {
             let mut last_latency_log = Instant::now();
             let mut latency_samples: Vec<i64> = Vec::new();
@@ -325,6 +348,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 _ => {}
                             }
                     }
+                    trad_last_ms.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
                     let _ = ibkr_status_tx.send(IbkrConnectionStatus::Connected);
                     continue;
                 }
@@ -366,6 +390,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(async move {
             while let Some(status) = status_rx.recv().await {
                 conn.store(matches!(status, ConnectionStatus::Connected), Ordering::Relaxed);
+            }
+        });
+    }
+
+    // IBKR liveness gate - mark as stale if no ticks arrive for a threshold
+    {
+        let ibkr_status_tx = ibkr_status_tx.clone();
+        let trad_last_ms = Arc::clone(&trad_last_ms);
+        tokio::spawn(async move {
+            let stale_secs = std::env::var("IBKR_STALE_SECS")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(10);
+            let mut current = IbkrConnectionStatus::Disconnected;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let last = trad_last_ms.load(Ordering::Relaxed);
+                let now = chrono::Utc::now().timestamp_millis();
+                let next = if last <= 0 {
+                    IbkrConnectionStatus::Disconnected
+                } else if now - last > stale_secs * 1000 {
+                    IbkrConnectionStatus::Stale
+                } else {
+                    IbkrConnectionStatus::Connected
+                };
+                if next != current {
+                    let _ = ibkr_status_tx.send(next);
+                    current = next;
+                }
             }
         });
     }

@@ -28,8 +28,8 @@ const COL_PRICE: usize = 8;
 const COL_FLOW: usize = 8;
 const COL_VWAP: usize = 6;
 const COL_BIAS: usize = 6;
-const COL_GAP: &str = "  ";
-const COL_GAP_LEN: usize = 2;
+const COL_GAP: &str = " ";
+const COL_GAP_LEN: usize = 1;
 const SEP_LEN: usize = 4 + COL_PRICE + COL_FLOW + COL_VWAP + COL_BIAS + (COL_GAP_LEN * 3);
 
 /// Render the TRAD MARKETS panel - clean card-based layout
@@ -41,7 +41,8 @@ pub fn render_trad_markets_panel(
 ) {
     let border_color = match ibkr_status {
         IbkrConnectionStatus::Connected => C_ACCENT,
-        _ => C_SELL,
+        IbkrConnectionStatus::Stale | IbkrConnectionStatus::Reconnecting => C_NEUTRAL,
+        IbkrConnectionStatus::Disconnected => C_SELL,
     };
 
     let block = Block::default()
@@ -100,6 +101,7 @@ pub fn render_trad_markets_panel(
         Span::styled(format!(" {}", nq_vwap_pct_str), Style::default().fg(nq_vwap_pct_color)),
     ]));
 
+    lines.push(Line::from(""));
     lines.push(Line::from(""));
 
     // === ROW 2: Matrix header ===
@@ -405,6 +407,7 @@ pub fn render_trad_markets_panel(
         Span::styled("└──────────┘", Style::default().fg(C_DIM)),
     ]));
 
+    lines.push(Line::from(""));
     lines.push(Line::from(""));
 
     // === ROW 5: DIVERGENCE with gradient bar ===

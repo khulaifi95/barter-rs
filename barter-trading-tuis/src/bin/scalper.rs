@@ -299,10 +299,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // WebSocket client with larger buffer for high-frequency mode
     let ws_url = get_ws_url();
+    let stale_timeout_secs = std::env::var("WS_STALE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(15.0);
+    let trade_stale_secs = std::env::var("TRADE_STALE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(10.0);
+    let lag_stale_secs = std::env::var("LAG_STALE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(15.0);
+    let lag_stale_duration_secs = std::env::var("LAG_STALE_DURATION_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(8.0);
     let config = WebSocketConfig::new(ws_url)
         .with_ping_interval(Duration::from_secs(30))
         .with_reconnect_delay(Duration::from_secs(2))
-        .with_channel_buffer_size(100_000); // Larger buffer for scalper
+        .with_channel_buffer_size(100_000) // Larger buffer for scalper
+        .with_stale_timeout(Duration::from_secs_f64(stale_timeout_secs))
+        .with_trade_stale_timeout(Duration::from_secs_f64(trade_stale_secs))
+        .with_lag_stale_threshold(Duration::from_secs_f64(lag_stale_secs))
+        .with_lag_stale_duration(Duration::from_secs_f64(lag_stale_duration_secs));
     let client = WebSocketClient::with_config(config);
     let (mut event_rx, mut status_rx) = client.start();
 

@@ -15,6 +15,7 @@ use super::state::TradMarketState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IbkrConnectionStatus {
     Connected,
+    Stale,
     Disconnected,
     Reconnecting,
 }
