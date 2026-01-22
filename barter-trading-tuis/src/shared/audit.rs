@@ -295,8 +295,8 @@ impl AuditLog for AuditLogger {
                 );
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                // Channel closed - writer task has stopped
-                error!("Audit channel closed, cannot log entry");
+                // Channel closed - writer task has stopped (or using no_op logger)
+                // Silently drop to avoid log spam
             }
         }
     }

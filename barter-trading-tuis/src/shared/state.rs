@@ -955,18 +955,6 @@ impl Aggregator {
         match event.kind.as_str() {
             "trade" => {
                 if let Ok(trade) = serde_json::from_value::<TradeData>(event.data.clone()) {
-                    // Debug: log Binance trades to verify is_perp classification
-                    if event.exchange.contains("Binance") {
-                        use std::io::Write;
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("binance_trade_classification.log")
-                        {
-                            let _ = writeln!(file, "[{}] {} {} is_perp={} is_spot={} kind={}",
-                                chrono::Utc::now(), event.exchange, ticker, is_perp, is_spot, kind);
-                        }
-                    }
                     state.push_trade(
                         trade,
                         &event.exchange,
@@ -2829,7 +2817,11 @@ impl TickerState {
             })
             .collect();
 
-        clusters.sort_by(|a, b| b.total_usd.partial_cmp(&a.total_usd).unwrap());
+        clusters.sort_by(|a, b| {
+            b.total_usd
+                .partial_cmp(&a.total_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let cascade_risk = clusters
             .first()
