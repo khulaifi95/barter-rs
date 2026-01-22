@@ -20,6 +20,7 @@ const C_TEXT: Color = Color::Rgb(180, 180, 180);      // Default text - light gr
 const C_BRIGHT: Color = Color::Rgb(220, 220, 220);
 const C_ACCENT: Color = Color::Rgb(100, 180, 220);
 const C_HEADER: Color = Color::Rgb(140, 140, 140);
+const C_YELLOW: Color = Color::Rgb(230, 200, 80);
 
 const PRICE_PCT_THRESHOLD: f64 = 0.0;
 const VWAP_POINTS_THRESHOLD: f64 = 1.0;
@@ -101,7 +102,16 @@ pub fn render_trad_markets_panel(
         Span::styled(format!(" {}", nq_vwap_pct_str), Style::default().fg(nq_vwap_pct_color)),
     ]));
 
-    lines.push(Line::from(""));
+    // === ROW 2: VWAP prices in yellow, aligned below ES/NQ prices ===
+    let es_vwap_str = signals.es_vwap.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "--".to_string());
+    let nq_vwap_str = signals.nq_vwap.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "--".to_string());
+    lines.push(Line::from(vec![
+        Span::styled("   ", Style::default()),
+        Span::styled(es_vwap_str, Style::default().fg(C_YELLOW)),
+        Span::styled("              ", Style::default()),  // 14 spaces to align NQ VWAP under NQ price
+        Span::styled(nq_vwap_str, Style::default().fg(C_YELLOW)),
+    ]));
+
     lines.push(Line::from(""));
 
     // === ROW 2: Matrix header ===
