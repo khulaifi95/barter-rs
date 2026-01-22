@@ -446,7 +446,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         if last_draw.elapsed() >= draw_interval {
-            let snapshot = aggregator.lock().await.snapshot();
+            let snapshot = match aggregator.try_lock() {
+                Ok(guard) => guard.snapshot(),
+                Err(_) => {
+                    // Skip frame if aggregator is busy processing events.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
+            };
             let connected_now = connected.load(Ordering::Relaxed);
             let idx = focus_index.load(Ordering::Relaxed);
             let ticker = TICKERS[idx];

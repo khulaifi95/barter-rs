@@ -326,13 +326,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = WebSocketClient::with_config(config);
     let (mut event_rx, mut status_rx) = client.start();
 
-    // Event processor
+    // Event processor (batch to reduce lock contention)
     {
         let agg = Arc::clone(&aggregator);
         tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
+            let mut batch = Vec::with_capacity(1024);
+            loop {
+                match event_rx.recv().await {
+                    Some(event) => batch.push(event),
+                    None => break,
+                }
+                while batch.len() < 1024 {
+                    match event_rx.try_recv() {
+                        Ok(event) => batch.push(event),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            batch.clear();
+                            return;
+                        }
+                    }
+                }
                 let mut guard = agg.lock().await;
-                guard.process_event(event);
+                for event in batch.drain(..) {
+                    guard.process_event(event);
+                }
             }
         });
     }
@@ -387,9 +404,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         if last_draw.elapsed() >= draw_interval {
-            let snapshot = {
-                let guard = aggregator.lock().await;
-                guard.snapshot()
+            let snapshot = match aggregator.try_lock() {
+                Ok(guard) => guard.snapshot(),
+                Err(_) => {
+                    // Skip frame if aggregator is busy processing events.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
             };
 
             let connected_now = connected.load(Ordering::Relaxed);

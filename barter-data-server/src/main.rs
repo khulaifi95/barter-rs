@@ -684,8 +684,9 @@ async fn main() {
     let agg_buffer = std::env::var("AGG_EVENT_BUFFER")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(10_000_usize)
-        .clamp(1_000, 100_000);
+        .unwrap_or(300_000_usize)
+        .clamp(1_000, 500_000);
+    info!("Aggregator buffer size: {}", agg_buffer);
     let (agg_event_tx, agg_event_rx) = mpsc::channel::<MarketEventMessage>(agg_buffer);
     let (agg_snapshot_tx, agg_snapshot_rx) = watch::channel(AggregatedSnapshot::default());
     let agg_event_tx = Arc::new(agg_event_tx);

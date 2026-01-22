@@ -218,6 +218,8 @@ async fn run_websocket_loop(
 
                 let mut last_event = std::time::Instant::now();
                 let mut last_trade_event = std::time::Instant::now();
+                let mut dropped_events: u64 = 0;
+                let mut last_drop_log = std::time::Instant::now();
                 let mut stale_interval = tokio::time::interval(config.stale_timeout);
                 stale_interval.tick().await;
                 let mut lag_breach_since: Option<std::time::Instant> = None;
@@ -290,10 +292,24 @@ async fn run_websocket_loop(
                                                             lag_breach_since = None;
                                                         }
                                                     }
-                                                    if event_tx.send(event).await.is_err() {
-                                                        warn!("Event receiver dropped, stopping client");
-                                                        should_break = true;
-                                                        break;
+                                                    match event_tx.try_send(event) {
+                                                        Ok(()) => {}
+                                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                            warn!("Event receiver dropped, stopping client");
+                                                            should_break = true;
+                                                            break;
+                                                        }
+                                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                                            dropped_events += 1;
+                                                            if last_drop_log.elapsed() >= Duration::from_secs(1) {
+                                                                warn!(
+                                                                    "Event channel full - dropped {} events in last 1s",
+                                                                    dropped_events
+                                                                );
+                                                                dropped_events = 0;
+                                                                last_drop_log = std::time::Instant::now();
+                                                            }
+                                                        }
                                                     }
                                                 }
                                                 Err(e) => {
@@ -352,10 +368,24 @@ async fn run_websocket_loop(
                                                             lag_breach_since = None;
                                                         }
                                                     }
-                                                    if event_tx.send(event).await.is_err() {
-                                                        warn!("Event receiver dropped, stopping client");
-                                                        should_break = true;
-                                                        break;
+                                                    match event_tx.try_send(event) {
+                                                        Ok(()) => {}
+                                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                            warn!("Event receiver dropped, stopping client");
+                                                            should_break = true;
+                                                            break;
+                                                        }
+                                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                                            dropped_events += 1;
+                                                            if last_drop_log.elapsed() >= Duration::from_secs(1) {
+                                                                warn!(
+                                                                    "Event channel full - dropped {} events in last 1s",
+                                                                    dropped_events
+                                                                );
+                                                                dropped_events = 0;
+                                                                last_drop_log = std::time::Instant::now();
+                                                            }
+                                                        }
                                                     }
                                                 }
                                                 Err(e) => {
