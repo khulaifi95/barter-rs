@@ -139,7 +139,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = WebSocketConfig::new(ws_url)
         .with_ping_interval(Duration::from_secs(30))
         .with_reconnect_delay(Duration::from_secs(2))
-        .with_channel_buffer_size(50_000);
+        .with_channel_buffer_size(200_000);
     let client = WebSocketClient::with_config(config);
     let (mut event_rx, mut status_rx) = client.start();
 

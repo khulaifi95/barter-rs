@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let ws_url = get_ws_url();
     let client =
-        WebSocketClient::with_config(WebSocketConfig::new(ws_url).with_channel_buffer_size(50_000));
+        WebSocketClient::with_config(WebSocketConfig::new(ws_url).with_channel_buffer_size(200_000));
     let (mut event_rx, mut status_rx) = client.start();
 
     {
