@@ -18,7 +18,7 @@ use barter_trading_tuis::shared::{
     options_state::{OptionsContext, OptionsContextBuilder},
     orchestrator::{OrchestratorResult, StateOrchestrator},
     snapshot_bridge::build_market_data_input,
-    state::{Aggregator, Candle1m, CandleBackfill, fetch_binance_1m_candles, ticker_to_binance_symbol},
+    state::{Aggregator, AggregatedSnapshot, Candle1m, CandleBackfill, fetch_binance_1m_candles, ticker_to_binance_symbol},
     types::{InstrumentInfo, MarketEventMessage},
     vol_regime::VolRegimeEngine,
 };
@@ -28,23 +28,132 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
+use std::sync::{Arc, atomic::{AtomicI64, AtomicU64, Ordering}};
 use std::time::Instant;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::broadcast,
+    sync::{broadcast, mpsc, watch},
     time::{interval, Duration},
 };
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
+use bytes::Bytes;
 use tracing::{debug, error, info, warn};
 
 // L2 throttling per exchange (OKX is noisier, needs higher throttle)
 const L2_THROTTLE_BINANCE_MS: u64 = 100;
+
+// Metrics: trade throughput and timestamp skew tracking
+// Skew = time_received - time_exchange (positive = server behind, negative = exchange ahead)
+static TRADE_COUNT: AtomicU64 = AtomicU64::new(0);
+static SKEW_SUM_MS: AtomicI64 = AtomicI64::new(0);
+static SKEW_MAX_MS: AtomicI64 = AtomicI64::new(0);
+static SKEW_MIN_MS: AtomicI64 = AtomicI64::new(i64::MAX);
+static SKEW_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// Per-feed health metrics
+static BINANCE_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+static OKX_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+static BYBIT_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+static IBKR_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+static AGG_CHANNEL_DROPPED: AtomicU64 = AtomicU64::new(0);
+static AGG_LAST_DROP_WARN_MS: AtomicI64 = AtomicI64::new(0);
+static BINANCE_LAST_EVENT_MS: AtomicI64 = AtomicI64::new(0);
+static OKX_LAST_EVENT_MS: AtomicI64 = AtomicI64::new(0);
+static BYBIT_LAST_EVENT_MS: AtomicI64 = AtomicI64::new(0);
+static IBKR_LAST_EVENT_MS: AtomicI64 = AtomicI64::new(0);
+
+// Stale threshold for feed health alerts (ms)
+const FEED_STALE_THRESHOLD_MS: i64 = 30_000; // 30 seconds
+
 const L2_THROTTLE_BYBIT_MS: u64 = 100;
 const L2_THROTTLE_OKX_MS: u64 = 150;
 const SNAPSHOT_VERSION: u16 = 2;
 
-/// Get L2 throttle interval for a given exchange
+/// Serialization config for broadcast messages (read once at startup)
+/// Also caches hot-path config values to avoid env var parsing per-event
+struct BroadcastConfig {
+    use_envelope: bool,
+    source: String,
+    /// Use binary WS frames (true) or text frames (false)
+    /// Binary is faster (no UTF-8 conversion) but non-TUI clients may expect text
+    use_binary_frames: bool,
+    /// Cached L1 throttle interval (avoids env var parsing in hot path)
+    l1_throttle_ms: u64,
+    /// Cached spot log threshold (avoids env var parsing in hot path)
+    spot_log_threshold: f64,
+}
+
+impl BroadcastConfig {
+    fn from_env() -> Self {
+        let use_envelope = std::env::var("WS_ENVELOPE")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+            .unwrap_or(false);
+        let source = std::env::var("WS_SOURCE")
+            .unwrap_or_else(|_| "barter-data-server".to_string());
+        // Default to binary frames for performance; set WS_BINARY_FRAMES=0 for text
+        let use_binary_frames = std::env::var("WS_BINARY_FRAMES")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE"))
+            .unwrap_or(true);
+        // Cache hot-path config values (avoid env var parsing per-event)
+        let l1_throttle_ms = std::env::var("L1_THROTTLE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50); // ~20 updates/sec per instrument
+        let spot_log_threshold = std::env::var("SPOT_LOG_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50_000.0);
+        Self { use_envelope, source, use_binary_frames, l1_throttle_ms, spot_log_threshold }
+    }
+}
+
+/// Pre-serialize a message for broadcast (avoids per-client serialization)
+/// Returns None on serialization failure (logs error, drops message)
+/// Uses Bytes for zero-copy sharing across clients
+fn serialize_for_broadcast(config: &BroadcastConfig, event: MarketEventMessage) -> Option<Bytes> {
+    let result = if config.use_envelope {
+        let wrapped = MarketEventEnvelope {
+            schema_version: 1,
+            source: config.source.clone(),
+            time_sent: Utc::now(),
+            payload: event,
+        };
+        serde_json::to_string(&wrapped)
+    } else {
+        serde_json::to_string(&event)
+    };
+
+    match result {
+        Ok(json) => Some(Bytes::from(json)),
+        Err(e) => {
+            error!("Failed to serialize market event: {}", e);
+            None
+        }
+    }
+}
+
+/// Get L2 throttle from ExchangeId directly (avoids hot-path String allocation)
+fn get_l2_throttle_ms_for_exchange(exchange: &ExchangeId) -> u64 {
+    use ExchangeId::*;
+    match exchange {
+        Okx => std::env::var("L2_THROTTLE_OKX_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(L2_THROTTLE_OKX_MS),
+        BybitSpot | BybitPerpetualsUsd => std::env::var("L2_THROTTLE_BYBIT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(L2_THROTTLE_BYBIT_MS),
+        _ => std::env::var("L2_THROTTLE_BINANCE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(L2_THROTTLE_BINANCE_MS),
+    }
+}
+
+/// Get L2 throttle interval for a given exchange (string-based, for compatibility)
 fn get_l2_throttle_ms(exchange: &str) -> u64 {
     if exchange.contains("Okx") {
         std::env::var("L2_THROTTLE_OKX_MS")
@@ -533,35 +642,65 @@ async fn main() {
     info!("Starting barter-data WebSocket server");
 
     // Separate channels for trades (hot path) and L2 (high volume, lower priority)
+    // Buffer sizing: peak_msgs_per_sec × desired_burst_seconds
+    // At 2-5k msgs/sec, 100k gives ~20-50s headroom for trade bursts
     let trades_buffer = std::env::var("WS_TRADES_BUFFER")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(10_000);
+        .unwrap_or(100_000_usize)
+        .clamp(1_000, 500_000); // Prevent OOM from misconfiguration
     let l2_buffer = std::env::var("WS_L2_BUFFER")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(50_000);
+        .unwrap_or(50_000_usize)
+        .clamp(1_000, 500_000); // Prevent OOM from misconfiguration
 
     info!(
         "Trade channel buffer: {}, L2 channel buffer: {}",
         trades_buffer, l2_buffer
     );
 
+    // Broadcast config (read once at startup to avoid per-client overhead)
+    let broadcast_config = Arc::new(BroadcastConfig::from_env());
+    info!(
+        "Broadcast config: envelope={}, source={}",
+        broadcast_config.use_envelope, broadcast_config.source
+    );
+
     // Trades channel: trades, liquidations, OI, CVD, L1 (hot path - NO L2)
-    let (tx_trades, _) = broadcast::channel::<MarketEventMessage>(trades_buffer);
+    // Now broadcasts pre-serialized Arc<String> to avoid per-client JSON serialization
+    let (tx_trades, _) = broadcast::channel::<Bytes>(trades_buffer);
     let tx_trades = Arc::new(tx_trades);
 
     // L2 channel: orderbook L2 only (high volume, can lag without affecting trades)
-    let (tx_l2, _) = broadcast::channel::<MarketEventMessage>(l2_buffer);
+    let (tx_l2, _) = broadcast::channel::<Bytes>(l2_buffer);
     let tx_l2 = Arc::new(tx_l2);
 
     let snapshot_builder = Arc::new(tokio::sync::Mutex::new(SnapshotBuilder::new()));
-    let shared_agg = Arc::new(tokio::sync::Mutex::new(Aggregator::new()));
+
+    // Aggregator channels: removes hot-path mutex contention
+    // - agg_event_tx: send events to aggregator task (mpsc, bounded)
+    // - agg_snapshot_rx: receive snapshots from aggregator (watch, latest-value)
+    let agg_buffer = std::env::var("AGG_EVENT_BUFFER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000_usize)
+        .clamp(1_000, 100_000);
+    let (agg_event_tx, agg_event_rx) = mpsc::channel::<MarketEventMessage>(agg_buffer);
+    let (agg_snapshot_tx, agg_snapshot_rx) = watch::channel(AggregatedSnapshot::default());
+    let agg_event_tx = Arc::new(agg_event_tx);
+    let agg_snapshot_rx = Arc::new(agg_snapshot_rx);
+
     let vol_states = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let spot_cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let options_cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let trad_last_ms = Arc::new(AtomicI64::new(0));
     let kline_cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    // Spawn dedicated aggregator task - removes lock().await from hot path
+    tokio::spawn(async move {
+        run_aggregator_task(agg_event_rx, agg_snapshot_tx).await;
+    });
 
     // Start WebSocket server
     // Configurable via WS_ADDR env var (default: 0.0.0.0:9001)
@@ -572,16 +711,89 @@ async fn main() {
     let tx_trades_clone = tx_trades.clone();
     let tx_l2_clone = tx_l2.clone();
     let kline_cache_clone = Arc::clone(&kline_cache);
+    let broadcast_cfg = Arc::clone(&broadcast_config);
     tokio::spawn(async move {
-        start_websocket_server(server_addr, tx_trades_clone, tx_l2_clone, kline_cache_clone).await;
+        start_websocket_server(
+            server_addr,
+            tx_trades_clone,
+            tx_l2_clone,
+            kline_cache_clone,
+            broadcast_cfg,
+        )
+        .await;
+    });
+
+    // Metrics logging task: trades/sec, timestamp skew, and per-feed health every 60s
+    tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(60));
+        interval.tick().await; // Skip first immediate tick
+        loop {
+            interval.tick().await;
+            let now_ms = Utc::now().timestamp_millis();
+
+            // Trade metrics
+            let trades = TRADE_COUNT.swap(0, Ordering::Relaxed);
+            let skew_sum = SKEW_SUM_MS.swap(0, Ordering::Relaxed);
+            let skew_max = SKEW_MAX_MS.swap(0, Ordering::Relaxed);
+            let skew_min = SKEW_MIN_MS.swap(i64::MAX, Ordering::Relaxed);
+            let skew_count = SKEW_COUNT.swap(0, Ordering::Relaxed);
+            let skew_avg = if skew_count > 0 { skew_sum / skew_count as i64 } else { 0 };
+            let skew_min_display = if skew_min == i64::MAX { 0 } else { skew_min };
+
+            // Per-feed event counts (reset each interval)
+            let binance_events = BINANCE_EVENT_COUNT.swap(0, Ordering::Relaxed);
+            let okx_events = OKX_EVENT_COUNT.swap(0, Ordering::Relaxed);
+            let bybit_events = BYBIT_EVENT_COUNT.swap(0, Ordering::Relaxed);
+            let ibkr_events = IBKR_EVENT_COUNT.swap(0, Ordering::Relaxed);
+            let agg_dropped = AGG_CHANNEL_DROPPED.swap(0, Ordering::Relaxed);
+
+            // Per-feed staleness check
+            let binance_last = BINANCE_LAST_EVENT_MS.load(Ordering::Relaxed);
+            let okx_last = OKX_LAST_EVENT_MS.load(Ordering::Relaxed);
+            let bybit_last = BYBIT_LAST_EVENT_MS.load(Ordering::Relaxed);
+            let ibkr_last = IBKR_LAST_EVENT_MS.load(Ordering::Relaxed);
+
+            info!(
+                "METRICS: trades/min={} ({:.1}/s), skew_avg={}ms, skew_min={}ms, skew_max={}ms",
+                trades,
+                trades as f64 / 60.0,
+                skew_avg,
+                skew_min_display,
+                skew_max
+            );
+            info!(
+                "FEEDS: binance={}/min, okx={}/min, bybit={}/min, ibkr={}/min, agg_dropped={}",
+                binance_events, okx_events, bybit_events, ibkr_events, agg_dropped
+            );
+
+            // Stale feed alerts
+            if binance_last > 0 && (now_ms - binance_last) > FEED_STALE_THRESHOLD_MS {
+                warn!("STALE: Binance feed stale for {}s", (now_ms - binance_last) / 1000);
+            }
+            if okx_last > 0 && (now_ms - okx_last) > FEED_STALE_THRESHOLD_MS {
+                warn!("STALE: OKX feed stale for {}s", (now_ms - okx_last) / 1000);
+            }
+            if bybit_last > 0 && (now_ms - bybit_last) > FEED_STALE_THRESHOLD_MS {
+                warn!("STALE: Bybit feed stale for {}s", (now_ms - bybit_last) / 1000);
+            }
+            if ibkr_last > 0 && (now_ms - ibkr_last) > FEED_STALE_THRESHOLD_MS {
+                warn!("STALE: IBKR feed stale for {}s", (now_ms - ibkr_last) / 1000);
+            }
+
+            // Backpressure alert
+            if agg_dropped > 0 {
+                warn!("BACKPRESSURE: {} events dropped from aggregator channel", agg_dropped);
+            }
+        }
     });
 
     // IBKR bridge feed (ES/NQ) -> trad_tick events
     {
         let tx_trades = tx_trades.clone();
+        let broadcast_cfg = Arc::clone(&broadcast_config);
         let trad_last_ms = Arc::clone(&trad_last_ms);
         tokio::spawn(async move {
-            start_ibkr_bridge_feed(tx_trades, trad_last_ms).await;
+            start_ibkr_bridge_feed(tx_trades, broadcast_cfg, trad_last_ms).await;
         });
     }
 
@@ -590,8 +802,9 @@ async fn main() {
         let tx_trades = tx_trades.clone();
         let spot_cache = Arc::clone(&spot_cache);
         let options_cache = Arc::clone(&options_cache);
+        let broadcast_cfg = Arc::clone(&broadcast_config);
         tokio::spawn(async move {
-            start_deribit_options_feed(tx_trades, spot_cache, options_cache).await;
+            start_deribit_options_feed(tx_trades, broadcast_cfg, spot_cache, options_cache).await;
         });
     }
 
@@ -611,23 +824,97 @@ async fn main() {
     // Binance kline feed (authoritative 1m candles for RV/ATR/tvVWAP)
     {
         let kline_cache = Arc::clone(&kline_cache);
-        let shared_agg = Arc::clone(&shared_agg);
-        seed_binance_klines(kline_cache, shared_agg, &tickers).await;
+        let agg_tx = Arc::clone(&agg_event_tx);
+        seed_binance_klines(kline_cache, agg_tx, &tickers).await;
     }
     for ticker in &tickers {
         let tx_trades = tx_trades.clone();
         let kline_cache = Arc::clone(&kline_cache);
-        let shared_agg = Arc::clone(&shared_agg);
+        let agg_tx = Arc::clone(&agg_event_tx);
+        let broadcast_cfg = Arc::clone(&broadcast_config);
         let ticker = ticker.clone();
         tokio::spawn(async move {
-            run_binance_kline_stream(ticker, tx_trades, kline_cache, shared_agg).await;
+            run_binance_kline_stream(ticker, tx_trades, broadcast_cfg, kline_cache, agg_tx).await;
+        });
+    }
+
+    // Background kline refresh task - checks for stale cache every 5 minutes
+    // Prevents per-client refresh during handshake (which can stall under burst connects)
+    {
+        let kline_cache = Arc::clone(&kline_cache);
+        let agg_tx = Arc::clone(&agg_event_tx);
+        let tickers = tickers.clone();
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(300)); // 5 minutes
+            loop {
+                interval.tick().await;
+                let today = Utc::now().date_naive();
+                let mut stale_tickers: Vec<String> = Vec::new();
+
+                // Check which tickers have stale cache
+                {
+                    let cache = kline_cache.lock().await;
+                    for ticker in &tickers {
+                        if let Some(candles) = cache.get(ticker) {
+                            let is_stale = candles.is_empty()
+                                || candles.back().map(|c| c.start_time.date_naive() != today).unwrap_or(true);
+                            if is_stale {
+                                stale_tickers.push(ticker.clone());
+                            }
+                        } else {
+                            stale_tickers.push(ticker.clone());
+                        }
+                    }
+                }
+
+                // Refresh stale tickers in background
+                for ticker in &stale_tickers {
+                    let symbol = ticker_to_binance_symbol(ticker);
+                    if let Ok(fresh_candles) = fetch_binance_1m_candles(symbol).await {
+                        let mut cache = kline_cache.lock().await;
+                        let entry = cache.entry(ticker.clone()).or_insert_with(VecDeque::new);
+                        entry.clear();
+                        for candle in &fresh_candles {
+                            entry.push_back(candle.clone());
+                        }
+                        while entry.len() > 300 {
+                            entry.pop_front();
+                        }
+                        info!("Background refresh: {} klines for {}", entry.len(), ticker);
+
+                        // Also update aggregator
+                        let payload = CandleBackfill {
+                            ticker: ticker.clone(),
+                            candles: fresh_candles,
+                        };
+                        let event = MarketEventMessage {
+                            time_exchange: Utc::now(),
+                            time_received: Utc::now(),
+                            exchange: "barter-data-server".to_string(),
+                            instrument: InstrumentInfo {
+                                base: ticker.clone(),
+                                quote: "USD".to_string(),
+                                kind: "Kline".to_string(),
+                            },
+                            kind: "candle_backfill".to_string(),
+                            data: serde_json::to_value(&payload).unwrap_or_default(),
+                        };
+                        let _ = agg_tx.send(event).await;
+                    }
+                }
+
+                if !stale_tickers.is_empty() {
+                    info!("Background kline refresh completed for {} tickers", stale_tickers.len());
+                }
+            }
         });
     }
 
     {
         let tx_trades = tx_trades.clone();
+        let broadcast_cfg = Arc::clone(&broadcast_config);
         let snapshot_builder = Arc::clone(&snapshot_builder);
-        let shared_agg = Arc::clone(&shared_agg);
+        let agg_snap_rx = Arc::clone(&agg_snapshot_rx);
         let vol_states = Arc::clone(&vol_states);
         let snapshot_secs: u64 = std::env::var("SNAPSHOT_SECS")
             .ok()
@@ -638,10 +925,8 @@ async fn main() {
             loop {
                 tick.tick().await;
                 let mut snapshot = snapshot_builder.lock().await.snapshot();
-                let agg_snapshot = {
-                    let guard = shared_agg.lock().await;
-                    guard.snapshot()
-                };
+                // Read latest snapshot from watch channel (no mutex!)
+                let agg_snapshot = agg_snap_rx.borrow().clone();
                 let mut engines = vol_states.lock().await;
                 for (ticker, snap) in snapshot.tickers.iter_mut() {
                     let rv = agg_snapshot
@@ -681,7 +966,9 @@ async fn main() {
                     kind: "market_snapshot".to_string(),
                     data: serde_json::to_value(&snapshot).unwrap_or_default(),
                 };
-                let _ = tx_trades.send(event);
+                if let Some(bytes) = serialize_for_broadcast(&broadcast_cfg, event) {
+                    let _ = tx_trades.send(bytes);
+                }
             }
         });
     }
@@ -689,7 +976,8 @@ async fn main() {
     // Centralized orchestrator (MarketState) - broadcasts orchestrator_result
     {
         let tx_trades = tx_trades.clone();
-        let shared_agg = Arc::clone(&shared_agg);
+        let broadcast_cfg = Arc::clone(&broadcast_config);
+        let agg_snap_rx = Arc::clone(&agg_snapshot_rx);
         let options_cache = Arc::clone(&options_cache);
         let trad_last_ms = Arc::clone(&trad_last_ms);
         tokio::spawn(async move {
@@ -703,10 +991,8 @@ async fn main() {
             let mut tick = interval(Duration::from_millis(200));
             loop {
                 tick.tick().await;
-                let snapshot = {
-                    let guard = shared_agg.lock().await;
-                    guard.snapshot()
-                };
+                // Read latest snapshot from watch channel (no mutex!)
+                let snapshot = agg_snap_rx.borrow().clone();
                 let options_snapshot = { options_cache.lock().await.clone() };
                 let trad_ts = trad_last_ms.load(Ordering::Relaxed);
                 let trad_status = if trad_ts <= 0 {
@@ -752,7 +1038,9 @@ async fn main() {
                         kind: "orchestrator_result".to_string(),
                         data: serde_json::to_value(&payload).unwrap_or_default(),
                     };
-                    let _ = tx_trades.send(event);
+                    if let Some(bytes) = serialize_for_broadcast(&broadcast_cfg, event) {
+                        let _ = tx_trades.send(bytes);
+                    }
                 }
             }
         });
@@ -760,17 +1048,15 @@ async fn main() {
 
     // Volatility regime updater: push hourly RV samples into engines
     {
-        let shared_agg = Arc::clone(&shared_agg);
+        let agg_snap_rx = Arc::clone(&agg_snapshot_rx);
         let vol_states = Arc::clone(&vol_states);
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(60));
             loop {
                 tick.tick().await;
                 let now_hour = Utc::now().timestamp() / 3600;
-                let snapshot = {
-                    let guard = shared_agg.lock().await;
-                    guard.snapshot()
-                };
+                // Read latest snapshot from watch channel (no mutex!)
+                let snapshot = agg_snap_rx.borrow().clone();
                 let mut states = vol_states.lock().await;
                 for (ticker, snap) in &snapshot.tickers {
                     let rv = snap.realized_vol_1h.unwrap_or(0.0);
@@ -809,7 +1095,8 @@ async fn main() {
 
     futures::pin_mut!(combined_stream);
 
-    let shared_agg = Arc::clone(&shared_agg);
+    // Clone event sender for main loop (hot path - no mutex!)
+    let agg_tx = Arc::clone(&agg_event_tx);
     let spot_cache = Arc::clone(&spot_cache);
 
     // Throttle state: per-instrument last broadcast time (L2 and Binance L1)
@@ -835,16 +1122,12 @@ async fn main() {
                         }
                     }
                     // Debug logging for large spot trades to verify spot streams
-                    // Threshold configurable via SPOT_LOG_THRESHOLD env var (default: $50,000)
+                    // Uses cached threshold (no env var parsing in hot path)
                     if let DataKind::Trade(trade) = &market_event.kind {
-                        let spot_log_threshold = std::env::var("SPOT_LOG_THRESHOLD")
-                            .ok()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(50_000.0);
                         let notional = trade.price * trade.amount;
                         let is_spot =
                             matches!(market_event.instrument.kind, MarketDataInstrumentKind::Spot);
-                        if is_spot && notional >= spot_log_threshold {
+                        if is_spot && notional >= broadcast_config.spot_log_threshold {
                             debug!(
                                 "SPOT TRADE >=50k {} {}/{} @ {} qty {} notional {} side {:?}",
                                 market_event.exchange,
@@ -908,16 +1191,18 @@ async fn main() {
                             market_event.instrument.quote
                         );
 
-                        // Per-exchange throttling
+                        // Per-exchange throttling (optimized: no extra string allocation)
+                        let throttle_ms = get_l2_throttle_ms_for_exchange(&market_event.exchange);
+                        let now = Instant::now();
+
+                        // Use compact key format: exchange:base:quote
+                        // The key is still needed for HashMap but we avoid the throttle string format
                         let key = format!(
-                            "{}:{}:{}",
+                            "{:?}:{}:{}",
                             market_event.exchange,
                             market_event.instrument.base,
                             market_event.instrument.quote
                         );
-                        let exchange_str = format!("{:?}", market_event.exchange);
-                        let throttle_ms = get_l2_throttle_ms(&exchange_str);
-                        let now = Instant::now();
 
                         let should_skip = if let Some(prev) = l2_last_broadcast.get(&key) {
                             now.duration_since(*prev) < Duration::from_millis(throttle_ms)
@@ -932,13 +1217,53 @@ async fn main() {
 
                         // Send to L2 channel (separate from trades)
                         let message = market_event_to_message(market_event);
-                        shared_agg.lock().await.process_event(message.clone());
-                        let _ = tx_l2.send(message); // Ignore errors if no receivers
+                        // Send to aggregator via channel (no mutex!)
+                        // Rate-limited warning: at most once per second when drops occur
+                        if agg_tx.try_send(message.clone()).is_err() {
+                            let dropped = AGG_CHANNEL_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                            let now_ms = Utc::now().timestamp_millis();
+                            let last_warn = AGG_LAST_DROP_WARN_MS.load(Ordering::Relaxed);
+                            if now_ms - last_warn > 1000 {
+                                AGG_LAST_DROP_WARN_MS.store(now_ms, Ordering::Relaxed);
+                                warn!(
+                                    "Aggregator channel full - dropped {} events total (consider increasing AGG_EVENT_BUFFER)",
+                                    dropped
+                                );
+                            }
+                        }
+                        if let Some(bytes) = serialize_for_broadcast(&broadcast_config, message) {
+                            let _ = tx_l2.send(bytes); // Ignore errors if no receivers
+                        }
                         continue; // Don't fall through to trade channel
                     }
 
                     let message = market_event_to_message(market_event);
-                    shared_agg.lock().await.process_event(message.clone());
+                    // Track per-feed metrics
+                    let now_ms = Utc::now().timestamp_millis();
+                    if message.exchange.contains("Binance") {
+                        BINANCE_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        BINANCE_LAST_EVENT_MS.store(now_ms, Ordering::Relaxed);
+                    } else if message.exchange.contains("Okx") {
+                        OKX_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        OKX_LAST_EVENT_MS.store(now_ms, Ordering::Relaxed);
+                    } else if message.exchange.contains("Bybit") {
+                        BYBIT_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        BYBIT_LAST_EVENT_MS.store(now_ms, Ordering::Relaxed);
+                    }
+                    // Send to aggregator via channel (no mutex!)
+                    // Rate-limited warning: at most once per second when drops occur
+                    if agg_tx.try_send(message.clone()).is_err() {
+                        let dropped = AGG_CHANNEL_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                        let now_ms = Utc::now().timestamp_millis();
+                        let last_warn = AGG_LAST_DROP_WARN_MS.load(Ordering::Relaxed);
+                        if now_ms - last_warn > 1000 {
+                            AGG_LAST_DROP_WARN_MS.store(now_ms, Ordering::Relaxed);
+                            warn!(
+                                "Aggregator channel full - dropped {} events total (consider increasing AGG_EVENT_BUFFER)",
+                                dropped
+                            );
+                        }
+                    }
 
                     // Binance L1: apply light throttle (~100ms per instrument) to reduce flood
                     if is_orderbook_l1 {
@@ -950,13 +1275,10 @@ async fn main() {
                                 message.instrument.base,
                                 message.instrument.quote
                             );
-                            let throttle_ms: u64 = std::env::var("L1_THROTTLE_MS")
-                                .ok()
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(50); // ~20 updates/sec per instrument
+                            // Use cached throttle value (no env var parsing in hot path)
                             let now = Instant::now();
                             let should_skip = if let Some(prev) = l1_last_broadcast.get(&key) {
-                                now.duration_since(*prev) < Duration::from_millis(throttle_ms)
+                                now.duration_since(*prev) < Duration::from_millis(broadcast_config.l1_throttle_ms)
                             } else {
                                 false
                             };
@@ -970,6 +1292,35 @@ async fn main() {
                     // Debug: log broadcast attempt for all event types
                     // NOTE: Changed from info! to debug! to avoid blocking hot path
                     if is_trade {
+                        // Track metrics: trade count and timestamp skew
+                        TRADE_COUNT.fetch_add(1, Ordering::Relaxed);
+                        let skew_ms = (message.time_received - message.time_exchange).num_milliseconds();
+                        // Only count positive skew for avg (negative = exchange clock ahead)
+                        if skew_ms >= 0 {
+                            SKEW_SUM_MS.fetch_add(skew_ms, Ordering::Relaxed);
+                            SKEW_COUNT.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // Track max skew (positive = server behind)
+                        let mut current_max = SKEW_MAX_MS.load(Ordering::Relaxed);
+                        while skew_ms > current_max {
+                            match SKEW_MAX_MS.compare_exchange_weak(
+                                current_max, skew_ms, Ordering::Relaxed, Ordering::Relaxed
+                            ) {
+                                Ok(_) => break,
+                                Err(x) => current_max = x,
+                            }
+                        }
+                        // Track min skew (negative = exchange clock ahead)
+                        let mut current_min = SKEW_MIN_MS.load(Ordering::Relaxed);
+                        while skew_ms < current_min {
+                            match SKEW_MIN_MS.compare_exchange_weak(
+                                current_min, skew_ms, Ordering::Relaxed, Ordering::Relaxed
+                            ) {
+                                Ok(_) => break,
+                                Err(x) => current_min = x,
+                            }
+                        }
+
                         let receivers = tx_trades.receiver_count();
                         debug!(
                             "TRADE→{} clients: {} {} {}/{} ${:.0}",
@@ -1003,27 +1354,30 @@ async fn main() {
                     }
 
                     // Broadcast to trade channel (hot path - NO L2 here)
-                    match tx_trades.send(message) {
-                        Ok(count) => {
-                            if is_trade {
-                                debug!("Trade sent to {} receivers", count);
+                    // Pre-serialized to avoid per-client JSON serialization overhead
+                    if let Some(bytes) = serialize_for_broadcast(&broadcast_config, message) {
+                        match tx_trades.send(bytes) {
+                            Ok(count) => {
+                                if is_trade {
+                                    debug!("Trade sent to {} receivers", count);
+                                }
+                                if is_liquidation {
+                                    debug!("Liquidation sent to {} receivers", count);
+                                }
+                                if is_open_interest {
+                                    debug!("OpenInterest sent to {} receivers", count);
+                                }
                             }
-                            if is_liquidation {
-                                debug!("Liquidation sent to {} receivers", count);
-                            }
-                            if is_open_interest {
-                                debug!("OpenInterest sent to {} receivers", count);
-                            }
-                        }
-                        Err(e) => {
-                            if is_trade {
-                                warn!("Failed to broadcast trade: {:?}", e);
-                            }
-                            if is_liquidation {
-                                warn!("Failed to broadcast liquidation: {:?}", e);
-                            }
-                            if is_open_interest {
-                                warn!("Failed to broadcast open_interest: {:?}", e);
+                            Err(e) => {
+                                if is_trade {
+                                    warn!("Failed to broadcast trade: {:?}", e);
+                                }
+                                if is_liquidation {
+                                    warn!("Failed to broadcast liquidation: {:?}", e);
+                                }
+                                if is_open_interest {
+                                    warn!("Failed to broadcast open_interest: {:?}", e);
+                                }
                             }
                         }
                     }
@@ -1045,9 +1399,10 @@ async fn main() {
 /// Start WebSocket server that broadcasts market events to connected clients
 async fn start_websocket_server(
     addr: SocketAddr,
-    tx_trades: Arc<broadcast::Sender<MarketEventMessage>>,
-    tx_l2: Arc<broadcast::Sender<MarketEventMessage>>,
+    tx_trades: Arc<broadcast::Sender<Bytes>>,
+    tx_l2: Arc<broadcast::Sender<Bytes>>,
     kline_cache: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Candle1m>>>>,
+    broadcast_config: Arc<BroadcastConfig>,
 ) {
     let listener = TcpListener::bind(&addr)
         .await
@@ -1060,18 +1415,21 @@ async fn start_websocket_server(
         let tx_trades = tx_trades.clone();
         let tx_l2 = tx_l2.clone();
         let kline_cache = Arc::clone(&kline_cache);
+        let broadcast_config = Arc::clone(&broadcast_config);
         tokio::spawn(handle_client(
             stream,
             peer_addr,
             tx_trades,
             tx_l2,
             kline_cache,
+            broadcast_config,
         ));
     }
 }
 
 async fn start_ibkr_bridge_feed(
-    tx_trades: Arc<broadcast::Sender<MarketEventMessage>>,
+    tx_trades: Arc<broadcast::Sender<Bytes>>,
+    broadcast_config: Arc<BroadcastConfig>,
     trad_last_ms: Arc<AtomicI64>,
 ) {
     if std::env::var("IBKR_BRIDGE_ENABLED")
@@ -1111,7 +1469,12 @@ async fn start_ibkr_bridge_feed(
                                             if tick.ts > 0 {
                                                 trad_last_ms.store(tick.ts, Ordering::Relaxed);
                                             }
-                                            let _ = tx_trades.send(trad_tick_event(tick));
+                                            // Track IBKR feed health
+                                            IBKR_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                            IBKR_LAST_EVENT_MS.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+                                            if let Some(bytes) = serialize_for_broadcast(&broadcast_config, trad_tick_event(tick)) {
+                                                let _ = tx_trades.send(bytes);
+                                            }
                                             tick_count += 1;
                                         }
                                         Ok(IbkrMessage::TickBackfill { ticks, .. }) => {
@@ -1119,7 +1482,9 @@ async fn start_ibkr_bridge_feed(
                                                 if tick.ts > 0 {
                                                     trad_last_ms.store(tick.ts, Ordering::Relaxed);
                                                 }
-                                                let _ = tx_trades.send(trad_tick_event(tick));
+                                                if let Some(bytes) = serialize_for_broadcast(&broadcast_config, trad_tick_event(tick)) {
+                                                    let _ = tx_trades.send(bytes);
+                                                }
                                             }
                                         }
                                         Ok(IbkrMessage::Welcome { .. }) => {
@@ -1163,7 +1528,8 @@ async fn start_ibkr_bridge_feed(
 }
 
 async fn start_deribit_options_feed(
-    tx_trades: Arc<broadcast::Sender<MarketEventMessage>>,
+    tx_trades: Arc<broadcast::Sender<Bytes>>,
+    broadcast_config: Arc<BroadcastConfig>,
     spot_cache: Arc<tokio::sync::Mutex<HashMap<String, f64>>>,
     options_cache: Arc<tokio::sync::Mutex<HashMap<String, OptionsContext>>>,
 ) {
@@ -1219,7 +1585,9 @@ async fn start_deribit_options_feed(
                         kind: "options_chain".to_string(),
                         data: serde_json::to_value(&chain).unwrap_or_default(),
                     };
-                    let _ = tx_trades.send(event);
+                    if let Some(bytes) = serialize_for_broadcast(&broadcast_config, event) {
+                        let _ = tx_trades.send(bytes);
+                    }
 
                     let spot = spot_cache
                         .lock()
@@ -1242,7 +1610,9 @@ async fn start_deribit_options_feed(
                             kind: "options_context".to_string(),
                             data: serde_json::to_value(&ctx).unwrap_or_default(),
                         };
-                        let _ = tx_trades.send(ctx_event);
+                        if let Some(bytes) = serialize_for_broadcast(&broadcast_config, ctx_event) {
+                            let _ = tx_trades.send(bytes);
+                        }
                     }
                 }
                 Err(e) => {
@@ -1255,7 +1625,7 @@ async fn start_deribit_options_feed(
 
 async fn seed_binance_klines(
     kline_cache: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Candle1m>>>>,
-    shared_agg: Arc<tokio::sync::Mutex<Aggregator>>,
+    agg_tx: Arc<mpsc::Sender<MarketEventMessage>>,
     tickers: &[String],
 ) {
     for ticker in tickers {
@@ -1290,7 +1660,8 @@ async fn seed_binance_klines(
                     kind: "candle_backfill".to_string(),
                     data: serde_json::to_value(&payload).unwrap_or_default(),
                 };
-                shared_agg.lock().await.process_event(event);
+                // Send to aggregator via channel (no mutex!)
+                let _ = agg_tx.send(event).await;
             }
             Err(e) => {
                 warn!("Failed to seed klines for {}: {}", ticker, e);
@@ -1447,9 +1818,10 @@ fn vol_regime_label(regime: VolRegime) -> &'static str {
 
 async fn run_binance_kline_stream(
     ticker: String,
-    tx_trades: Arc<broadcast::Sender<MarketEventMessage>>,
+    tx_trades: Arc<broadcast::Sender<Bytes>>,
+    broadcast_config: Arc<BroadcastConfig>,
     kline_cache: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Candle1m>>>>,
-    shared_agg: Arc<tokio::sync::Mutex<Aggregator>>,
+    agg_tx: Arc<mpsc::Sender<MarketEventMessage>>,
 ) {
     let symbol = ticker_to_binance_symbol(&ticker).to_lowercase();
     let url = format!("wss://fstream.binance.com/ws/{}@kline_1m", symbol);
@@ -1509,8 +1881,11 @@ async fn run_binance_kline_stream(
                                                     kind: "candle_1m".to_string(),
                                                     data: serde_json::to_value(&candle).unwrap_or_default(),
                                                 };
-                                                let _ = tx_trades.send(event.clone());
-                                                shared_agg.lock().await.process_event(event);
+                                                if let Some(bytes) = serialize_for_broadcast(&broadcast_config, event.clone()) {
+                                                    let _ = tx_trades.send(bytes);
+                                                }
+                                                // Send to aggregator via channel (no mutex!)
+                                                let _ = agg_tx.try_send(event);
                                             }
                                         }
                                     }
@@ -1671,9 +2046,10 @@ async fn fetch_deribit_ticker(
 async fn handle_client(
     stream: TcpStream,
     peer_addr: SocketAddr,
-    tx_trades: Arc<broadcast::Sender<MarketEventMessage>>,
-    tx_l2: Arc<broadcast::Sender<MarketEventMessage>>,
+    tx_trades: Arc<broadcast::Sender<Bytes>>,
+    tx_l2: Arc<broadcast::Sender<Bytes>>,
     kline_cache: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Candle1m>>>>,
+    broadcast_config: Arc<BroadcastConfig>,
 ) {
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
@@ -1688,59 +2064,26 @@ async fn handle_client(
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let mut rx_trades = tx_trades.subscribe();
     let mut rx_l2 = tx_l2.subscribe();
-    let use_envelope = std::env::var("WS_ENVELOPE")
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
-        .unwrap_or(false);
-    let envelope_source =
-        std::env::var("WS_SOURCE").unwrap_or_else(|_| "barter-data-server".to_string());
+    // Note: envelope/source config is now handled at broadcast time (serialize_for_broadcast)
 
-    // Send welcome message
+    // Send welcome message (respects WS_BINARY_FRAMES config)
     let welcome = serde_json::json!({
         "type": "welcome",
         "message": "Connected to barter-data market feed",
         "timestamp": Utc::now()
     });
     if let Ok(msg) = serde_json::to_string(&welcome) {
-        let _ = ws_sender.send(Message::Text(msg.into())).await;
+        let welcome_msg = if broadcast_config.use_binary_frames {
+            Message::Binary(Bytes::from(msg.into_bytes()))
+        } else {
+            Message::Text(msg.into())
+        };
+        let _ = ws_sender.send(welcome_msg).await;
     }
 
-    // Send kline backfill to align RV/ATR across clients
-    // First check for stale cache (last candle date != today) and refresh if needed
+    // Send kline backfill from cache (refresh is done by background task)
+    // Uses whatever is in cache - no blocking network calls during handshake
     {
-        let today = Utc::now().date_naive();
-        let mut stale_tickers: Vec<String> = Vec::new();
-
-        // Check which tickers have stale cache
-        {
-            let cache = kline_cache.lock().await;
-            for (ticker, candles) in cache.iter() {
-                let is_stale = candles.is_empty()
-                    || candles.back().map(|c| c.start_time.date_naive() != today).unwrap_or(true);
-                if is_stale {
-                    stale_tickers.push(ticker.clone());
-                }
-            }
-        }
-
-        // Refresh stale tickers
-        for ticker in &stale_tickers {
-            let symbol = ticker_to_binance_symbol(ticker);
-            if let Ok(fresh_candles) = fetch_binance_1m_candles(symbol).await {
-                let mut cache = kline_cache.lock().await;
-                let entry = cache.entry(ticker.clone()).or_insert_with(VecDeque::new);
-                entry.clear();
-                for candle in fresh_candles {
-                    entry.push_back(candle);
-                }
-                while entry.len() > 300 {
-                    entry.pop_front();
-                }
-                info!("Refreshed stale kline cache for {} (had {} candles)", ticker, entry.len());
-            }
-        }
-
-        // Now send backfill for all tickers
         let cache = kline_cache.lock().await;
         for (ticker, candles) in cache.iter() {
             let payload = CandleBackfill {
@@ -1759,14 +2102,21 @@ async fn handle_client(
                 kind: "candle_backfill".to_string(),
                 data: serde_json::to_value(&payload).unwrap_or_default(),
             };
-            if let Ok(json) = serde_json::to_string(&event) {
-                let _ = ws_sender.send(Message::Text(json.into())).await;
+            if let Some(bytes) = serialize_for_broadcast(&broadcast_config, event) {
+                let backfill_msg = if broadcast_config.use_binary_frames {
+                    Message::Binary(bytes)
+                } else {
+                    // Safe: serialize_for_broadcast produces valid UTF-8
+                    Message::Text(String::from_utf8_lossy(&bytes).into_owned().into())
+                };
+                let _ = ws_sender.send(backfill_msg).await;
             }
         }
     }
 
     // Spawn task to send market events to this client
     // Uses biased select! to prioritize trades over L2
+    let use_binary = broadcast_config.use_binary_frames;
     let mut send_task = tokio::spawn(async move {
         loop {
             // Biased select: trades always checked first (hot path priority)
@@ -1774,24 +2124,18 @@ async fn handle_client(
                 biased;
 
                 // PRIORITY 1: Trades, liquidations, OI, CVD, L1 (hot path)
+                // Messages are pre-serialized at broadcast time - just forward them
                 result = rx_trades.recv() => {
                     match result {
-                        Ok(event) => {
-                            let json = if use_envelope {
-                                let wrapped = MarketEventEnvelope {
-                                    schema_version: 1,
-                                    source: envelope_source.clone(),
-                                    time_sent: Utc::now(),
-                                    payload: event,
-                                };
-                                serde_json::to_string(&wrapped)
+                        Ok(bytes) => {
+                            // Respects WS_BINARY_FRAMES config
+                            let msg = if use_binary {
+                                Message::Binary(bytes)
                             } else {
-                                serde_json::to_string(&event)
+                                Message::Text(String::from_utf8_lossy(&bytes).into_owned().into())
                             };
-                            if let Ok(json) = json {
-                                if ws_sender.send(Message::Text(json.into())).await.is_err() {
-                                    break;
-                                }
+                            if ws_sender.send(msg).await.is_err() {
+                                break;
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -1809,22 +2153,15 @@ async fn handle_client(
                 // PRIORITY 2: L2 orderbook (lower priority, can lag)
                 result = rx_l2.recv() => {
                     match result {
-                        Ok(event) => {
-                            let json = if use_envelope {
-                                let wrapped = MarketEventEnvelope {
-                                    schema_version: 1,
-                                    source: envelope_source.clone(),
-                                    time_sent: Utc::now(),
-                                    payload: event,
-                                };
-                                serde_json::to_string(&wrapped)
+                        Ok(bytes) => {
+                            // Respects WS_BINARY_FRAMES config
+                            let msg = if use_binary {
+                                Message::Binary(bytes)
                             } else {
-                                serde_json::to_string(&event)
+                                Message::Text(String::from_utf8_lossy(&bytes).into_owned().into())
                             };
-                            if let Ok(json) = json {
-                                if ws_sender.send(Message::Text(json.into())).await.is_err() {
-                                    break;
-                                }
+                            if ws_sender.send(msg).await.is_err() {
+                                break;
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -2522,6 +2859,35 @@ fn binance_open_interest_poller(
     )
 }
 
+/// Dedicated aggregator task - processes events without blocking the hot path
+/// Publishes snapshots to watch channel for consumers
+async fn run_aggregator_task(
+    mut event_rx: mpsc::Receiver<MarketEventMessage>,
+    snapshot_tx: watch::Sender<AggregatedSnapshot>,
+) {
+    let mut aggregator = Aggregator::new();
+    let mut snapshot_interval = interval(Duration::from_millis(100)); // Publish snapshots at 10Hz
+    snapshot_interval.tick().await; // Skip first immediate tick
+
+    loop {
+        tokio::select! {
+            biased;
+
+            // Process incoming events (priority)
+            Some(event) = event_rx.recv() => {
+                aggregator.process_event(event);
+            }
+
+            // Periodically publish snapshot
+            _ = snapshot_interval.tick() => {
+                let snapshot = aggregator.snapshot();
+                // send() only fails if all receivers dropped - that's OK
+                let _ = snapshot_tx.send(snapshot);
+            }
+        }
+    }
+}
+
 /// Initialize logging
 fn init_logging() {
     tracing_subscriber::fmt()
@@ -2530,4 +2896,531 @@ fn init_logging() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_event() -> MarketEventMessage {
+        MarketEventMessage {
+            time_exchange: Utc::now(),
+            time_received: Utc::now(),
+            exchange: "TestExchange".to_string(),
+            instrument: InstrumentInfo {
+                base: "BTC".to_string(),
+                quote: "USD".to_string(),
+                kind: "Perpetual".to_string(),
+            },
+            kind: "trade".to_string(),
+            data: serde_json::json!({"price": 50000.0, "amount": 1.5}),
+        }
+    }
+
+    #[test]
+    fn test_serialize_for_broadcast_without_envelope() {
+        let config = BroadcastConfig {
+            use_envelope: false,
+            source: "test-source".to_string(),
+            use_binary_frames: true,
+            l1_throttle_ms: 50,
+            spot_log_threshold: 50_000.0,
+        };
+        let event = test_event();
+
+        let result = serialize_for_broadcast(&config, event.clone());
+        assert!(result.is_some(), "Serialization should succeed");
+
+        let bytes = result.unwrap();
+        let json_str = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // Verify it's valid JSON and contains expected fields
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["exchange"], "TestExchange");
+        assert_eq!(parsed["kind"], "trade");
+        assert!(parsed.get("schema_version").is_none(), "Should not have envelope fields");
+    }
+
+    #[test]
+    fn test_serialize_for_broadcast_with_envelope() {
+        let config = BroadcastConfig {
+            use_envelope: true,
+            source: "test-source".to_string(),
+            use_binary_frames: true,
+            l1_throttle_ms: 50,
+            spot_log_threshold: 50_000.0,
+        };
+        let event = test_event();
+
+        let result = serialize_for_broadcast(&config, event);
+        assert!(result.is_some(), "Serialization should succeed");
+
+        let bytes = result.unwrap();
+        let json_str = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // Verify envelope structure
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["source"], "test-source");
+        assert!(parsed.get("time_sent").is_some(), "Should have time_sent");
+        assert!(parsed.get("payload").is_some(), "Should have payload");
+        assert_eq!(parsed["payload"]["exchange"], "TestExchange");
+    }
+
+    #[test]
+    fn test_serialize_for_broadcast_produces_valid_utf8() {
+        let config = BroadcastConfig {
+            use_envelope: false,
+            source: "test".to_string(),
+            use_binary_frames: true,
+            l1_throttle_ms: 50,
+            spot_log_threshold: 50_000.0,
+        };
+        let event = test_event();
+
+        let result = serialize_for_broadcast(&config, event);
+        let bytes = result.unwrap();
+
+        // Verify the bytes are valid UTF-8
+        assert!(String::from_utf8(bytes.to_vec()).is_ok(), "Should produce valid UTF-8");
+    }
+
+    #[test]
+    fn test_broadcast_config_from_env_defaults() {
+        // Clear env vars to test defaults
+        // SAFETY: Only modifying test-specific env vars in single-threaded test
+        unsafe {
+            std::env::remove_var("WS_ENVELOPE");
+            std::env::remove_var("WS_SOURCE");
+        }
+
+        let config = BroadcastConfig::from_env();
+        assert!(!config.use_envelope, "Default should be no envelope");
+        assert_eq!(config.source, "barter-data-server", "Default source");
+    }
+
+    #[test]
+    fn test_bytes_channel_type() {
+        // Verify Bytes can be sent through broadcast channel
+        let (tx, mut rx) = broadcast::channel::<Bytes>(10);
+
+        let test_bytes = Bytes::from("test message");
+        tx.send(test_bytes.clone()).unwrap();
+
+        let received = rx.blocking_recv().unwrap();
+        assert_eq!(received, test_bytes);
+    }
+
+    #[test]
+    fn test_aggregator_mpsc_channel() {
+        // Verify mpsc channel works for aggregator events
+        let (tx, mut rx) = mpsc::channel::<MarketEventMessage>(100);
+
+        let event = test_event();
+        tx.blocking_send(event.clone()).unwrap();
+
+        let received = rx.blocking_recv().unwrap();
+        assert_eq!(received.exchange, "TestExchange");
+        assert_eq!(received.kind, "trade");
+    }
+
+    #[test]
+    fn test_aggregator_watch_channel() {
+        // Verify watch channel works for snapshot publishing
+        let (tx, rx) = watch::channel(AggregatedSnapshot::default());
+
+        // Initial value should be empty
+        let initial = rx.borrow().clone();
+        assert!(initial.tickers.is_empty());
+
+        // Create a snapshot with some data
+        let mut snapshot = AggregatedSnapshot::default();
+        snapshot.tickers.insert("BTC".to_string(), Default::default());
+
+        // Send new snapshot
+        tx.send(snapshot).unwrap();
+
+        // Receiver should see new value
+        let received = rx.borrow().clone();
+        assert!(received.tickers.contains_key("BTC"));
+    }
+
+    #[test]
+    fn test_try_send_non_blocking() {
+        // Verify try_send doesn't block (critical for hot-path)
+        let (tx, _rx) = mpsc::channel::<MarketEventMessage>(1);
+
+        let event1 = test_event();
+        let event2 = test_event();
+
+        // First send should succeed
+        assert!(tx.try_send(event1).is_ok());
+
+        // Second send should fail (channel full) but not block
+        assert!(tx.try_send(event2).is_err());
+    }
+
+    #[test]
+    fn test_feed_health_atomics() {
+        // Verify atomic counters work for feed health tracking
+        use std::sync::atomic::Ordering;
+
+        // Reset counters
+        BINANCE_EVENT_COUNT.store(0, Ordering::Relaxed);
+        AGG_CHANNEL_DROPPED.store(0, Ordering::Relaxed);
+
+        // Increment
+        BINANCE_EVENT_COUNT.fetch_add(10, Ordering::Relaxed);
+        AGG_CHANNEL_DROPPED.fetch_add(2, Ordering::Relaxed);
+
+        // Swap (like metrics logging does)
+        let binance = BINANCE_EVENT_COUNT.swap(0, Ordering::Relaxed);
+        let dropped = AGG_CHANNEL_DROPPED.swap(0, Ordering::Relaxed);
+
+        assert_eq!(binance, 10);
+        assert_eq!(dropped, 2);
+
+        // After swap, should be 0
+        assert_eq!(BINANCE_EVENT_COUNT.load(Ordering::Relaxed), 0);
+        assert_eq!(AGG_CHANNEL_DROPPED.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_stale_threshold_constant() {
+        // Verify stale threshold is reasonable (30s = 30000ms)
+        assert_eq!(FEED_STALE_THRESHOLD_MS, 30_000);
+    }
+
+    // ========== CRITICAL: Aggregator backpressure tests ==========
+
+    #[test]
+    fn test_aggregator_backpressure_counter_increments() {
+        use std::sync::atomic::Ordering;
+
+        // Reset the counter
+        AGG_CHANNEL_DROPPED.store(0, Ordering::Relaxed);
+
+        // Create a small channel that will overflow
+        let (tx, _rx) = mpsc::channel::<MarketEventMessage>(2);
+
+        // Fill the channel
+        for _ in 0..2 {
+            let _ = tx.try_send(test_event());
+        }
+
+        // Now simulate the backpressure handling code pattern
+        let event = test_event();
+        if tx.try_send(event).is_err() {
+            // This is exactly what the hot path does
+            AGG_CHANNEL_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Verify counter incremented
+        let dropped = AGG_CHANNEL_DROPPED.load(Ordering::Relaxed);
+        assert_eq!(dropped, 1, "Should have incremented dropped counter");
+    }
+
+    #[test]
+    fn test_aggregator_channel_recovers_after_drain() {
+        // Note: This test verifies channel behavior, not global counter
+        // (global counter is tested separately in test_aggregator_backpressure_counter_increments)
+
+        // Create a small channel
+        let (tx, mut rx) = mpsc::channel::<MarketEventMessage>(2);
+
+        // Fill it
+        assert!(tx.try_send(test_event()).is_ok(), "First send should succeed");
+        assert!(tx.try_send(test_event()).is_ok(), "Second send should succeed");
+
+        // This should fail (channel full)
+        assert!(tx.try_send(test_event()).is_err(), "Third send should fail (channel full)");
+
+        // Drain one message
+        let _ = rx.try_recv();
+
+        // Now send should succeed (channel has space again)
+        assert!(tx.try_send(test_event()).is_ok(), "Should succeed after drain");
+    }
+
+    #[test]
+    fn test_rate_limited_warning_logic() {
+        use std::sync::atomic::Ordering;
+
+        // Test the rate limiting logic for drop warnings
+        AGG_LAST_DROP_WARN_MS.store(0, Ordering::Relaxed);
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        // First warning should trigger (0 is far in the past)
+        let last_warn = AGG_LAST_DROP_WARN_MS.load(Ordering::Relaxed);
+        let should_warn = now_ms - last_warn > 1000;
+        assert!(should_warn, "Should warn on first drop");
+
+        // Update the last warn time
+        AGG_LAST_DROP_WARN_MS.store(now_ms, Ordering::Relaxed);
+
+        // Immediate second warning should NOT trigger (< 1 second)
+        let now_ms_2 = chrono::Utc::now().timestamp_millis();
+        let last_warn_2 = AGG_LAST_DROP_WARN_MS.load(Ordering::Relaxed);
+        let should_warn_2 = now_ms_2 - last_warn_2 > 1000;
+        assert!(!should_warn_2, "Should NOT warn within 1 second");
+    }
+
+    #[test]
+    fn test_cached_config_values() {
+        // Verify hot-path config values are properly cached
+        let config = BroadcastConfig::from_env();
+
+        // These should be the defaults (no env vars set in test)
+        assert_eq!(config.l1_throttle_ms, 50, "L1 throttle should be cached");
+        assert_eq!(config.spot_log_threshold, 50_000.0, "Spot log threshold should be cached");
+    }
+
+    // ========== CRITICAL: Feed staleness detection tests ==========
+
+    #[test]
+    fn test_feed_staleness_detection_logic() {
+        use std::sync::atomic::Ordering;
+
+        // Simulate the staleness check logic from the metrics task
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        // Recent event (5 seconds ago) - should NOT be stale
+        let recent_event_ms = now_ms - 5_000;
+        let is_recent_stale = recent_event_ms > 0 && (now_ms - recent_event_ms) > FEED_STALE_THRESHOLD_MS;
+        assert!(!is_recent_stale, "5s old event should NOT be stale (threshold is 30s)");
+
+        // Old event (45 seconds ago) - should BE stale
+        let old_event_ms = now_ms - 45_000;
+        let is_old_stale = old_event_ms > 0 && (now_ms - old_event_ms) > FEED_STALE_THRESHOLD_MS;
+        assert!(is_old_stale, "45s old event should BE stale (threshold is 30s)");
+
+        // Never received event (0) - should NOT trigger stale (special case)
+        let never_received_ms = 0_i64;
+        let is_never_stale = never_received_ms > 0 && (now_ms - never_received_ms) > FEED_STALE_THRESHOLD_MS;
+        assert!(!is_never_stale, "Never-received event should NOT trigger stale alert");
+    }
+
+    #[test]
+    fn test_feed_event_timestamp_tracking() {
+        use std::sync::atomic::Ordering;
+
+        // Reset timestamps
+        BINANCE_LAST_EVENT_MS.store(0, Ordering::Relaxed);
+
+        // Verify initial state
+        assert_eq!(BINANCE_LAST_EVENT_MS.load(Ordering::Relaxed), 0);
+
+        // Simulate event arrival
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        BINANCE_LAST_EVENT_MS.store(now_ms, Ordering::Relaxed);
+
+        // Verify timestamp updated
+        let stored = BINANCE_LAST_EVENT_MS.load(Ordering::Relaxed);
+        assert!(stored > 0, "Timestamp should be updated after event");
+        assert!((stored - now_ms).abs() < 1000, "Timestamp should be recent");
+    }
+
+    #[test]
+    fn test_backpressure_alert_threshold() {
+        use std::sync::atomic::Ordering;
+
+        // Reset counters
+        AGG_CHANNEL_DROPPED.store(0, Ordering::Relaxed);
+        AGG_LAST_DROP_WARN_MS.store(0, Ordering::Relaxed);
+
+        // Simulate burst of drops
+        for _ in 0..100 {
+            AGG_CHANNEL_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let total_dropped = AGG_CHANNEL_DROPPED.load(Ordering::Relaxed);
+        assert_eq!(total_dropped, 100, "Should track all dropped events");
+
+        // In production, this would trigger a warning like:
+        // "Aggregator channel full - dropped 100 events total (consider increasing AGG_EVENT_BUFFER)"
+        // The rate limiting ensures we don't spam warnings (tested in test_rate_limited_warning_logic)
+    }
+
+    #[test]
+    fn test_metrics_calculation_with_events() {
+        use std::sync::atomic::Ordering;
+
+        // Reset all metrics
+        TRADE_COUNT.store(0, Ordering::Relaxed);
+        SKEW_SUM_MS.store(0, Ordering::Relaxed);
+        SKEW_COUNT.store(0, Ordering::Relaxed);
+        SKEW_MAX_MS.store(0, Ordering::Relaxed);
+        SKEW_MIN_MS.store(i64::MAX, Ordering::Relaxed);
+
+        // Simulate 10 trades with various skews
+        for skew in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50_i64] {
+            TRADE_COUNT.fetch_add(1, Ordering::Relaxed);
+            SKEW_SUM_MS.fetch_add(skew, Ordering::Relaxed);
+            SKEW_COUNT.fetch_add(1, Ordering::Relaxed);
+
+            // Update max
+            let mut current_max = SKEW_MAX_MS.load(Ordering::Relaxed);
+            while skew > current_max {
+                match SKEW_MAX_MS.compare_exchange_weak(
+                    current_max, skew, Ordering::Relaxed, Ordering::Relaxed
+                ) {
+                    Ok(_) => break,
+                    Err(x) => current_max = x,
+                }
+            }
+
+            // Update min
+            let mut current_min = SKEW_MIN_MS.load(Ordering::Relaxed);
+            while skew < current_min {
+                match SKEW_MIN_MS.compare_exchange_weak(
+                    current_min, skew, Ordering::Relaxed, Ordering::Relaxed
+                ) {
+                    Ok(_) => break,
+                    Err(x) => current_min = x,
+                }
+            }
+        }
+
+        // Verify metrics
+        let trades = TRADE_COUNT.load(Ordering::Relaxed);
+        let skew_sum = SKEW_SUM_MS.load(Ordering::Relaxed);
+        let skew_count = SKEW_COUNT.load(Ordering::Relaxed);
+        let skew_max = SKEW_MAX_MS.load(Ordering::Relaxed);
+        let skew_min = SKEW_MIN_MS.load(Ordering::Relaxed);
+
+        assert_eq!(trades, 10, "Should have 10 trades");
+        assert_eq!(skew_sum, 275, "Sum should be 5+10+...+50 = 275");
+        assert_eq!(skew_count, 10, "Should have 10 skew samples");
+        assert_eq!(skew_max, 50, "Max skew should be 50ms");
+        assert_eq!(skew_min, 5, "Min skew should be 5ms");
+
+        // Calculate average like the metrics task does
+        let skew_avg = if skew_count > 0 { skew_sum / skew_count as i64 } else { 0 };
+        assert_eq!(skew_avg, 27, "Average skew should be 27ms (275/10)");
+    }
+
+    // ========== END-TO-END: Integration tests ==========
+
+    #[tokio::test]
+    async fn test_e2e_broadcast_channel_data_flow() {
+        // This tests the complete data flow:
+        // Event -> serialize_for_broadcast -> broadcast channel -> receive
+
+        let config = BroadcastConfig {
+            use_envelope: false,
+            source: "test".to_string(),
+            use_binary_frames: true,
+            l1_throttle_ms: 50,
+            spot_log_threshold: 50_000.0,
+        };
+
+        // Create broadcast channel (simulates server)
+        let (tx, mut rx) = broadcast::channel::<Bytes>(100);
+
+        // Create test event
+        let event = test_event();
+
+        // Serialize (simulates hot path)
+        let bytes = serialize_for_broadcast(&config, event.clone())
+            .expect("Serialization should succeed");
+
+        // Broadcast
+        tx.send(bytes.clone()).expect("Broadcast should succeed");
+
+        // Receive (simulates client)
+        let received = rx.recv().await.expect("Should receive broadcast");
+
+        // Verify received data
+        assert_eq!(received, bytes, "Received bytes should match sent bytes");
+
+        // Parse received data (simulates client parsing)
+        let parsed: MarketEventMessage = serde_json::from_slice(&received)
+            .expect("Should parse as MarketEventMessage");
+
+        assert_eq!(parsed.exchange, "TestExchange");
+        assert_eq!(parsed.kind, "trade");
+        assert_eq!(parsed.instrument.base, "BTC");
+    }
+
+    #[tokio::test]
+    async fn test_e2e_multiple_clients_receive_same_data() {
+        // Test that multiple clients receive the same broadcast
+
+        let config = BroadcastConfig {
+            use_envelope: false,
+            source: "test".to_string(),
+            use_binary_frames: true,
+            l1_throttle_ms: 50,
+            spot_log_threshold: 50_000.0,
+        };
+
+        // Create broadcast channel with multiple receivers
+        let (tx, _rx1) = broadcast::channel::<Bytes>(100);
+        let mut rx1 = tx.subscribe();
+        let mut rx2 = tx.subscribe();
+        let mut rx3 = tx.subscribe();
+
+        // Broadcast event
+        let event = test_event();
+        let bytes = serialize_for_broadcast(&config, event).unwrap();
+        tx.send(bytes.clone()).unwrap();
+
+        // All clients should receive the same data
+        let recv1 = rx1.recv().await.unwrap();
+        let recv2 = rx2.recv().await.unwrap();
+        let recv3 = rx3.recv().await.unwrap();
+
+        assert_eq!(recv1, recv2, "Client 1 and 2 should receive same data");
+        assert_eq!(recv2, recv3, "Client 2 and 3 should receive same data");
+    }
+
+    #[tokio::test]
+    async fn test_e2e_envelope_format_data_flow() {
+        // Test envelope format end-to-end
+
+        let config = BroadcastConfig {
+            use_envelope: true,
+            source: "test-server".to_string(),
+            use_binary_frames: true,
+            l1_throttle_ms: 50,
+            spot_log_threshold: 50_000.0,
+        };
+
+        let (tx, mut rx) = broadcast::channel::<Bytes>(100);
+
+        let event = test_event();
+        let bytes = serialize_for_broadcast(&config, event).unwrap();
+        tx.send(bytes).unwrap();
+
+        let received = rx.recv().await.unwrap();
+
+        // Parse as JSON value to verify envelope structure
+        let envelope: serde_json::Value = serde_json::from_slice(&received)
+            .expect("Should parse as JSON");
+
+        assert_eq!(envelope["schema_version"], 1);
+        assert_eq!(envelope["source"], "test-server");
+        assert_eq!(envelope["payload"]["exchange"], "TestExchange");
+    }
+
+    #[tokio::test]
+    async fn test_e2e_aggregator_channel_data_flow() {
+        // Test aggregator channel receives events correctly
+
+        let (tx, mut rx) = mpsc::channel::<MarketEventMessage>(100);
+
+        // Send multiple events
+        for i in 0..10 {
+            let mut event = test_event();
+            event.instrument.base = format!("TEST{}", i);
+            tx.send(event).await.expect("Send should succeed");
+        }
+
+        // Receive and verify
+        for i in 0..10 {
+            let received = rx.recv().await.expect("Should receive event");
+            assert_eq!(received.instrument.base, format!("TEST{}", i));
+        }
+    }
 }

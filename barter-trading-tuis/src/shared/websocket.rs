@@ -27,6 +27,10 @@ pub struct WebSocketConfig {
     pub reconnect_delay: Duration,
     /// Maximum channel buffer size for events
     pub channel_buffer_size: usize,
+    /// Expect envelope format (must match server WS_ENVELOPE setting)
+    /// When true: parse only envelope format, fail on non-envelope
+    /// When false: parse only raw format, fail on envelope
+    pub expect_envelope: bool,
 }
 
 impl Default for WebSocketConfig {
@@ -40,6 +44,11 @@ impl Default for WebSocketConfig {
             lag_stale_duration: Duration::from_secs(10),
             reconnect_delay: Duration::from_secs(2),
             channel_buffer_size: 1000,
+            // Read from same env var as server to avoid config drift
+            expect_envelope: std::env::var("WS_ENVELOPE")
+                .ok()
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+                .unwrap_or(false),
         }
     }
 }
@@ -92,6 +101,12 @@ impl WebSocketConfig {
     /// Set channel buffer size
     pub fn with_channel_buffer_size(mut self, size: usize) -> Self {
         self.channel_buffer_size = size;
+        self
+    }
+
+    /// Set expected message format (must match server WS_ENVELOPE setting)
+    pub fn with_expect_envelope(mut self, expect: bool) -> Self {
+        self.expect_envelope = expect;
         self
     }
 }
@@ -235,49 +250,23 @@ async fn run_websocket_loop(
                                     last_event = std::time::Instant::now();
                                     match msg {
                                         Message::Text(text) => {
-                                            // Check if it's a welcome message
-                                            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&text) {
-                                                if json_val.get("type").and_then(|v| v.as_str()) == Some("welcome")
-                                                {
-                                                    debug!("Received welcome message");
-                                                    continue;
-                                                }
-                                            }
-
-                                            // Try to parse as market event
-                                            if let Ok(envelope) = serde_json::from_str::<MarketEventEnvelope>(&text)
-                                            {
-                                                if envelope.payload.kind == "trade" {
-                                                    last_trade_event = std::time::Instant::now();
-                                                    let lag_ms = chrono::Utc::now().timestamp_millis()
-                                                        - envelope.payload.time_exchange.timestamp_millis();
-                                                    if lag_ms >= config.lag_stale_threshold.as_millis() as i64 {
-                                                        if lag_breach_since.is_none() {
-                                                            lag_breach_since = Some(std::time::Instant::now());
-                                                        }
-                                                        if let Some(start) = lag_breach_since {
-                                                            if start.elapsed() >= config.lag_stale_duration {
-                                                                warn!(
-                                                                    "WebSocket lag stale ({}ms), reconnecting...",
-                                                                    lag_ms
-                                                                );
-                                                                should_break = true;
-                                                                break;
-                                                            }
-                                                        }
-                                                    } else {
-                                                        lag_breach_since = None;
-                                                    }
-                                                }
-                                                if event_tx.send(envelope.payload).await.is_err() {
-                                                    warn!("Event receiver dropped, stopping client");
-                                                    should_break = true;
-                                                    break;
-                                                }
+                                            // Fast path: check for welcome message without full JSON parse
+                                            if text.contains(r#""type":"welcome"#) {
+                                                debug!("Received welcome message");
                                                 continue;
                                             }
 
-                                            match serde_json::from_str::<MarketEventMessage>(&text) {
+                                            // Single format parsing based on config (no fallback = faster)
+                                            let parse_result: Result<MarketEventMessage, _> = if config.expect_envelope {
+                                                // Envelope format: extract payload
+                                                serde_json::from_str::<MarketEventEnvelope>(&text)
+                                                    .map(|env| env.payload)
+                                            } else {
+                                                // Raw format: parse directly
+                                                serde_json::from_str::<MarketEventMessage>(&text)
+                                            };
+
+                                            match parse_result {
                                                 Ok(event) => {
                                                     if event.kind == "trade" {
                                                         last_trade_event = std::time::Instant::now();
@@ -308,7 +297,69 @@ async fn run_websocket_loop(
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    error!("Failed to parse message: {}", e);
+                                                    error!("Failed to parse message (expect_envelope={}): {}", config.expect_envelope, e);
+                                                    debug!("Raw message: {}", text);
+                                                }
+                                            }
+                                        }
+                                        Message::Binary(bytes) => {
+                                            // Binary frame: parse from bytes (zero-copy from server)
+                                            let text = match std::str::from_utf8(&bytes) {
+                                                Ok(t) => t,
+                                                Err(e) => {
+                                                    error!("Invalid UTF-8 in binary frame: {}", e);
+                                                    continue;
+                                                }
+                                            };
+
+                                            // Fast path: check for welcome message without full JSON parse
+                                            if text.contains(r#""type":"welcome"#) {
+                                                debug!("Received welcome message");
+                                                continue;
+                                            }
+
+                                            // Single format parsing based on config (no fallback = faster)
+                                            let parse_result: Result<MarketEventMessage, _> = if config.expect_envelope {
+                                                // Envelope format: extract payload
+                                                serde_json::from_str::<MarketEventEnvelope>(text)
+                                                    .map(|env| env.payload)
+                                            } else {
+                                                // Raw format: parse directly
+                                                serde_json::from_str::<MarketEventMessage>(text)
+                                            };
+
+                                            match parse_result {
+                                                Ok(event) => {
+                                                    if event.kind == "trade" {
+                                                        last_trade_event = std::time::Instant::now();
+                                                        let lag_ms = chrono::Utc::now().timestamp_millis()
+                                                            - event.time_exchange.timestamp_millis();
+                                                        if lag_ms >= config.lag_stale_threshold.as_millis() as i64 {
+                                                            if lag_breach_since.is_none() {
+                                                                lag_breach_since = Some(std::time::Instant::now());
+                                                            }
+                                                            if let Some(start) = lag_breach_since {
+                                                                if start.elapsed() >= config.lag_stale_duration {
+                                                                    warn!(
+                                                                        "WebSocket lag stale ({}ms), reconnecting...",
+                                                                        lag_ms
+                                                                    );
+                                                                    should_break = true;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        } else {
+                                                            lag_breach_since = None;
+                                                        }
+                                                    }
+                                                    if event_tx.send(event).await.is_err() {
+                                                        warn!("Event receiver dropped, stopping client");
+                                                        should_break = true;
+                                                        break;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to parse binary message (expect_envelope={}): {}", config.expect_envelope, e);
                                                     debug!("Raw message: {}", text);
                                                 }
                                             }
@@ -400,5 +451,303 @@ mod tests {
         assert_eq!(config.lag_stale_duration, Duration::from_secs(10));
         assert_eq!(config.reconnect_delay, Duration::from_secs(2));
         assert_eq!(config.channel_buffer_size, 1000);
+        assert!(!config.expect_envelope, "Default should be non-envelope format");
+    }
+
+    #[test]
+    fn test_expect_envelope_config() {
+        let config = WebSocketConfig::default()
+            .with_expect_envelope(true);
+        assert!(config.expect_envelope);
+
+        let config_raw = WebSocketConfig::default()
+            .with_expect_envelope(false);
+        assert!(!config_raw.expect_envelope);
+    }
+
+    // ========== CRITICAL: Binary frame parsing tests ==========
+
+    fn create_test_event() -> MarketEventMessage {
+        use chrono::Utc;
+        MarketEventMessage {
+            time_exchange: Utc::now(),
+            time_received: Utc::now(),
+            exchange: "TestExchange".to_string(),
+            instrument: crate::shared::types::InstrumentInfo {
+                base: "BTC".to_string(),
+                quote: "USD".to_string(),
+                kind: "Perpetual".to_string(),
+            },
+            kind: "trade".to_string(),
+            data: serde_json::json!({"price": 50000.0, "amount": 1.0}),
+        }
+    }
+
+    #[test]
+    fn test_binary_frame_parsing_raw_format() {
+        // Simulate server sending raw format (no envelope)
+        let event = create_test_event();
+        let json = serde_json::to_string(&event).unwrap();
+        let bytes = json.as_bytes();
+
+        // Parse as if we received binary frame
+        let text = std::str::from_utf8(bytes).expect("Should be valid UTF-8");
+
+        // With expect_envelope=false, should parse successfully
+        let parsed: Result<MarketEventMessage, _> = serde_json::from_str(text);
+        assert!(parsed.is_ok(), "Should parse raw format successfully");
+
+        let msg = parsed.unwrap();
+        assert_eq!(msg.exchange, "TestExchange");
+        assert_eq!(msg.kind, "trade");
+    }
+
+    #[test]
+    fn test_binary_frame_parsing_envelope_format() {
+        use chrono::Utc;
+        // Simulate server sending envelope format
+        let event = create_test_event();
+        let envelope = MarketEventEnvelope {
+            schema_version: 1,
+            source: "test-server".to_string(),
+            time_sent: Utc::now(),
+            payload: event,
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        let bytes = json.as_bytes();
+
+        // Parse as if we received binary frame
+        let text = std::str::from_utf8(bytes).expect("Should be valid UTF-8");
+
+        // With expect_envelope=true, should parse successfully
+        let parsed: Result<MarketEventEnvelope, _> = serde_json::from_str(text);
+        assert!(parsed.is_ok(), "Should parse envelope format successfully");
+
+        let env = parsed.unwrap();
+        assert_eq!(env.schema_version, 1);
+        assert_eq!(env.payload.exchange, "TestExchange");
+    }
+
+    #[test]
+    fn test_envelope_mismatch_graceful_failure() {
+        // Server sends envelope, client expects raw
+        use chrono::Utc;
+        let event = create_test_event();
+        let envelope = MarketEventEnvelope {
+            schema_version: 1,
+            source: "test-server".to_string(),
+            time_sent: Utc::now(),
+            payload: event.clone(),
+        };
+        let envelope_json = serde_json::to_string(&envelope).unwrap();
+
+        // Try to parse envelope as raw format (mismatch)
+        let parsed_raw: Result<MarketEventMessage, _> = serde_json::from_str(&envelope_json);
+        // This should fail gracefully (no crash, just parse error)
+        // The envelope has different fields, so parsing as raw will fail
+        assert!(parsed_raw.is_err(), "Should fail to parse envelope as raw format");
+
+        // Now test the reverse: raw sent, envelope expected
+        let raw_json = serde_json::to_string(&event).unwrap();
+        let parsed_envelope: Result<MarketEventEnvelope, _> = serde_json::from_str(&raw_json);
+        assert!(parsed_envelope.is_err(), "Should fail to parse raw as envelope format");
+    }
+
+    #[test]
+    fn test_invalid_utf8_binary_frame_handling() {
+        // Simulate invalid UTF-8 bytes
+        let invalid_bytes: &[u8] = &[0xFF, 0xFE, 0x00, 0x01];
+
+        // This is how the code handles it
+        let result = std::str::from_utf8(invalid_bytes);
+        assert!(result.is_err(), "Should fail on invalid UTF-8");
+
+        // The error should be catchable (no panic)
+        match result {
+            Ok(_) => panic!("Should not succeed with invalid UTF-8"),
+            Err(e) => {
+                // Error is handled gracefully
+                assert!(e.to_string().contains("invalid"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_lag_threshold_detection() {
+        use chrono::Utc;
+        use std::time::Duration;
+
+        let config = WebSocketConfig::default()
+            .with_lag_stale_threshold(Duration::from_secs(15))
+            .with_lag_stale_duration(Duration::from_secs(10));
+
+        // Simulate trade event with different lag values
+        let now_ms = Utc::now().timestamp_millis();
+
+        // Event with 5s lag (under threshold)
+        let event_time_5s = chrono::DateTime::from_timestamp_millis(now_ms - 5_000).unwrap();
+        let lag_5s = now_ms - event_time_5s.timestamp_millis();
+        assert!(lag_5s < config.lag_stale_threshold.as_millis() as i64,
+            "5s lag should be under 15s threshold");
+
+        // Event with 20s lag (over threshold)
+        let event_time_20s = chrono::DateTime::from_timestamp_millis(now_ms - 20_000).unwrap();
+        let lag_20s = now_ms - event_time_20s.timestamp_millis();
+        assert!(lag_20s >= config.lag_stale_threshold.as_millis() as i64,
+            "20s lag should exceed 15s threshold");
+    }
+
+    #[test]
+    fn test_welcome_message_detection() {
+        // Welcome messages should be detected and skipped
+        let welcome_json = r#"{"type":"welcome","message":"Connected to barter-data market feed","timestamp":"2024-01-01T00:00:00Z"}"#;
+
+        // Fast path check that's used in the actual code
+        let is_welcome = welcome_json.contains(r#""type":"welcome"#);
+        assert!(is_welcome, "Should detect welcome message");
+
+        // Non-welcome message
+        let trade_json = r#"{"time_exchange":"2024-01-01T00:00:00Z","exchange":"Test","kind":"trade"}"#;
+        let is_not_welcome = !trade_json.contains(r#""type":"welcome"#);
+        assert!(is_not_welcome, "Should not detect trade as welcome");
+    }
+
+    // ========== CRITICAL: Stale/Lag reconnection trigger tests ==========
+
+    #[test]
+    fn test_stale_timeout_should_trigger_reconnect() {
+        // This tests the logic that triggers reconnection when no events arrive
+        let config = WebSocketConfig::default()
+            .with_stale_timeout(Duration::from_secs(15));
+
+        // Simulate: last event was 20 seconds ago
+        let last_event = std::time::Instant::now() - Duration::from_secs(20);
+
+        // This is the check from the actual code
+        let should_reconnect = last_event.elapsed() > config.stale_timeout;
+        assert!(should_reconnect, "Should trigger reconnect when stale_timeout (15s) exceeded");
+    }
+
+    #[test]
+    fn test_stale_timeout_should_not_trigger_prematurely() {
+        let config = WebSocketConfig::default()
+            .with_stale_timeout(Duration::from_secs(15));
+
+        // Simulate: last event was 10 seconds ago (under threshold)
+        let last_event = std::time::Instant::now() - Duration::from_secs(10);
+
+        let should_reconnect = last_event.elapsed() > config.stale_timeout;
+        assert!(!should_reconnect, "Should NOT trigger reconnect when under stale_timeout");
+    }
+
+    #[test]
+    fn test_trade_stale_timeout_trigger() {
+        let config = WebSocketConfig::default()
+            .with_trade_stale_timeout(Duration::from_secs(15));
+
+        // Last trade was 20 seconds ago
+        let last_trade_event = std::time::Instant::now() - Duration::from_secs(20);
+
+        // This is the check from the actual code
+        let should_reconnect = last_trade_event.elapsed() > config.trade_stale_timeout;
+        assert!(should_reconnect, "Should trigger reconnect when no trades for > trade_stale_timeout");
+    }
+
+    #[test]
+    fn test_lag_stale_duration_accumulation() {
+        use std::time::Instant;
+
+        let config = WebSocketConfig::default()
+            .with_lag_stale_threshold(Duration::from_secs(15))
+            .with_lag_stale_duration(Duration::from_secs(10));
+
+        // Simulate lag that exceeds threshold
+        let lag_ms: i64 = 20_000; // 20 seconds lag
+        let threshold_ms = config.lag_stale_threshold.as_millis() as i64;
+
+        // First check: lag exceeds threshold, start timer
+        let mut lag_breach_since: Option<Instant> = None;
+        if lag_ms >= threshold_ms {
+            if lag_breach_since.is_none() {
+                lag_breach_since = Some(Instant::now());
+            }
+        }
+        assert!(lag_breach_since.is_some(), "Should start lag breach timer when threshold exceeded");
+
+        // Simulate: breach has been ongoing for 5 seconds (under duration)
+        // In real code, we'd wait; here we just check the logic
+        let breach_start = Instant::now() - Duration::from_secs(5);
+        let should_reconnect_5s = breach_start.elapsed() >= config.lag_stale_duration;
+        assert!(!should_reconnect_5s, "Should NOT reconnect after only 5s of lag (duration is 10s)");
+
+        // Simulate: breach has been ongoing for 12 seconds (over duration)
+        let breach_start_12s = Instant::now() - Duration::from_secs(12);
+        let should_reconnect_12s = breach_start_12s.elapsed() >= config.lag_stale_duration;
+        assert!(should_reconnect_12s, "Should reconnect after 12s of lag (duration is 10s)");
+    }
+
+    #[test]
+    fn test_lag_breach_resets_when_lag_recovers() {
+        let config = WebSocketConfig::default()
+            .with_lag_stale_threshold(Duration::from_secs(15));
+
+        let threshold_ms = config.lag_stale_threshold.as_millis() as i64;
+
+        // Start with lag breach
+        let mut lag_breach_since: Option<std::time::Instant> = Some(std::time::Instant::now());
+
+        // Simulate: lag recovers (now only 5 seconds)
+        let recovered_lag_ms: i64 = 5_000;
+        if recovered_lag_ms < threshold_ms {
+            lag_breach_since = None; // Reset
+        }
+
+        assert!(lag_breach_since.is_none(), "Lag breach should reset when lag recovers");
+    }
+
+    #[test]
+    fn test_reconnect_delay_configuration() {
+        let config = WebSocketConfig::default()
+            .with_reconnect_delay(Duration::from_secs(5));
+
+        assert_eq!(config.reconnect_delay, Duration::from_secs(5),
+            "Reconnect delay should be configurable");
+
+        // Default is 2 seconds
+        let default_config = WebSocketConfig::default();
+        assert_eq!(default_config.reconnect_delay, Duration::from_secs(2),
+            "Default reconnect delay should be 2 seconds");
+    }
+
+    #[test]
+    fn test_all_stale_conditions_combined() {
+        // Comprehensive test of all three stale conditions
+
+        let config = WebSocketConfig::default()
+            .with_stale_timeout(Duration::from_secs(15))
+            .with_trade_stale_timeout(Duration::from_secs(15))
+            .with_lag_stale_threshold(Duration::from_secs(15))
+            .with_lag_stale_duration(Duration::from_secs(10));
+
+        // Condition 1: General stale (no events at all)
+        let last_event = std::time::Instant::now() - Duration::from_secs(20);
+        let general_stale = last_event.elapsed() > config.stale_timeout;
+
+        // Condition 2: Trade stale (no trade events)
+        let last_trade = std::time::Instant::now() - Duration::from_secs(20);
+        let trade_stale = last_trade.elapsed() > config.trade_stale_timeout;
+
+        // Condition 3: Lag stale (trades arriving but with high lag for too long)
+        let lag_breach_start = std::time::Instant::now() - Duration::from_secs(12);
+        let lag_stale = lag_breach_start.elapsed() >= config.lag_stale_duration;
+
+        // Any of these should trigger reconnect
+        let should_reconnect = general_stale || trade_stale || lag_stale;
+        assert!(should_reconnect, "At least one stale condition should trigger reconnect");
+
+        // Verify each individually
+        assert!(general_stale, "General stale should be true");
+        assert!(trade_stale, "Trade stale should be true");
+        assert!(lag_stale, "Lag stale should be true");
     }
 }

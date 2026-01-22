@@ -33,3 +33,8 @@ reqwest = { workspace = true }
 
 # Misc
 chrono = { workspace = true }
+bytes = { workspace = true }
+
+[[bin]]
+name = "load-test"
+path = "src/load_test.rs"
