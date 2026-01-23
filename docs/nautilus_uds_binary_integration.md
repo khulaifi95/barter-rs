@@ -109,6 +109,7 @@ barter-data-server:
 - TCP_BUFFER=100000 (clamped 1k-500k)
 
 nautilus_trader (BarterDataClientConfig):
+- enabled: bool (default false; or set BARTER_ENABLED=1)
 - uds_path: Option<String> (defaults to /tmp/barter-data.sock)
 - tcp_addr: Option<String> (defaults to 127.0.0.1:9102 on Windows or when set)
 - data_type: \"barter.market_event\"
@@ -117,6 +118,7 @@ nautilus_trader (BarterDataClientConfig):
 
 Notes:
 - Setting `BARTER_TCP_ADDR` forces TCP even on Unix platforms.
+- `BARTER_ENABLED` only applies to the Nautilus adapter; the smoke/bench binaries connect directly.
 
 ## Tradeoffs (current approach)
 Current: UDS + MessagePack + MarketEventMessage (serde_json::Value payload)
