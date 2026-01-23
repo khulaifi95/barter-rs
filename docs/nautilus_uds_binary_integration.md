@@ -31,6 +31,11 @@ Phase 2:
 - Optional: map specific barter events into native Nautilus types (TradeTick, QuoteTick, etc.) for tighter integration.
 - Optional: multi-host auth/ACL or TLS for TCP deployments.
 
+Status note (current): Parity mapping is now implemented in the Nautilus adapter for
+`trade`, `order_book_l1`, and `order_book_l2` when the Nautilus instrument cache
+contains a matching instrument. This runs alongside CustomData and does not change
+Barter’s output format.
+
 ## Non-goals
 - Replacing existing WS JSON feed (it remains for TUIs).
 - Designing a multi-language schema (Rust-only for now).
