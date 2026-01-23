@@ -27,6 +27,7 @@ tokio-tungstenite = { workspace = true }
 # SerDe
 serde = { workspace = true }
 serde_json = { workspace = true }
+rmp-serde = { workspace = true }
 
 # HTTP for REST polling
 reqwest = { workspace = true }

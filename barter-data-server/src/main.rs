@@ -31,10 +31,15 @@ use std::net::SocketAddr;
 use std::sync::{Arc, atomic::{AtomicI64, AtomicU64, Ordering}};
 use std::time::Instant;
 use tokio::{
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc, watch},
     time::{interval, Duration},
 };
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use bytes::Bytes;
 use tracing::{debug, error, info, warn};
@@ -56,6 +61,7 @@ static OKX_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static BYBIT_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static IBKR_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static AGG_CHANNEL_DROPPED: AtomicU64 = AtomicU64::new(0);
+static IPC_LAGGED_FRAMES: AtomicU64 = AtomicU64::new(0);
 static AGG_LAST_DROP_WARN_MS: AtomicI64 = AtomicI64::new(0);
 static BINANCE_LAST_EVENT_MS: AtomicI64 = AtomicI64::new(0);
 static OKX_LAST_EVENT_MS: AtomicI64 = AtomicI64::new(0);
@@ -109,6 +115,61 @@ impl BroadcastConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+struct UdsConfig {
+    enabled: bool,
+    path: String,
+    buffer: usize,
+}
+
+impl UdsConfig {
+    fn from_env() -> Self {
+        let default_enabled = cfg!(unix);
+        let enabled = std::env::var("UDS_ENABLED")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE"))
+            .unwrap_or(default_enabled);
+        let path = std::env::var("UDS_PATH")
+            .unwrap_or_else(|_| "/tmp/barter-data.sock".to_string());
+        let buffer = std::env::var("UDS_BUFFER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000_usize)
+            .clamp(1_000, 500_000);
+        Self { enabled, path, buffer }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TcpConfig {
+    enabled: bool,
+    addr: String,
+    buffer: usize,
+}
+
+impl TcpConfig {
+    fn from_env() -> Self {
+        let default_enabled = !cfg!(unix);
+        let enabled = std::env::var("TCP_ENABLED")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE"))
+            .unwrap_or(default_enabled);
+        let addr = std::env::var("TCP_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:9102".to_string());
+        let buffer = std::env::var("TCP_BUFFER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000_usize)
+            .clamp(1_000, 500_000);
+        Self { enabled, addr, buffer }
+    }
+}
+
+#[derive(Serialize)]
+enum UdsMessageRef<'a> {
+    Event(&'a MarketEventMessage),
+}
+
 /// Pre-serialize a message for broadcast (avoids per-client serialization)
 /// Returns None on serialization failure (logs error, drops message)
 /// Uses Bytes for zero-copy sharing across clients
@@ -132,6 +193,24 @@ fn serialize_for_broadcast(config: &BroadcastConfig, event: MarketEventMessage) 
             None
         }
     }
+}
+
+fn serialize_for_uds(event: &MarketEventMessage) -> Option<Bytes> {
+    let payload = match rmp_serde::to_vec(&UdsMessageRef::Event(event)) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("Failed to serialize UDS message: {}", e);
+            return None;
+        }
+    };
+    if payload.len() > u32::MAX as usize {
+        error!("UDS payload too large: {} bytes", payload.len());
+        return None;
+    }
+    let mut framed = Vec::with_capacity(4 + payload.len());
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    framed.extend_from_slice(&payload);
+    Some(Bytes::from(framed))
 }
 
 /// Get L2 throttle from ExchangeId directly (avoids hot-path String allocation)
@@ -667,6 +746,17 @@ async fn main() {
         broadcast_config.use_envelope, broadcast_config.source
     );
 
+    let uds_config = UdsConfig::from_env();
+    let tcp_config = TcpConfig::from_env();
+    info!(
+        "UDS config: enabled={}, path={}, buffer={}",
+        uds_config.enabled, uds_config.path, uds_config.buffer
+    );
+    info!(
+        "TCP config: enabled={}, addr={}, buffer={}",
+        tcp_config.enabled, tcp_config.addr, tcp_config.buffer
+    );
+
     // Trades channel: trades, liquidations, OI, CVD, L1 (hot path - NO L2)
     // Now broadcasts pre-serialized Arc<String> to avoid per-client JSON serialization
     let (tx_trades, _) = broadcast::channel::<Bytes>(trades_buffer);
@@ -675,6 +765,10 @@ async fn main() {
     // L2 channel: orderbook L2 only (high volume, can lag without affecting trades)
     let (tx_l2, _) = broadcast::channel::<Bytes>(l2_buffer);
     let tx_l2 = Arc::new(tx_l2);
+
+    let ipc_buffer = std::cmp::max(uds_config.buffer, tcp_config.buffer);
+    let (tx_uds, _) = broadcast::channel::<Bytes>(ipc_buffer);
+    let tx_uds = Arc::new(tx_uds);
 
     let snapshot_builder = Arc::new(tokio::sync::Mutex::new(SnapshotBuilder::new()));
 
@@ -724,6 +818,26 @@ async fn main() {
         .await;
     });
 
+    #[cfg(unix)]
+    if uds_config.enabled {
+        let uds_path = uds_config.path.clone();
+        let uds_tx = Arc::clone(&tx_uds);
+        tokio::spawn(async move {
+            start_uds_server(uds_path, uds_tx).await;
+        });
+    }
+    #[cfg(not(unix))]
+    if uds_config.enabled {
+        warn!("UDS IPC requested but not supported on this platform; enable TCP IPC instead.");
+    }
+    if tcp_config.enabled {
+        let tcp_addr = tcp_config.addr.clone();
+        let tcp_tx = Arc::clone(&tx_uds);
+        tokio::spawn(async move {
+            start_tcp_server(tcp_addr, tcp_tx).await;
+        });
+    }
+
     // Metrics logging task: trades/sec, timestamp skew, and per-feed health every 60s
     tokio::spawn(async move {
         let mut interval = interval(Duration::from_secs(60));
@@ -747,6 +861,7 @@ async fn main() {
             let bybit_events = BYBIT_EVENT_COUNT.swap(0, Ordering::Relaxed);
             let ibkr_events = IBKR_EVENT_COUNT.swap(0, Ordering::Relaxed);
             let agg_dropped = AGG_CHANNEL_DROPPED.swap(0, Ordering::Relaxed);
+            let ipc_lagged = IPC_LAGGED_FRAMES.swap(0, Ordering::Relaxed);
 
             // Per-feed staleness check
             let binance_last = BINANCE_LAST_EVENT_MS.load(Ordering::Relaxed);
@@ -763,8 +878,8 @@ async fn main() {
                 skew_max
             );
             info!(
-                "FEEDS: binance={}/min, okx={}/min, bybit={}/min, ibkr={}/min, agg_dropped={}",
-                binance_events, okx_events, bybit_events, ibkr_events, agg_dropped
+                "FEEDS: binance={}/min, okx={}/min, bybit={}/min, ibkr={}/min, agg_dropped={}, ipc_lagged={}",
+                binance_events, okx_events, bybit_events, ibkr_events, agg_dropped, ipc_lagged
             );
 
             // Stale feed alerts
@@ -791,21 +906,23 @@ async fn main() {
     // IBKR bridge feed (ES/NQ) -> trad_tick events
     {
         let tx_trades = tx_trades.clone();
+        let tx_uds = Arc::clone(&tx_uds);
         let broadcast_cfg = Arc::clone(&broadcast_config);
         let trad_last_ms = Arc::clone(&trad_last_ms);
         tokio::spawn(async move {
-            start_ibkr_bridge_feed(tx_trades, broadcast_cfg, trad_last_ms).await;
+            start_ibkr_bridge_feed(tx_trades, tx_uds, broadcast_cfg, trad_last_ms).await;
         });
     }
 
     // Deribit options feed (options_chain events)
     {
         let tx_trades = tx_trades.clone();
+        let tx_uds = Arc::clone(&tx_uds);
         let spot_cache = Arc::clone(&spot_cache);
         let options_cache = Arc::clone(&options_cache);
         let broadcast_cfg = Arc::clone(&broadcast_config);
         tokio::spawn(async move {
-            start_deribit_options_feed(tx_trades, broadcast_cfg, spot_cache, options_cache).await;
+            start_deribit_options_feed(tx_trades, tx_uds, broadcast_cfg, spot_cache, options_cache).await;
         });
     }
 
@@ -825,17 +942,19 @@ async fn main() {
     // Binance kline feed (authoritative 1m candles for RV/ATR/tvVWAP)
     {
         let kline_cache = Arc::clone(&kline_cache);
+        let tx_uds = Arc::clone(&tx_uds);
         let agg_tx = Arc::clone(&agg_event_tx);
-        seed_binance_klines(kline_cache, agg_tx, &tickers).await;
+        seed_binance_klines(kline_cache, tx_uds, agg_tx, &tickers).await;
     }
     for ticker in &tickers {
         let tx_trades = tx_trades.clone();
+        let tx_uds = Arc::clone(&tx_uds);
         let kline_cache = Arc::clone(&kline_cache);
         let agg_tx = Arc::clone(&agg_event_tx);
         let broadcast_cfg = Arc::clone(&broadcast_config);
         let ticker = ticker.clone();
         tokio::spawn(async move {
-            run_binance_kline_stream(ticker, tx_trades, broadcast_cfg, kline_cache, agg_tx).await;
+            run_binance_kline_stream(ticker, tx_trades, tx_uds, broadcast_cfg, kline_cache, agg_tx).await;
         });
     }
 
@@ -843,6 +962,7 @@ async fn main() {
     // Prevents per-client refresh during handshake (which can stall under burst connects)
     {
         let kline_cache = Arc::clone(&kline_cache);
+        let tx_uds = Arc::clone(&tx_uds);
         let agg_tx = Arc::clone(&agg_event_tx);
         let tickers = tickers.clone();
         tokio::spawn(async move {
@@ -900,6 +1020,9 @@ async fn main() {
                             kind: "candle_backfill".to_string(),
                             data: serde_json::to_value(&payload).unwrap_or_default(),
                         };
+                        if let Some(frame) = serialize_for_uds(&event) {
+                            let _ = tx_uds.send(frame);
+                        }
                         let _ = agg_tx.send(event).await;
                     }
                 }
@@ -913,6 +1036,7 @@ async fn main() {
 
     {
         let tx_trades = tx_trades.clone();
+        let tx_uds = Arc::clone(&tx_uds);
         let broadcast_cfg = Arc::clone(&broadcast_config);
         let snapshot_builder = Arc::clone(&snapshot_builder);
         let agg_snap_rx = Arc::clone(&agg_snapshot_rx);
@@ -967,6 +1091,9 @@ async fn main() {
                     kind: "market_snapshot".to_string(),
                     data: serde_json::to_value(&snapshot).unwrap_or_default(),
                 };
+                if let Some(frame) = serialize_for_uds(&event) {
+                    let _ = tx_uds.send(frame);
+                }
                 if let Some(bytes) = serialize_for_broadcast(&broadcast_cfg, event) {
                     let _ = tx_trades.send(bytes);
                 }
@@ -977,6 +1104,7 @@ async fn main() {
     // Centralized orchestrator (MarketState) - broadcasts orchestrator_result
     {
         let tx_trades = tx_trades.clone();
+        let tx_uds = Arc::clone(&tx_uds);
         let broadcast_cfg = Arc::clone(&broadcast_config);
         let agg_snap_rx = Arc::clone(&agg_snapshot_rx);
         let options_cache = Arc::clone(&options_cache);
@@ -1039,6 +1167,9 @@ async fn main() {
                         kind: "orchestrator_result".to_string(),
                         data: serde_json::to_value(&payload).unwrap_or_default(),
                     };
+                    if let Some(frame) = serialize_for_uds(&event) {
+                        let _ = tx_uds.send(frame);
+                    }
                     if let Some(bytes) = serialize_for_broadcast(&broadcast_cfg, event) {
                         let _ = tx_trades.send(bytes);
                     }
@@ -1232,6 +1363,9 @@ async fn main() {
                                 );
                             }
                         }
+                        if let Some(frame) = serialize_for_uds(&message) {
+                            let _ = tx_uds.send(frame);
+                        }
                         if let Some(bytes) = serialize_for_broadcast(&broadcast_config, message) {
                             let _ = tx_l2.send(bytes); // Ignore errors if no receivers
                         }
@@ -1264,6 +1398,9 @@ async fn main() {
                                 dropped
                             );
                         }
+                    }
+                    if let Some(frame) = serialize_for_uds(&message) {
+                        let _ = tx_uds.send(frame);
                     }
 
                     // Binance L1: apply light throttle (~100ms per instrument) to reduce flood
@@ -1428,8 +1565,101 @@ async fn start_websocket_server(
     }
 }
 
+#[cfg(unix)]
+async fn start_uds_server(path: String, tx_uds: Arc<broadcast::Sender<Bytes>>) {
+    if Path::new(&path).exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            warn!("Failed to remove existing UDS socket {}: {}", path, e);
+        }
+    }
+
+    let listener = match UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!("Failed to bind UDS socket {}: {}", path, e);
+            return;
+        }
+    };
+
+    info!("UDS server bound to {}", path);
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                let tx_uds = tx_uds.clone();
+                tokio::spawn(handle_uds_client(stream, tx_uds));
+            }
+            Err(e) => {
+                warn!("UDS accept error: {}", e);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn handle_uds_client(mut stream: UnixStream, tx_uds: Arc<broadcast::Sender<Bytes>>) {
+    let mut rx = tx_uds.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(frame) => {
+                if stream.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                IPC_LAGGED_FRAMES.fetch_add(skipped as u64, Ordering::Relaxed);
+                debug!("UDS client lagged, skipped {} frames", skipped);
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+async fn start_tcp_server(addr: String, tx_uds: Arc<broadcast::Sender<Bytes>>) {
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!("Failed to bind TCP IPC {}: {}", addr, e);
+            return;
+        }
+    };
+
+    info!("TCP IPC server bound to {}", addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                let tx_uds = tx_uds.clone();
+                tokio::spawn(handle_tcp_client(stream, tx_uds));
+            }
+            Err(e) => {
+                warn!("TCP IPC accept error: {}", e);
+            }
+        }
+    }
+}
+
+async fn handle_tcp_client(mut stream: TcpStream, tx_uds: Arc<broadcast::Sender<Bytes>>) {
+    let mut rx = tx_uds.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(frame) => {
+                if stream.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                IPC_LAGGED_FRAMES.fetch_add(skipped as u64, Ordering::Relaxed);
+                debug!("TCP IPC client lagged, skipped {} frames", skipped);
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 async fn start_ibkr_bridge_feed(
     tx_trades: Arc<broadcast::Sender<Bytes>>,
+    tx_uds: Arc<broadcast::Sender<Bytes>>,
     broadcast_config: Arc<BroadcastConfig>,
     trad_last_ms: Arc<AtomicI64>,
 ) {
@@ -1473,8 +1703,12 @@ async fn start_ibkr_bridge_feed(
                                             // Track IBKR feed health
                                             IBKR_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
                                             IBKR_LAST_EVENT_MS.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
-                                            if let Some(bytes) = serialize_for_broadcast(&broadcast_config, trad_tick_event(tick)) {
+                                            let event = trad_tick_event(tick);
+                                            if let Some(bytes) = serialize_for_broadcast(&broadcast_config, event.clone()) {
                                                 let _ = tx_trades.send(bytes);
+                                            }
+                                            if let Some(frame) = serialize_for_uds(&event) {
+                                                let _ = tx_uds.send(frame);
                                             }
                                             tick_count += 1;
                                         }
@@ -1483,8 +1717,12 @@ async fn start_ibkr_bridge_feed(
                                                 if tick.ts > 0 {
                                                     trad_last_ms.store(tick.ts, Ordering::Relaxed);
                                                 }
-                                                if let Some(bytes) = serialize_for_broadcast(&broadcast_config, trad_tick_event(tick)) {
+                                                let event = trad_tick_event(tick);
+                                                if let Some(bytes) = serialize_for_broadcast(&broadcast_config, event.clone()) {
                                                     let _ = tx_trades.send(bytes);
+                                                }
+                                                if let Some(frame) = serialize_for_uds(&event) {
+                                                    let _ = tx_uds.send(frame);
                                                 }
                                             }
                                         }
@@ -1530,6 +1768,7 @@ async fn start_ibkr_bridge_feed(
 
 async fn start_deribit_options_feed(
     tx_trades: Arc<broadcast::Sender<Bytes>>,
+    tx_uds: Arc<broadcast::Sender<Bytes>>,
     broadcast_config: Arc<BroadcastConfig>,
     spot_cache: Arc<tokio::sync::Mutex<HashMap<String, f64>>>,
     options_cache: Arc<tokio::sync::Mutex<HashMap<String, OptionsContext>>>,
@@ -1586,8 +1825,11 @@ async fn start_deribit_options_feed(
                         kind: "options_chain".to_string(),
                         data: serde_json::to_value(&chain).unwrap_or_default(),
                     };
-                    if let Some(bytes) = serialize_for_broadcast(&broadcast_config, event) {
+                    if let Some(bytes) = serialize_for_broadcast(&broadcast_config, event.clone()) {
                         let _ = tx_trades.send(bytes);
+                    }
+                    if let Some(frame) = serialize_for_uds(&event) {
+                        let _ = tx_uds.send(frame);
                     }
 
                     let spot = spot_cache
@@ -1611,8 +1853,11 @@ async fn start_deribit_options_feed(
                             kind: "options_context".to_string(),
                             data: serde_json::to_value(&ctx).unwrap_or_default(),
                         };
-                        if let Some(bytes) = serialize_for_broadcast(&broadcast_config, ctx_event) {
+                        if let Some(bytes) = serialize_for_broadcast(&broadcast_config, ctx_event.clone()) {
                             let _ = tx_trades.send(bytes);
+                        }
+                        if let Some(frame) = serialize_for_uds(&ctx_event) {
+                            let _ = tx_uds.send(frame);
                         }
                     }
                 }
@@ -1626,6 +1871,7 @@ async fn start_deribit_options_feed(
 
 async fn seed_binance_klines(
     kline_cache: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Candle1m>>>>,
+    tx_uds: Arc<broadcast::Sender<Bytes>>,
     agg_tx: Arc<mpsc::Sender<MarketEventMessage>>,
     tickers: &[String],
 ) {
@@ -1661,6 +1907,9 @@ async fn seed_binance_klines(
                     kind: "candle_backfill".to_string(),
                     data: serde_json::to_value(&payload).unwrap_or_default(),
                 };
+                if let Some(frame) = serialize_for_uds(&event) {
+                    let _ = tx_uds.send(frame);
+                }
                 // Send to aggregator via channel (no mutex!)
                 let _ = agg_tx.send(event).await;
             }
@@ -1820,6 +2069,7 @@ fn vol_regime_label(regime: VolRegime) -> &'static str {
 async fn run_binance_kline_stream(
     ticker: String,
     tx_trades: Arc<broadcast::Sender<Bytes>>,
+    tx_uds: Arc<broadcast::Sender<Bytes>>,
     broadcast_config: Arc<BroadcastConfig>,
     kline_cache: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Candle1m>>>>,
     agg_tx: Arc<mpsc::Sender<MarketEventMessage>>,
@@ -1884,6 +2134,9 @@ async fn run_binance_kline_stream(
                                                 };
                                                 if let Some(bytes) = serialize_for_broadcast(&broadcast_config, event.clone()) {
                                                     let _ = tx_trades.send(bytes);
+                                                }
+                                                if let Some(frame) = serialize_for_uds(&event) {
+                                                    let _ = tx_uds.send(frame);
                                                 }
                                                 // Send to aggregator via channel (no mutex!)
                                                 let _ = agg_tx.try_send(event);
@@ -2984,6 +3237,34 @@ mod tests {
 
         // Verify the bytes are valid UTF-8
         assert!(String::from_utf8(bytes.to_vec()).is_ok(), "Should produce valid UTF-8");
+    }
+
+    #[test]
+    fn test_serialize_for_uds_frame_roundtrip() {
+        #[derive(Deserialize)]
+        enum UdsMessage {
+            Event(MarketEventMessage),
+        }
+
+        let event = test_event();
+        let frame = serialize_for_uds(&event).expect("UDS serialization should succeed");
+        let bytes = frame.to_vec();
+
+        assert!(bytes.len() >= 4, "Frame should include length prefix");
+        let mut len_buf = [0_u8; 4];
+        len_buf.copy_from_slice(&bytes[..4]);
+        let payload_len = u32::from_be_bytes(len_buf) as usize;
+        assert_eq!(payload_len, bytes.len() - 4, "Length prefix should match payload");
+
+        let payload = &bytes[4..];
+        let decoded = rmp_serde::from_slice::<UdsMessage>(payload)
+            .expect("UDS payload should decode");
+        match decoded {
+            UdsMessage::Event(decoded_event) => {
+                assert_eq!(decoded_event.exchange, "TestExchange");
+                assert_eq!(decoded_event.kind, "trade");
+            }
+        }
     }
 
     #[test]
