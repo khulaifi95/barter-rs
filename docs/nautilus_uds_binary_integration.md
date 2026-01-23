@@ -112,6 +112,8 @@ nautilus_trader (BarterDataClientConfig):
 - enabled: bool (default false; or set BARTER_ENABLED=1)
 - uds_path: Option<String> (defaults to /tmp/barter-data.sock)
 - tcp_addr: Option<String> (defaults to 127.0.0.1:9102 on Windows or when set)
+- exchange_filter: Option<Vec<String>> (or set BARTER_EXCHANGES=binance,okx)
+- instrument_filter: Option<Vec<String>> (or set BARTER_INSTRUMENTS=btc-usdt-perp,eth-usdt-spot)
 - data_type: \"barter.market_event\"
 - reconnect_delay_ms: 1000
 - max_frame_bytes: 8MB
