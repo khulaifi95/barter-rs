@@ -79,7 +79,7 @@ fn test_healthy_market_produces_ready_or_caution() {
     let mut orchestrator = StateOrchestrator::new(config, logger);
 
     let snap = healthy_snapshot();
-    let input = build_market_data_input(&snap, TradMarketStatus::Live);
+    let input = build_market_data_input(&snap, None, TradMarketStatus::Live);
     let result = orchestrator.calculate(&input);
 
     // Healthy market should produce Ready or Caution (not Wait)
@@ -105,7 +105,7 @@ fn test_volatile_market_produces_wait_or_caution() {
     let mut orchestrator = StateOrchestrator::new(config, logger);
 
     let snap = volatile_snapshot();
-    let input = build_market_data_input(&snap, TradMarketStatus::Live);
+    let input = build_market_data_input(&snap, None, TradMarketStatus::Live);
     let result = orchestrator.calculate(&input);
 
     // Volatile/shock market should trigger caution or wait
@@ -121,7 +121,7 @@ fn test_distribution_triggers_absorption() {
     let mut orchestrator = StateOrchestrator::new(config, logger);
 
     let snap = distribution_snapshot();
-    let input = build_market_data_input(&snap, TradMarketStatus::Live);
+    let input = build_market_data_input(&snap, None, TradMarketStatus::Live);
     let result = orchestrator.calculate(&input);
 
     // Distribution signal should be detected as absorption
@@ -152,7 +152,7 @@ fn test_stale_price_produces_wait() {
         m
     };
 
-    let input = build_market_data_input(&snap, TradMarketStatus::Live);
+    let input = build_market_data_input(&snap, None, TradMarketStatus::Live);
     let result = orchestrator.calculate(&input);
 
     // Stale data should trigger Wait
@@ -174,7 +174,7 @@ fn test_no_trad_mode_when_trad_unavailable() {
     let mut orchestrator = StateOrchestrator::new(config, logger);
 
     let snap = healthy_snapshot();
-    let input = build_market_data_input(&snap, TradMarketStatus::Unavailable);
+    let input = build_market_data_input(&snap, None, TradMarketStatus::Unavailable);
     let result = orchestrator.calculate(&input);
 
     assert!(result.no_trad_mode, "Should be in NO-TRAD mode");
@@ -188,7 +188,7 @@ fn test_state_transitions_increment_audit_id() {
 
     // First call
     let snap = healthy_snapshot();
-    let input = build_market_data_input(&snap, TradMarketStatus::Live);
+    let input = build_market_data_input(&snap, None, TradMarketStatus::Live);
     let result1 = orchestrator.calculate(&input);
     let id1 = result1.state.audit_id;
 
@@ -211,7 +211,7 @@ fn test_sol_ticker_uses_override_thresholds() {
     snap.ticker = "SOL".to_string();
     snap.realized_vol_trend = VolTrend::Expanding;
 
-    let input = build_market_data_input(&snap, TradMarketStatus::Live);
+    let input = build_market_data_input(&snap, None, TradMarketStatus::Live);
     let result = orchestrator.calculate(&input);
 
     // SOL has lower extreme threshold (90%), so high vol triggers sooner
@@ -228,7 +228,7 @@ fn test_consensus_calculation() {
     let mut orchestrator = StateOrchestrator::new(config, logger);
 
     let snap = mixed_consensus_snapshot();
-    let input = build_market_data_input(&snap, TradMarketStatus::Live);
+    let input = build_market_data_input(&snap, None, TradMarketStatus::Live);
     let result = orchestrator.calculate(&input);
 
     // Mixed consensus: 1 long, 2 short = Short consensus at 66%
@@ -247,14 +247,14 @@ fn test_multiple_tickers_independent() {
 
     // Process BTC
     let btc_snap = healthy_snapshot();
-    let btc_input = build_market_data_input(&btc_snap, TradMarketStatus::Live);
+    let btc_input = build_market_data_input(&btc_snap, None, TradMarketStatus::Live);
     let btc_result = orchestrator.calculate(&btc_input);
 
     // Process ETH (different ticker)
     let mut eth_snap = healthy_snapshot();
     eth_snap.ticker = "ETH".to_string();
     eth_snap.binance_perp_last = Some(3200.0);
-    let eth_input = build_market_data_input(&eth_snap, TradMarketStatus::Live);
+    let eth_input = build_market_data_input(&eth_snap, None, TradMarketStatus::Live);
     let eth_result = orchestrator.calculate(&eth_input);
 
     // Both should produce valid states

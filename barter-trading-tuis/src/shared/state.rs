@@ -1819,7 +1819,20 @@ impl TickerState {
     }
 
     fn push_liquidation(&mut self, liq: LiquidationData, exchange: &str, time: DateTime<Utc>) {
-        let value = liq.price * liq.quantity;
+        // NORMALIZE: OKX reports liquidation quantity in contracts, not base currency
+        // OKX contract sizes: BTC=0.01, ETH=0.1, SOL=1
+        // Binance and Bybit report in base currency already
+        let normalized_quantity = if exchange.to_lowercase().contains("okx") {
+            match self.ticker.as_str() {
+                "BTC" => liq.quantity * 0.01,  // 100 contracts = 1 BTC
+                "ETH" => liq.quantity * 0.1,   // 10 contracts = 1 ETH
+                _ => liq.quantity,              // SOL and others: 1:1
+            }
+        } else {
+            liq.quantity
+        };
+
+        let value = liq.price * normalized_quantity;
         self.liquidations.push_back(LiquidationRecord {
             time,
             side: liq.side,
