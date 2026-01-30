@@ -27,6 +27,7 @@ pub struct BarMetadata {
 
 impl BarMetadata {
     /// Create metadata for a Binance perpetual instrument.
+    #[allow(dead_code)]
     pub fn binance_perp(symbol: &str, price_precision: u8, size_precision: u8) -> Self {
         let instrument_id = format!("{}-PERP.BINANCE", symbol);
         Self {
@@ -62,6 +63,7 @@ pub struct TradeMetadata {
 
 impl TradeMetadata {
     /// Create metadata for a Binance perpetual instrument.
+    #[allow(dead_code)]
     pub fn binance_perp(symbol: &str, price_precision: u8, size_precision: u8) -> Self {
         Self {
             instrument_id: format!("{}-PERP.BINANCE", symbol),

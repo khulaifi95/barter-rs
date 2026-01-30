@@ -35,6 +35,7 @@ pub enum ParquetError {
     #[error("Parquet error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
     #[error("Invalid data: {0}")]
+    #[allow(dead_code)]
     InvalidData(String),
 }
 
@@ -46,6 +47,7 @@ pub struct ParquetConfig {
     /// Flush interval in seconds
     pub flush_interval_secs: u64,
     /// Buffer size for event channel
+    #[allow(dead_code)]
     pub buffer_size: usize,
     /// Enable S3 upload after local write
     pub s3_enabled: bool,

@@ -7,12 +7,14 @@ use tokio::fs;
 use tracing::debug;
 
 /// Local filesystem storage.
+#[allow(dead_code)]
 pub struct LocalStorage {
     base_dir: PathBuf,
 }
 
 impl LocalStorage {
     /// Create a new local storage backend.
+    #[allow(dead_code)]
     pub fn new<P: AsRef<Path>>(base_dir: P) -> Self {
         Self {
             base_dir: base_dir.as_ref().to_path_buf(),
@@ -20,6 +22,7 @@ impl LocalStorage {
     }
 
     /// Get the full path for a relative path.
+    #[allow(dead_code)]
     fn full_path(&self, path: &str) -> PathBuf {
         self.base_dir.join(path)
     }

@@ -14,6 +14,7 @@ const MAX_RETRIES: u32 = 3;
 const RETRY_BASE_DELAY_MS: u64 = 100;
 
 /// S3 storage backend.
+#[allow(dead_code)]
 pub struct S3Storage {
     client: Client,
     bucket: String,
@@ -37,6 +38,7 @@ impl S3Storage {
     }
 
     /// Create from environment variables.
+    #[allow(dead_code)]
     pub async fn from_env() -> Result<Self, StorageError> {
         let bucket = std::env::var("S3_BUCKET")
             .map_err(|_| StorageError::Config("S3_BUCKET not set".to_string()))?;

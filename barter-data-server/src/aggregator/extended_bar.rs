@@ -16,6 +16,7 @@ use barter_instrument::Side;
 pub struct ExtendedBar {
     // Core OHLCV
     pub instrument_id: String,
+    #[allow(dead_code)]
     pub bar_type: String,
     pub open: f64,
     pub high: f64,
@@ -111,6 +112,7 @@ pub struct DepthBands {
 }
 
 impl DepthBands {
+    #[allow(dead_code)]
     pub fn scaled(self, multiplier: f64) -> Self {
         if (multiplier - 1.0).abs() < f64::EPSILON {
             return self;
@@ -208,26 +210,31 @@ impl ExtendedBar {
     /// Get the VWAP for this bar (approximated from OHLC midpoint weighted by volume).
     ///
     /// Note: True VWAP requires tick-by-tick data. This is an approximation.
+    #[allow(dead_code)]
     pub fn approx_vwap(&self) -> f64 {
         (self.open + self.high + self.low + self.close) / 4.0
     }
 
     /// Get the bar range (high - low).
+    #[allow(dead_code)]
     pub fn range(&self) -> f64 {
         self.high - self.low
     }
 
     /// Get the bar body (close - open), positive for bullish.
+    #[allow(dead_code)]
     pub fn body(&self) -> f64 {
         self.close - self.open
     }
 
     /// Check if the bar is bullish (close >= open).
+    #[allow(dead_code)]
     pub fn is_bullish(&self) -> bool {
         self.close >= self.open
     }
 
     /// Get the buy ratio (0.0 - 1.0).
+    #[allow(dead_code)]
     pub fn buy_ratio(&self) -> f64 {
         if self.volume > 0.0 {
             self.buy_volume / self.volume
@@ -373,6 +380,7 @@ impl ExtendedBarBuilder {
     }
 
     /// Reset CVD (e.g., at day boundary).
+    #[allow(dead_code)]
     pub fn reset_cvd(&mut self) {
         self.cvd = 0.0;
     }

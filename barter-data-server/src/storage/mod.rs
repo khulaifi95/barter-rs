@@ -10,6 +10,7 @@ use thiserror::Error;
 
 /// Errors that can occur during storage operations.
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum StorageError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -26,6 +27,7 @@ pub enum StorageError {
 
 /// Trait for storage backends (local filesystem, S3, etc.).
 #[async_trait]
+#[allow(dead_code)]
 pub trait StorageBackend: Send + Sync {
     /// Write data to a path.
     async fn write(&self, path: &str, data: &[u8]) -> Result<(), StorageError>;
@@ -45,6 +47,7 @@ pub trait StorageBackend: Send + Sync {
 
 /// Storage configuration from environment.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct StorageConfig {
     /// Use S3 storage
     pub s3_enabled: bool,
@@ -58,6 +61,7 @@ pub struct StorageConfig {
 
 impl StorageConfig {
     /// Load configuration from environment variables.
+    #[allow(dead_code)]
     pub fn from_env() -> Self {
         let s3_enabled = std::env::var("S3_ENABLED")
             .map(|v| v == "1" || v == "true")
@@ -78,5 +82,6 @@ impl StorageConfig {
     }
 }
 
+#[allow(unused_imports)]
 pub use local::LocalStorage;
 pub use s3::S3Storage;

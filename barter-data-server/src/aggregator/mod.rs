@@ -10,7 +10,11 @@ pub mod depth_bands;
 pub mod extended_bar;
 pub mod minute_bar;
 
+#[allow(unused_imports)]
 pub use delta::DeltaTracker;
+#[allow(unused_imports)]
 pub use depth_bands::compute_depth_bands;
+#[allow(unused_imports)]
 pub use extended_bar::ExtendedBar;
+#[allow(unused_imports)]
 pub use minute_bar::{MinuteBar, MinuteBarBuilder, MinuteBarAggregator};

@@ -86,6 +86,7 @@ pub fn encode_fixed_point(value: f64, mode: PrecisionMode) -> FixedBytes {
 
 /// Encode a floating-point value to a fixed-point i128 using the selected precision.
 #[inline]
+#[allow(dead_code)]
 pub fn encode_fixed_point_i128(value: f64, mode: PrecisionMode) -> i128 {
     (value * mode.multiplier()).round() as i128
 }
@@ -101,6 +102,7 @@ pub fn encode_fixed_point_i64(value: f64) -> i64 {
 ///
 /// Supports both 8-byte and 16-byte formats.
 #[inline]
+#[allow(dead_code)]
 pub fn decode_fixed_point(bytes: &[u8]) -> f64 {
     match bytes.len() {
         8 => {
@@ -119,6 +121,7 @@ pub fn decode_fixed_point(bytes: &[u8]) -> f64 {
 ///
 /// Returns None if the value would overflow i128 after scaling (very unlikely).
 #[inline]
+#[allow(dead_code)]
 pub fn encode_price_checked(value: f64, mode: PrecisionMode) -> Option<FixedBytes> {
     let scaled = value * mode.multiplier();
     if !scaled.is_finite() {

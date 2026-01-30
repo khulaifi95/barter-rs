@@ -51,12 +51,14 @@ impl DeltaTracker {
 
     /// Get the total volume (buy + sell).
     #[inline]
+    #[allow(dead_code)]
     pub fn total_volume(&self) -> f64 {
         self.buy_volume + self.sell_volume
     }
 
     /// Get the buy ratio (0.0 - 1.0).
     #[inline]
+    #[allow(dead_code)]
     pub fn buy_ratio(&self) -> f64 {
         let total = self.total_volume();
         if total > 0.0 {
@@ -67,6 +69,7 @@ impl DeltaTracker {
     }
 
     /// Reset the tracker for the next period.
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.buy_volume = 0.0;
         self.sell_volume = 0.0;
@@ -75,6 +78,7 @@ impl DeltaTracker {
     }
 
     /// Take the current values and reset.
+    #[allow(dead_code)]
     pub fn take(&mut self) -> DeltaTracker {
         let snapshot = self.clone();
         self.reset();
@@ -84,6 +88,7 @@ impl DeltaTracker {
 
 /// Cumulative Volume Delta tracker (persists across bars).
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct CvdTracker {
     /// Cumulative delta since tracking started
     pub cvd: f64,
@@ -91,6 +96,7 @@ pub struct CvdTracker {
     pub bars_processed: u64,
 }
 
+#[allow(dead_code)]
 impl CvdTracker {
     /// Create a new CVD tracker.
     pub fn new() -> Self {

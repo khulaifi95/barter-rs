@@ -53,7 +53,7 @@ mod health;
 mod parquet;
 mod storage;
 
-use parquet::writer::{ParquetConfig, ParquetEvent, TradeEvent, BarEvent, ExtendedBarEvent, run_parquet_writer_task};
+use parquet::writer::{ParquetConfig, ParquetEvent, TradeEvent, ExtendedBarEvent, run_parquet_writer_task};
 use health::heartbeat::{HeartbeatConfig, HeartbeatState, run_heartbeat_task, update_heartbeat_bar};
 use aggregator::minute_bar::MinuteBarAggregator;
 use aggregator::extended_bar::ExtendedBarBuilder;
@@ -319,26 +319,6 @@ fn get_l2_throttle_ms_for_exchange(exchange: &ExchangeId) -> u64 {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(L2_THROTTLE_BINANCE_MS),
-    }
-}
-
-/// Get L2 throttle interval for a given exchange (string-based, for compatibility)
-fn get_l2_throttle_ms(exchange: &str) -> u64 {
-    if exchange.contains("Okx") {
-        std::env::var("L2_THROTTLE_OKX_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(L2_THROTTLE_OKX_MS)
-    } else if exchange.contains("Bybit") {
-        std::env::var("L2_THROTTLE_BYBIT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(L2_THROTTLE_BYBIT_MS)
-    } else {
-        std::env::var("L2_THROTTLE_BINANCE_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(L2_THROTTLE_BINANCE_MS)
     }
 }
 
@@ -745,11 +725,11 @@ enum IbkrMessage {
     #[serde(rename = "tick")]
     Tick(TradMarketTick),
     #[serde(rename = "tick_backfill")]
-    TickBackfill { symbol: String, ticks: Vec<TradMarketTick> },
+    TickBackfill { #[allow(dead_code)] symbol: String, ticks: Vec<TradMarketTick> },
     #[serde(rename = "welcome")]
-    Welcome { #[serde(default)] message: Option<String> },
+    Welcome { #[serde(default)] #[allow(dead_code)] message: Option<String> },
     #[serde(rename = "status")]
-    Status { #[serde(default)] connected: Option<bool> },
+    Status { #[serde(default)] #[allow(dead_code)] connected: Option<bool> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -782,12 +762,15 @@ struct DeribitGreeks {
 #[derive(Debug, Deserialize)]
 struct DeribitTicker {
     instrument_name: String,
+    #[allow(dead_code)]
     open_interest: Option<f64>,
+    #[allow(dead_code)]
     mark_iv: Option<f64>,
     greeks: Option<DeribitGreeks>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct BinanceKline(
     i64,    // 0: Open time
     String, // 1: Open

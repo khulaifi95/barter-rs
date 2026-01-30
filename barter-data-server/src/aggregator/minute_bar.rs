@@ -260,6 +260,7 @@ impl MinuteBarAggregator {
     }
 
     /// Flush all current bars (e.g., at shutdown).
+    #[allow(dead_code)]
     pub fn flush_all(&mut self) -> Vec<MinuteBar> {
         let mut bars = Vec::new();
         for (_, builder) in self.builders.drain() {
@@ -271,6 +272,7 @@ impl MinuteBarAggregator {
     }
 
     /// Get the number of instruments being tracked.
+    #[allow(dead_code)]
     pub fn instrument_count(&self) -> usize {
         self.builders.len()
     }
