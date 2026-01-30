@@ -467,7 +467,7 @@ fn render_scalper_ui(
     snapshot: &AggregatedSnapshot,
     connected: bool,
     focused_ticker: &str,
-    debounced_signals: Option<(Option<DivergenceSignal>, FlowSignal)>,
+    _debounced_signals: Option<(Option<DivergenceSignal>, FlowSignal)>,
     bar_state: &mut BarState,
     bvol24h: Option<f64>,
 ) {
@@ -523,6 +523,7 @@ fn render_scalper_ui(
     render_footer_simple(f, chunks[5], focused_ticker);
 }
 
+#[allow(dead_code)]
 fn render_header(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -609,6 +610,7 @@ fn render_header(
 /// Line 1: Price + Status + Spread
 /// Line 2: VWAP deviation + ATR + Vol regime
 /// Line 3: OI velocity + Basis
+#[allow(dead_code)]
 fn render_header_extended(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -836,6 +838,7 @@ fn render_header_extended(
     f.render_widget(paragraph, area);
 }
 
+#[allow(dead_code)]
 fn render_delta_velocity(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -955,6 +958,7 @@ fn render_delta_velocity(
     f.render_widget(paragraph, area);
 }
 
+#[allow(dead_code)]
 fn render_imbalance(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -1021,6 +1025,7 @@ fn render_imbalance(
     f.render_widget(paragraph, area);
 }
 
+#[allow(dead_code)]
 fn render_tape_speed(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -1090,6 +1095,7 @@ fn render_tape_speed(
 }
 
 /// Compact imbalance panel (2 lines max)
+#[allow(dead_code)]
 fn render_imbalance_compact(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -1148,6 +1154,7 @@ fn render_imbalance_compact(
 }
 
 /// Compact tape speed panel (2 lines max)
+#[allow(dead_code)]
 fn render_tape_speed_compact(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -1297,6 +1304,7 @@ fn render_whale_tape(
     f.render_widget(paragraph, area);
 }
 
+#[allow(dead_code)]
 fn render_per_exchange_strip(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -1427,6 +1435,7 @@ fn normalize_ex(name: &str) -> &str {
     }
 }
 
+#[allow(dead_code)]
 fn render_footer(f: &mut ratatui::Frame, area: Rect, focused_ticker: &str) {
     let hotkeys = vec![
         Span::raw(" ["),
@@ -1989,7 +1998,7 @@ fn render_volatility_new(
         let atr = t.atr_14.unwrap_or(0.0);
         // Use Binance perp price for consistent RV calculation
         let price = t.binance_perp_last.or(t.latest_price).unwrap_or(1.0);
-        let rv = if atr > 0.0 && price > 0.0 { (atr / price) * 100.0 } else { 0.0 };
+        let _rv = if atr > 0.0 && price > 0.0 { (atr / price) * 100.0 } else { 0.0 };
         let trend = match t.realized_vol_trend {
             VolTrend::Expanding => "+EXP",
             VolTrend::Contracting => "+CTR",
@@ -2076,6 +2085,7 @@ fn render_footer_simple(
 }
 
 /// Footer with [B]TC [E]TH [S]OL | OI | RV | LEAD | [q]uit (OLD - unused)
+#[allow(dead_code)]
 fn render_footer_new(
     f: &mut ratatui::Frame,
     area: Rect,

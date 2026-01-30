@@ -5,6 +5,7 @@ use barter_data::{
     streams::{builder::dynamic::DynamicStreams, consumer::MarketStreamResult, reconnect::Event},
     subscription::funding::FundingRate,
     subscription::open_interest::OpenInterest,
+    books::OrderBook,
 };
 use barter_instrument::{
     exchange::ExchangeId,
@@ -26,6 +27,8 @@ use chrono::{DateTime, TimeZone, Utc, Duration as ChronoDuration};
 use futures::{SinkExt, StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use rust_decimal::prelude::ToPrimitive;
+use rustls::crypto::ring::default_provider;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::{AtomicI64, AtomicU64, Ordering}};
@@ -43,6 +46,21 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use bytes::Bytes;
 use tracing::{debug, error, info, warn};
+
+// Parquet/Nautilus integration modules
+mod aggregator;
+mod health;
+mod parquet;
+mod storage;
+
+use parquet::writer::{ParquetConfig, ParquetEvent, TradeEvent, BarEvent, ExtendedBarEvent, run_parquet_writer_task};
+use health::heartbeat::{HeartbeatConfig, HeartbeatState, run_heartbeat_task, update_heartbeat_bar};
+use aggregator::minute_bar::MinuteBarAggregator;
+use aggregator::extended_bar::ExtendedBarBuilder;
+use aggregator::compute_depth_bands;
+
+// Parquet channel drop tracking
+static PARQUET_DROPS: AtomicU64 = AtomicU64::new(0);
 
 // L2 throttling per exchange (OKX is noisier, needs higher throttle)
 const L2_THROTTLE_BINANCE_MS: u64 = 100;
@@ -75,6 +93,38 @@ const L2_THROTTLE_BYBIT_MS: u64 = 100;
 const L2_THROTTLE_OKX_MS: u64 = 150;
 const SNAPSHOT_VERSION: u16 = 2;
 
+/// Map ExchangeId to Nautilus-compatible venue name.
+/// Nautilus expects simple venue names like "BINANCE", "OKX", "BYBIT".
+fn exchange_to_venue(exchange: &barter_instrument::exchange::ExchangeId) -> &'static str {
+    use barter_instrument::exchange::ExchangeId;
+    match exchange {
+        ExchangeId::BinanceFuturesUsd | ExchangeId::BinanceFuturesCoin |
+        ExchangeId::BinanceSpot | ExchangeId::BinanceOptions |
+        ExchangeId::BinancePortfolioMargin | ExchangeId::BinanceUs => "BINANCE",
+        ExchangeId::Okx => "OKX",
+        ExchangeId::BybitPerpetualsUsd | ExchangeId::BybitSpot => "BYBIT",
+        ExchangeId::Coinbase | ExchangeId::CoinbaseInternational => "COINBASE",
+        ExchangeId::Kraken => "KRAKEN",
+        ExchangeId::GateioSpot | ExchangeId::GateioFuturesUsd | ExchangeId::GateioFuturesBtc |
+        ExchangeId::GateioPerpetualsUsd | ExchangeId::GateioPerpetualsBtc |
+        ExchangeId::GateioOptions => "GATEIO",
+        ExchangeId::Htx => "HTX",
+        ExchangeId::Kucoin => "KUCOIN",
+        ExchangeId::Bitfinex => "BITFINEX",
+        ExchangeId::Bitmex => "BITMEX",
+        ExchangeId::Deribit => "DERIBIT",
+        ExchangeId::Poloniex => "POLONIEX",
+        ExchangeId::Bitget => "BITGET",
+        ExchangeId::Gemini => "GEMINI",
+        ExchangeId::Bitstamp => "BITSTAMP",
+        ExchangeId::Bitmart | ExchangeId::BitmartFuturesUsd => "BITMART",
+        // Default for unknown/simulated exchanges
+        _ => "OTHER",
+    }
+}
+
+/// OKX perpetuals report sizes in contracts. Convert to base units using ctVal.
+
 /// Serialization config for broadcast messages (read once at startup)
 /// Also caches hot-path config values to avoid env var parsing per-event
 struct BroadcastConfig {
@@ -87,6 +137,46 @@ struct BroadcastConfig {
     l1_throttle_ms: u64,
     /// Cached spot log threshold (avoids env var parsing in hot path)
     spot_log_threshold: f64,
+}
+
+/// Per-instrument precision configuration for Parquet + bars.
+struct PrecisionConfig {
+    default_price: u8,
+    default_size: u8,
+    map: HashMap<String, (u8, u8)>,
+}
+
+impl PrecisionConfig {
+    fn from_env() -> Self {
+        let default_price = std::env::var("PRICE_PRECISION_DEFAULT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let default_size = std::env::var("SIZE_PRECISION_DEFAULT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+
+        let mut map = HashMap::new();
+        if let Ok(raw) = std::env::var("PRECISION_MAP") {
+            for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+                let Some((instrument_id, prec)) = entry.split_once('=') else { continue };
+                let Some((p_str, s_str)) = prec.split_once(':') else { continue };
+                if let (Ok(p), Ok(s)) = (p_str.parse::<u8>(), s_str.parse::<u8>()) {
+                    map.insert(instrument_id.to_string(), (p, s));
+                }
+            }
+        }
+
+        Self { default_price, default_size, map }
+    }
+
+    fn get(&self, instrument_id: &str) -> (u8, u8) {
+        self.map
+            .get(instrument_id)
+            .copied()
+            .unwrap_or((self.default_price, self.default_size))
+    }
 }
 
 impl BroadcastConfig {
@@ -718,6 +808,11 @@ async fn main() {
     // Initialize logging
     init_logging();
 
+    // Install rustls crypto provider (required for TLS in reqwest/ws)
+    if let Err(e) = default_provider().install_default() {
+        warn!("Rustls crypto provider already installed or failed: {e:?}");
+    }
+
     info!("Starting barter-data WebSocket server");
 
     // Separate channels for trades (hot path) and L2 (high volume, lower priority)
@@ -796,6 +891,72 @@ async fn main() {
     tokio::spawn(async move {
         run_aggregator_task(agg_event_rx, agg_snapshot_tx).await;
     });
+
+    // Parquet writer channel (mpsc for backpressure)
+    // Disabled by default - enable with PARQUET_ENABLED=1
+    let parquet_enabled = std::env::var("PARQUET_ENABLED")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    let parquet_buffer = std::env::var("PARQUET_BUFFER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50_000_usize);
+
+    let (parquet_tx, parquet_rx) = mpsc::channel::<ParquetEvent>(parquet_buffer);
+    let parquet_tx = Arc::new(parquet_tx);
+    let precision_config = Arc::new(PrecisionConfig::from_env());
+
+    // MinuteBarAggregator for building 1m bars from trades
+    // Default precision: price=2 (e.g., $100,000.00), size=3 (e.g., 0.001 BTC)
+    let bar_aggregator = Arc::new(tokio::sync::Mutex::new(MinuteBarAggregator::new(2, 3)));
+
+    // ExtendedBarBuilder per instrument for CVD tracking and extended metrics
+    let extended_bar_builders: Arc<tokio::sync::Mutex<HashMap<String, ExtendedBarBuilder>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    // L2 order book cache per instrument (for depth bands at bar close)
+    let l2_book_cache: Arc<tokio::sync::Mutex<HashMap<String, OrderBook>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    if parquet_enabled {
+        let config = ParquetConfig::from_env();
+        info!(
+            "Parquet writer enabled: output_dir={:?}, flush_interval={}s, buffer={}",
+            config.output_dir, config.flush_interval_secs, parquet_buffer
+        );
+        tokio::spawn(async move {
+            run_parquet_writer_task(parquet_rx, config).await;
+        });
+    } else {
+        info!("Parquet writer disabled (set PARQUET_ENABLED=1 to enable)");
+        // Drop the receiver so the channel closes immediately
+        drop(parquet_rx);
+    }
+
+    // Heartbeat task for health monitoring
+    // Disabled by default - enable with HEARTBEAT_ENABLED=1
+    let heartbeat_enabled = std::env::var("HEARTBEAT_ENABLED")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+
+    // Counters for heartbeat (using Arc since run_heartbeat_task needs ownership)
+    let heartbeat_bars_written = Arc::new(AtomicU64::new(0));
+    let heartbeat_trades_processed = Arc::new(AtomicU64::new(0));
+
+    // Heartbeat state handle for updating symbols/last_bars
+    let heartbeat_state: Option<Arc<tokio::sync::RwLock<HeartbeatState>>> = if heartbeat_enabled {
+        let config = HeartbeatConfig::from_env();
+        info!(
+            "Heartbeat enabled: file={:?}, interval={}s",
+            config.file_path, config.interval_secs
+        );
+        let bars_counter = Arc::clone(&heartbeat_bars_written);
+        let trades_counter = Arc::clone(&heartbeat_trades_processed);
+        // run_heartbeat_task spawns its own task internally and returns state handle
+        Some(run_heartbeat_task(config, bars_counter, trades_counter).await)
+    } else {
+        info!("Heartbeat disabled (set HEARTBEAT_ENABLED=1 to enable)");
+        None
+    };
 
     // Start WebSocket server
     // Configurable via WS_ADDR env var (default: 0.0.0.0:9001)
@@ -1313,6 +1474,234 @@ async fn main() {
                     } else {
                         None
                     };
+
+                    // Send trades/bars to Parquet writer (if enabled).
+                    // Per requirement: only persist PERP data (avoid mixing spot/perp).
+                    // Uses try_send for non-blocking - drops with logging/metrics if full.
+                    if parquet_enabled
+                        && matches!(market_event.instrument.kind, MarketDataInstrumentKind::Perpetual)
+                    {
+                        // Build instrument_id in Nautilus format: {BASE}{QUOTE}-{KIND}.{VENUE}
+                        // e.g., "BTCUSDT-PERP.BINANCE"
+                        let venue = exchange_to_venue(&market_event.exchange);
+                        let instrument_id = format!(
+                            "{}{}-{}.{}",
+                            market_event.instrument.base,
+                            market_event.instrument.quote,
+                            match market_event.instrument.kind {
+                                MarketDataInstrumentKind::Perpetual => "PERP",
+                                MarketDataInstrumentKind::Spot => "SPOT",
+                                _ => "OTHER",
+                            },
+                            venue
+                        ).to_uppercase();
+                        let (price_precision, size_precision) = precision_config.get(&instrument_id);
+
+                        // Update extended bar builder with latest OI/Funding/L1
+                        match &market_event.kind {
+                            DataKind::OpenInterest(oi) => {
+                                let oi_value = oi.contracts;
+                                let mut ext_builders = extended_bar_builders.lock().await;
+                                let ext_builder = ext_builders
+                                    .entry(instrument_id.clone())
+                                    .or_insert_with(ExtendedBarBuilder::new);
+                                ext_builder.update_oi(oi_value);
+                            }
+                            DataKind::FundingRate(fr) => {
+                                let mut ext_builders = extended_bar_builders.lock().await;
+                                let ext_builder = ext_builders
+                                    .entry(instrument_id.clone())
+                                    .or_insert_with(ExtendedBarBuilder::new);
+                                ext_builder.update_funding(fr.rate);
+                            }
+                            DataKind::Liquidation(liq) => {
+                                let notional = liq.price * liq.quantity;
+                                let mut ext_builders = extended_bar_builders.lock().await;
+                                let ext_builder = ext_builders
+                                    .entry(instrument_id.clone())
+                                    .or_insert_with(ExtendedBarBuilder::new);
+                                ext_builder.update_liquidation(notional, liq.side);
+                            }
+                            DataKind::OrderBookL1(l1) => {
+                                let bid = l1.best_bid.and_then(|lvl| lvl.price.to_f64()).unwrap_or(0.0);
+                                let bid_size = l1.best_bid.and_then(|lvl| lvl.amount.to_f64()).unwrap_or(0.0);
+                                let ask = l1.best_ask.and_then(|lvl| lvl.price.to_f64()).unwrap_or(0.0);
+                                let ask_size = l1.best_ask.and_then(|lvl| lvl.amount.to_f64()).unwrap_or(0.0);
+                                if bid > 0.0 && ask > 0.0 {
+                                    let mut ext_builders = extended_bar_builders.lock().await;
+                                    let ext_builder = ext_builders
+                                        .entry(instrument_id.clone())
+                                        .or_insert_with(ExtendedBarBuilder::new);
+                                    ext_builder.update_l1(bid, bid_size, ask, ask_size);
+                                }
+                            }
+                            DataKind::OrderBook(ob_event) => {
+                                let mut cache = l2_book_cache.lock().await;
+                                let book = cache
+                                    .entry(instrument_id.clone())
+                                    .or_insert_with(OrderBook::default);
+                                book.update(ob_event);
+                            }
+                            _ => {}
+                        }
+
+                        if let DataKind::Trade(trade) = &market_event.kind {
+
+                            let ts_init_ns = market_event.time_received
+                                .timestamp_nanos_opt()
+                                .unwrap_or(0) as u64;
+                            let mut ts_event_ns = market_event.time_exchange
+                                .timestamp_nanos_opt()
+                                .unwrap_or(0) as u64;
+                            if ts_event_ns == 0 {
+                                // Fallback to receive time if exchange timestamp is missing/invalid.
+                                ts_event_ns = ts_init_ns;
+                            }
+
+                            let parquet_event = ParquetEvent::Trade(TradeEvent {
+                                instrument_id: instrument_id.clone(),
+                                price: trade.price,
+                                size: trade.amount,
+                                side: Some(trade.side),
+                                trade_id: trade.id.clone(),
+                                ts_event_ns,
+                                ts_init_ns,
+                                price_precision,
+                                size_precision,
+                            });
+
+                            if parquet_tx.try_send(parquet_event).is_err() {
+                                // Log and increment metric - completeness is critical
+                                let drops = PARQUET_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                                if drops % 1000 == 1 {
+                                    warn!("Parquet channel full, trade dropped (total drops: {})", drops);
+                                }
+                            } else {
+                                // Increment heartbeat counter on successful send
+                                heartbeat_trades_processed.fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            // Aggregate trades into 1-minute bars
+                            // When a minute boundary is crossed, emit the completed bar
+                            let completed_bar = {
+                                let mut aggregator = bar_aggregator.lock().await;
+                                aggregator.process_trade(
+                                    &instrument_id,
+                                    trade.price,
+                                    trade.amount,
+                                    Some(trade.side),
+                                    ts_event_ns,
+                                    price_precision,
+                                    size_precision,
+                                )
+                            };
+
+                            if let Some(completed_bar) = completed_bar {
+                                // Send completed bar to Parquet writer (Nautilus-compatible core bar)
+                                // BLOCKING SEND: Core bars must never be dropped per PRD
+                                let bar_event = ParquetEvent::Bar(completed_bar.to_bar_event());
+                                if parquet_tx.send(bar_event).await.is_err() {
+                                    // Channel closed - receiver dropped
+                                    error!("Parquet channel closed, cannot send bar");
+                                } else {
+                                    // Increment heartbeat bar counter
+                                    heartbeat_bars_written.fetch_add(1, Ordering::Relaxed);
+
+                                    // Update heartbeat state with symbol and last bar time
+                                    if let Some(ref state) = heartbeat_state {
+                                        let bar_time = chrono::DateTime::from_timestamp_nanos(
+                                            completed_bar.ts_close_ns as i64,
+                                        );
+                                        update_heartbeat_bar(
+                                            state,
+                                            &completed_bar.instrument_id,
+                                            bar_time,
+                                        )
+                                        .await;
+                                    }
+
+                                    debug!(
+                                        "Emitted 1m bar for {} close={} vol={:.4} trades={}",
+                                        completed_bar.instrument_id,
+                                        completed_bar.close,
+                                        completed_bar.volume,
+                                        completed_bar.trade_count
+                                    );
+                                }
+
+                                // Compute L2 depth bands from latest order book snapshot (if available)
+                                let depth_bands = {
+                                    let cache = l2_book_cache.lock().await;
+                                    cache
+                                        .get(&instrument_id)
+                                        .and_then(|book| compute_depth_bands(book))
+                                };
+
+                                // Also create and send extended bar (Barter-only, with CVD/delta)
+                                let extended_bar = {
+                                    let mut ext_builders = extended_bar_builders.lock().await;
+                                    let ext_builder = ext_builders
+                                        .entry(instrument_id.clone())
+                                        .or_insert_with(ExtendedBarBuilder::new);
+                                    ext_builder.update_depth_bands(depth_bands);
+                                    ext_builder.build(completed_bar)
+                                };
+
+                                let ext_bar_event = ParquetEvent::ExtendedBar(ExtendedBarEvent {
+                                    instrument_id: extended_bar.instrument_id,
+                                    ts_event_ns: extended_bar.ts_close_ns,
+                                    ts_init_ns: extended_bar.ts_init_ns,
+                                    ts_open_ns: extended_bar.ts_open_ns,
+                                    open: extended_bar.open,
+                                    high: extended_bar.high,
+                                    low: extended_bar.low,
+                                    close: extended_bar.close,
+                                    volume: extended_bar.volume,
+                                    quote_volume: extended_bar.quote_volume,
+                                    trade_count: extended_bar.trade_count,
+                                    buy_volume: extended_bar.buy_volume,
+                                    sell_volume: extended_bar.sell_volume,
+                                    delta: extended_bar.delta,
+                                    cvd: extended_bar.cvd,
+                                    open_interest: extended_bar.open_interest,
+                                    oi_change: extended_bar.oi_change,
+                                    funding_rate: extended_bar.funding_rate,
+                                    bid_price: extended_bar.bid_price,
+                                    bid_size: extended_bar.bid_size,
+                                    ask_price: extended_bar.ask_price,
+                                    ask_size: extended_bar.ask_size,
+                                    spread_bps: extended_bar.spread_bps,
+                                    book_imbalance: extended_bar.book_imbalance,
+                                    liq_buy_usd: extended_bar.liq_buy_usd,
+                                    liq_sell_usd: extended_bar.liq_sell_usd,
+                                    liq_total_usd: extended_bar.liq_total_usd,
+                                    liq_count: extended_bar.liq_count,
+                                    bid_depth_10bps_base: extended_bar.bid_depth_10bps_base,
+                                    ask_depth_10bps_base: extended_bar.ask_depth_10bps_base,
+                                    bid_depth_10bps_usd: extended_bar.bid_depth_10bps_usd,
+                                    ask_depth_10bps_usd: extended_bar.ask_depth_10bps_usd,
+                                    depth_imb_10bps: extended_bar.depth_imb_10bps,
+                                    bid_depth_50bps_base: extended_bar.bid_depth_50bps_base,
+                                    ask_depth_50bps_base: extended_bar.ask_depth_50bps_base,
+                                    bid_depth_50bps_usd: extended_bar.bid_depth_50bps_usd,
+                                    ask_depth_50bps_usd: extended_bar.ask_depth_50bps_usd,
+                                    depth_imb_50bps: extended_bar.depth_imb_50bps,
+                                    bid_depth_100bps_base: extended_bar.bid_depth_100bps_base,
+                                    ask_depth_100bps_base: extended_bar.ask_depth_100bps_base,
+                                    bid_depth_100bps_usd: extended_bar.bid_depth_100bps_usd,
+                                    ask_depth_100bps_usd: extended_bar.ask_depth_100bps_usd,
+                                    depth_imb_100bps: extended_bar.depth_imb_100bps,
+                                    price_precision: extended_bar.price_precision,
+                                    size_precision: extended_bar.size_precision,
+                                });
+
+                                // BLOCKING SEND: Extended bars should also not be dropped
+                                if parquet_tx.send(ext_bar_event).await.is_err() {
+                                    error!("Parquet channel closed, cannot send extended bar");
+                                }
+                            }
+                        }
+                    }
 
                     // L2 orderbook events: apply per-exchange throttle and route to L2 channel
                     if is_orderbook_l2 {

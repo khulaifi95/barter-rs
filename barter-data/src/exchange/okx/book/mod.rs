@@ -6,6 +6,7 @@ use crate::{
     event::{MarketEvent, MarketIter},
     subscription::book::OrderBookEvent,
 };
+use super::ctval;
 use barter_instrument::exchange::ExchangeId;
 use barter_integration::subscription::SubscriptionId;
 use chrono::{DateTime, TimeZone, Utc};
@@ -179,11 +180,29 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, OkxOrderBookMessage)>
                     return Self(vec![]);
                 };
 
+                let multiplier = ctval::ctval_multiplier_dec(&payload.arg.inst_id);
+                let bids = data
+                    .bids
+                    .into_iter()
+                    .map(|lvl| Level {
+                        price: lvl.price,
+                        amount: lvl.amount * multiplier,
+                    })
+                    .collect::<Vec<_>>();
+                let asks = data
+                    .asks
+                    .into_iter()
+                    .map(|lvl| Level {
+                        price: lvl.price,
+                        amount: lvl.amount * multiplier,
+                    })
+                    .collect::<Vec<_>>();
+
                 let orderbook = OrderBook::new(
                     0, // OKX doesn't provide sequence number in the same way
                     Some(data.ts),
-                    data.bids,
-                    data.asks,
+                    bids,
+                    asks,
                 );
 
                 let kind = match payload.action {
@@ -202,6 +221,7 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, OkxOrderBookMessage)>
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {

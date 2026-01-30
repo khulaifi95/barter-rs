@@ -14,8 +14,8 @@ use std::{
 };
 
 use barter_trading_tuis::{
-    Aggregator, ConnectionStatus, OrchestratorResult, TickerSnapshot, WebSocketClient,
-    WebSocketConfig, TradMarketState, TradeData,
+    Aggregator, ConnectionStatus, OrchestratorResult, WebSocketClient, WebSocketConfig,
+    TradMarketState, TradeData,
 };
 use barter_trading_tuis::shared::types::TradTickData;
 use barter_trading_tuis::views::{ActiveView, ViewContext};
@@ -46,54 +46,6 @@ fn get_tickers() -> Vec<String> {
 /// Get WebSocket URL from WS_URL env var (default: ws://127.0.0.1:9001)
 fn get_ws_url() -> String {
     std::env::var("WS_URL").unwrap_or_else(|_| "ws://127.0.0.1:9001".to_string())
-}
-
-const BINANCE_PRICE_STALE_SECS: f64 = 2.0;
-
-fn binance_perp_age(snapshot: &TickerSnapshot) -> Option<f64> {
-    snapshot
-        .exchange_health
-        .iter()
-        .filter_map(|(name, age)| {
-            let name = name.to_lowercase();
-            if name.contains("binancefutures")
-                || name.contains("binancefuturesusd")
-                || (name.contains("binance") && name.contains("futures"))
-            {
-                Some(*age)
-            } else {
-                None
-            }
-        })
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .or_else(|| {
-            snapshot
-                .exchange_health
-                .iter()
-                .filter_map(|(name, age)| {
-                    if name.to_lowercase().contains("binance") {
-                        Some(*age)
-                    } else {
-                        None
-                    }
-                })
-                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        })
-}
-
-fn resolve_spot_price(snapshot: &TickerSnapshot) -> f64 {
-    let binance_fresh = binance_perp_age(snapshot)
-        .map(|age| age <= BINANCE_PRICE_STALE_SECS)
-        .unwrap_or(true);
-    if binance_fresh {
-        snapshot
-            .binance_perp_last
-            .filter(|&p| p > 0.0)
-            .or(snapshot.latest_price)
-            .unwrap_or(0.0)
-    } else {
-        snapshot.latest_price.unwrap_or(0.0)
-    }
 }
 
 fn tickers() -> &'static [String] {

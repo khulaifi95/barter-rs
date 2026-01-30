@@ -7,7 +7,7 @@ use crate::shared::types::{
     CvdData, FundingRateData, LiquidationData, MarketEventMessage, MarketSnapshotMessage,
     OpenInterestData, OrderBookL1Data, Side, SnapshotPerExchangeShort, TradeData,
 };
-use chrono::{DateTime, Duration as ChronoDuration, Datelike, Timelike, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -25,6 +25,31 @@ const USD_WALL_NORMAL: f64 = 25_000_000.0;
 const USD_WALL_LARGE: f64 = 50_000_000.0;
 const USD_WALL_HUGE: f64 = 100_000_000.0;
 const FUNDING_LOOKBACK_SECS: i64 = 15 * 60;
+
+// ============================================================================
+// EXPERIMENTAL SIGNAL THRESHOLDS (TUI ONLY - NOT VALIDATED)
+// Last reviewed: 2026-01-30
+// TODO: Move to config after validation
+// ============================================================================
+// CVD divergence (5m)
+const CVD_DIV_PRICE_PCT_5M: f64 = 0.0005; // 0.05%
+const CVD_DIV_THRESH_5M_BTC: f64 = 50_000.0;
+const CVD_DIV_THRESH_5M_ETH: f64 = 20_000.0;
+const CVD_DIV_THRESH_5M_ALT: f64 = 5_000.0;
+// CVD divergence (15s)
+const CVD_DIV_PRICE_PCT_15S: f64 = 0.0003; // 0.03%
+const CVD_DIV_THRESH_15S_BTC: f64 = 10_000.0;
+const CVD_DIV_THRESH_15S_ETH: f64 = 5_000.0;
+const CVD_DIV_THRESH_15S_ALT: f64 = 2_000.0;
+// Flow signal (1m)
+const FLOW_PRICE_FLAT_PCT: f64 = 0.02; // ±0.02% considered flat
+const FLOW_CVD_SIGNIFICANT_BTC: f64 = 100_000.0;
+const FLOW_CVD_SIGNIFICANT_ETH: f64 = 50_000.0;
+const FLOW_CVD_SIGNIFICANT_ALT: f64 = 10_000.0;
+// Basis momentum (P1)
+const BASIS_TREND_THRESHOLD_BTC: f64 = 50.0;
+const BASIS_TREND_THRESHOLD_ETH: f64 = 5.0;
+const BASIS_TREND_THRESHOLD_ALT: f64 = 0.5;
 
 // ============================================================================
 // VWAP & ATR Configuration
@@ -190,15 +215,6 @@ impl TradingSession {
             TradingSession::USLate => "US-LATE",
         }
     }
-
-    fn start_hour(&self) -> u32 {
-        match self {
-            TradingSession::Asia => 0,
-            TradingSession::Europe => 8,
-            TradingSession::US => 14,
-            TradingSession::USLate => 22,
-        }
-    }
 }
 
 /// Volatility trend indicator
@@ -234,6 +250,7 @@ impl VolTrend {
 
 /// Binance kline response format
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct BinanceKline(
     i64,    // 0: Open time
     String, // 1: Open
@@ -258,7 +275,7 @@ pub struct BackfillResult {
 }
 
 /// Fetch 5m candles from Binance and return parsed candles
-pub async fn fetch_binance_5m_candles(symbol: &str) -> Result<Vec<Candle5m>, String> {
+async fn fetch_binance_5m_candles(symbol: &str) -> Result<Vec<Candle5m>, String> {
     // Calculate start time: 00:00 UTC today
     let now = Utc::now();
     let start_of_day = now
@@ -425,20 +442,6 @@ fn whale_multiplier() -> f64 {
     })
 }
 
-/// Per-ticker mega whale thresholds (env: MEGA_WHALE_BTC/ETH/SOL, fallback MEGA_WHALE_THRESHOLD default $500k)
-fn mega_whale_threshold(ticker: &str) -> f64 {
-    let key = format!("MEGA_WHALE_{}", ticker);
-    std::env::var(&key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .or_else(|| {
-            std::env::var("MEGA_WHALE_THRESHOLD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(500_000.0)
-}
-
 /// Get max whales buffer size from MAX_WHALES env var (default: 500)
 fn max_whales() -> usize {
     static MAX_WHALES: OnceLock<usize> = OnceLock::new();
@@ -563,6 +566,7 @@ pub struct TickerSnapshot {
     pub whales: Vec<WhaleRecord>,
     pub liquidations: Vec<LiquidationCluster>,
     pub liq_rate_per_min: f64,
+    pub liq_count_per_min: f64,
     pub liq_bucket: f64,
     pub cascade_risk: f64,
     pub next_cascade_level: Option<CascadeLevel>,
@@ -1136,7 +1140,6 @@ struct TradeRecord {
     amount: f64,
     exchange: String,
     usd: f64,
-    is_spot: bool,
     is_perp: bool,
 }
 
@@ -1146,7 +1149,6 @@ struct LiquidationRecord {
     side: Side,
     price: f64,
     value: f64,
-    exchange: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1170,7 +1172,6 @@ struct OiRecord {
 struct BasisRecord {
     time: DateTime<Utc>,
     basis_usd: f64,
-    basis_pct: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -1181,8 +1182,6 @@ struct TickerState {
     // Per-exchange whale buffers to avoid a single venue dominating
     whales_by_exchange: HashMap<String, VecDeque<WhaleRecord>>,
     liquidations: VecDeque<LiquidationRecord>,
-    // Rolling CVD deltas per exchange (time, delta_quote)
-    cvd_deltas_by_exchange: HashMap<String, VecDeque<(DateTime<Utc>, f64)>>,
     cvd_history: VecDeque<CvdRecord>, // snapshots of total CVD (used for divergence)
     // P1: OI time-series for velocity calculation
     oi_by_exchange: HashMap<String, f64>,
@@ -1246,7 +1245,6 @@ impl TickerState {
             last_trade_time: None,
             whales_by_exchange: HashMap::new(),
             liquidations: VecDeque::new(),
-            cvd_deltas_by_exchange: HashMap::new(),
             cvd_history: VecDeque::new(),
             oi_by_exchange: HashMap::new(),
             oi_history: VecDeque::new(),
@@ -1588,29 +1586,15 @@ impl TickerState {
         is_spot: bool,
         is_perp: bool,
     ) {
-        // NORMALIZE: OKX reports trade amounts in contracts, not base currency
-        // OKX contract sizes: BTC=0.01, ETH=0.1, SOL=1
-        // Binance and Bybit report in base currency already
-        let normalized_amount = if exchange.to_lowercase().contains("okx") && is_perp {
-            match self.ticker.as_str() {
-                "BTC" => trade.amount * 0.01,  // 100 contracts = 1 BTC
-                "ETH" => trade.amount * 0.1,   // 10 contracts = 1 ETH
-                _ => trade.amount,              // SOL and others: 1:1
-            }
-        } else {
-            trade.amount
-        };
-
-        let usd = trade.price * normalized_amount;
+        let usd = trade.price * trade.amount;
         let side = trade.side.clone();
         let record = TradeRecord {
             time,
             side: side.clone(),
             price: trade.price,
-            amount: normalized_amount,  // Use normalized amount for VWAP, etc.
+            amount: trade.amount,
             exchange: exchange.to_string(),
             usd,
-            is_spot,
             is_perp,
         };
 
@@ -1714,13 +1698,13 @@ impl TickerState {
 
         // Update VWAP and ATR (perps only for consistency)
         if is_perp {
-            self.update_vwap(trade.price, normalized_amount, time);
+            self.update_vwap(trade.price, trade.amount, time);
             // Only update trade-based candles if kline metrics are NOT available (fallback only)
             // When kline metrics are active, tvVWAP/ATR/RV come from authoritative 1m klines
             if !self.use_kline_metrics {
                 let is_binance = exchange.to_lowercase().contains("binance");
                 if is_binance {
-                    self.update_candle(trade.price, normalized_amount, time);
+                    self.update_candle(trade.price, trade.amount, time);
                 }
             }
         }
@@ -1818,33 +1802,19 @@ impl TickerState {
         }
     }
 
-    fn push_liquidation(&mut self, liq: LiquidationData, exchange: &str, time: DateTime<Utc>) {
-        // NORMALIZE: OKX reports liquidation quantity in contracts, not base currency
-        // OKX contract sizes: BTC=0.01, ETH=0.1, SOL=1
-        // Binance and Bybit report in base currency already
-        let normalized_quantity = if exchange.to_lowercase().contains("okx") {
-            match self.ticker.as_str() {
-                "BTC" => liq.quantity * 0.01,  // 100 contracts = 1 BTC
-                "ETH" => liq.quantity * 0.1,   // 10 contracts = 1 ETH
-                _ => liq.quantity,              // SOL and others: 1:1
-            }
-        } else {
-            liq.quantity
-        };
-
-        let value = liq.price * normalized_quantity;
+    fn push_liquidation(&mut self, liq: LiquidationData, _exchange: &str, time: DateTime<Utc>) {
+        let value = liq.price * liq.quantity;
         self.liquidations.push_back(LiquidationRecord {
             time,
             side: liq.side,
             price: liq.price,
             value,
-            exchange: exchange.to_string(),
         });
 
         self.prune(time);
     }
 
-    fn push_cvd(&mut self, exchange: &str, cvd: CvdData, time: DateTime<Utc>) {
+    fn push_cvd(&mut self, _exchange: &str, _cvd: CvdData, time: DateTime<Utc>) {
         // We now derive CVD from trades; keep minimal pruning of history
         let cutoff = time - ChronoDuration::seconds(CVD_RETENTION_SECS);
         while let Some(front) = self.cvd_history.front() {
@@ -1856,21 +1826,8 @@ impl TickerState {
         }
     }
 
-    fn push_oi(&mut self, exchange: &str, contracts: f64, exchange_time: DateTime<Utc>) {
-        // NORMALIZE: OKX reports raw contracts, not base currency
-        // OKX contract sizes: BTC=0.01, ETH=0.1, SOL=1
-        // Binance and Bybit report in base currency already
-        let normalized = if exchange.to_lowercase().contains("okx") {
-            match self.ticker.as_str() {
-                "BTC" => contracts * 0.01,  // 100 contracts = 1 BTC
-                "ETH" => contracts * 0.1,   // 10 contracts = 1 ETH
-                _ => contracts,              // SOL and others: 1:1
-            }
-        } else {
-            contracts
-        };
-
-        self.oi_by_exchange.insert(exchange.to_string(), normalized);
+    fn push_oi(&mut self, exchange: &str, contracts: f64, _exchange_time: DateTime<Utc>) {
+        self.oi_by_exchange.insert(exchange.to_string(), contracts);
 
         // P1: Track OI time-series for velocity calculation
         let now = Utc::now();
@@ -1888,7 +1845,7 @@ impl TickerState {
             .or_insert_with(VecDeque::new);
         deque.push_back(OiRecord {
             time: now,
-            total: normalized,
+            total: contracts,
         });
 
         // Prune old OI records
@@ -1992,12 +1949,7 @@ impl TickerState {
         if let (Some(spot), Some(perp)) = (self.spot_mid, self.perp_mid) {
             if spot > 0.0 {
                 let basis_usd = perp - spot;
-                let basis_pct = (basis_usd / spot) * 100.0;
-                self.basis_history.push_back(BasisRecord {
-                    time,
-                    basis_usd,
-                    basis_pct,
-                });
+                self.basis_history.push_back(BasisRecord { time, basis_usd });
 
                 // Prune old basis records
                 let cutoff = time - ChronoDuration::seconds(BASIS_RETENTION_SECS);
@@ -2146,7 +2098,8 @@ impl TickerState {
         // Bump to 120 so the tape captures more of the last 5m without losing venue balance.
         let whales: Vec<WhaleRecord> = self.fair_whale_selection(120);
         let (clusters, cascade_risk, next_level, protection_level) = self.liquidation_clusters();
-        let liq_rate_per_min = self.liquidation_rate_per_min();
+        let liq_rate_per_min = self.liquidation_usd_per_min();
+        let liq_count_per_min = self.liquidation_count_per_min();
         let liq_bucket = self.liquidation_bucket_size();
         let cvd = self.cvd_summary();
         // P0: Multi-timeframe CVD (5s, 15s, 30s for scalper; 1m, 5m, 15m for swing)
@@ -2274,6 +2227,7 @@ impl TickerState {
             whales,
             liquidations: clusters,
             liq_rate_per_min,
+            liq_count_per_min,
             liq_bucket,
             cascade_risk,
             next_cascade_level: next_level,
@@ -2904,7 +2858,22 @@ impl TickerState {
         }
     }
 
-    fn liquidation_rate_per_min(&self) -> f64 {
+    /// Liquidation USD notional per minute (averaged over LIQ_RETENTION_SECS).
+    fn liquidation_usd_per_min(&self) -> f64 {
+        let now = Utc::now();
+        let cutoff = now - ChronoDuration::seconds(LIQ_RETENTION_SECS);
+        let total_usd: f64 = self
+            .liquidations
+            .iter()
+            .rev()
+            .take_while(|liq| liq.time >= cutoff)
+            .map(|liq| liq.value)
+            .sum();
+        total_usd / (LIQ_RETENTION_SECS as f64 / 60.0)
+    }
+
+    /// Liquidation count per minute (averaged over LIQ_RETENTION_SECS).
+    fn liquidation_count_per_min(&self) -> f64 {
         let now = Utc::now();
         let cutoff = now - ChronoDuration::seconds(LIQ_RETENTION_SECS);
         let count = self
@@ -3202,13 +3171,11 @@ impl TickerState {
                 .unwrap_or(0.0);
 
         // P0: Tighten thresholds for more actionable signals
-        // Price threshold: 0.05% instead of 0.1% (more sensitive)
-        let price_threshold = self.latest_price().unwrap_or(1.0) * 0.0005;
-        // CVD threshold scaled by asset: BTC needs higher, alts lower
+        let price_threshold = self.latest_price().unwrap_or(1.0) * CVD_DIV_PRICE_PCT_5M;
         let cvd_threshold = match self.ticker.as_str() {
-            "BTC" => 50_000.0,  // $50K for BTC (was $1K - too sensitive)
-            "ETH" => 20_000.0,  // $20K for ETH
-            _ => 5_000.0,       // $5K for alts
+            "BTC" => CVD_DIV_THRESH_5M_BTC,
+            "ETH" => CVD_DIV_THRESH_5M_ETH,
+            _ => CVD_DIV_THRESH_5M_ALT,
         };
 
         let price_up = price_trend > price_threshold;
@@ -3252,11 +3219,11 @@ impl TickerState {
         let cvd_15s = self.cvd_total(15);
 
         // Tighter thresholds for 15s window (more sensitive for scalping)
-        let price_threshold = price_end * 0.0003; // 0.03% price move in 15s
+        let price_threshold = price_end * CVD_DIV_PRICE_PCT_15S;
         let cvd_threshold = match self.ticker.as_str() {
-            "BTC" => 10_000.0,  // $10K CVD for BTC in 15s
-            "ETH" => 5_000.0,   // $5K for ETH
-            _ => 2_000.0,       // $2K for alts
+            "BTC" => CVD_DIV_THRESH_15S_BTC,
+            "ETH" => CVD_DIV_THRESH_15S_ETH,
+            _ => CVD_DIV_THRESH_15S_ALT,
         };
 
         let price_up = price_change > price_threshold;
@@ -3417,11 +3384,11 @@ impl TickerState {
 
         // Thresholds for signal detection (tightened from original)
         // P0: Use 48-52% band (±2% from neutral) instead of 45-55%
-        let price_flat_threshold = 0.02; // ±0.02% considered flat
+        let price_flat_threshold = FLOW_PRICE_FLAT_PCT; // percent units
         let cvd_significant = match self.ticker.as_str() {
-            "BTC" => 100_000.0,  // $100K CVD significant for BTC
-            "ETH" => 50_000.0,   // $50K for ETH
-            _ => 10_000.0,       // $10K for alts
+            "BTC" => FLOW_CVD_SIGNIFICANT_BTC,
+            "ETH" => FLOW_CVD_SIGNIFICANT_ETH,
+            _ => FLOW_CVD_SIGNIFICANT_ALT,
         };
 
         let price_flat = price_pct_change.abs() < price_flat_threshold;
@@ -3506,9 +3473,9 @@ impl TickerState {
 
         // Higher thresholds to avoid flickering - require significant moves
         let threshold = match self.ticker.as_str() {
-            "BTC" => 50.0,   // $50 change significant for BTC (was $5)
-            "ETH" => 5.0,    // $5 for ETH (was $1)
-            _ => 0.5,        // $0.50 for alts (was $0.10)
+            "BTC" => BASIS_TREND_THRESHOLD_BTC,
+            "ETH" => BASIS_TREND_THRESHOLD_ETH,
+            _ => BASIS_TREND_THRESHOLD_ALT,
         };
 
         // Signal threshold even higher - only show signal for strong moves
@@ -3546,6 +3513,36 @@ impl TickerState {
             trend,
             signal,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::types::LiquidationData;
+
+    #[test]
+    fn test_liquidation_usd_and_count_per_min() {
+        let mut state = TickerState::new("BTC".to_string());
+        let now = Utc::now();
+
+        // Three liquidations totaling $30,000
+        let liqs = vec![
+            LiquidationData { side: Side::Buy, price: 100.0, quantity: 100.0, time: now },
+            LiquidationData { side: Side::Sell, price: 200.0, quantity: 50.0, time: now },
+            LiquidationData { side: Side::Buy, price: 50.0, quantity: 200.0, time: now },
+        ];
+
+        for liq in liqs {
+            state.push_liquidation(liq, "Binance", now);
+        }
+
+        let usd_per_min = state.liquidation_usd_per_min();
+        let count_per_min = state.liquidation_count_per_min();
+
+        // LIQ_RETENTION_SECS = 600 => per-min avg divides by 10
+        assert!((usd_per_min - 3000.0).abs() < 1e-6);
+        assert!((count_per_min - 0.3).abs() < 1e-6);
     }
 }
 

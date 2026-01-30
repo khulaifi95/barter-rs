@@ -225,7 +225,6 @@ async fn run_websocket_loop(
                 let mut lag_breach_since: Option<std::time::Instant> = None;
 
                 // Main message reading loop
-                let mut should_break = false;
                 loop {
                     tokio::select! {
                         _ = stale_interval.tick() => {
@@ -234,7 +233,6 @@ async fn run_websocket_loop(
                                     "WebSocket stale (no data for {:?}), reconnecting...",
                                     config.stale_timeout
                                 );
-                                should_break = true;
                                 break;
                             }
                             if last_trade_event.elapsed() > config.trade_stale_timeout {
@@ -242,7 +240,6 @@ async fn run_websocket_loop(
                                     "WebSocket trade stale (no trades for {:?}), reconnecting...",
                                     config.trade_stale_timeout
                                 );
-                                should_break = true;
                                 break;
                             }
                         }
@@ -284,7 +281,6 @@ async fn run_websocket_loop(
                                                                         "WebSocket lag stale ({}ms), reconnecting...",
                                                                         lag_ms
                                                                     );
-                                                                    should_break = true;
                                                                     break;
                                                                 }
                                                             }
@@ -296,7 +292,6 @@ async fn run_websocket_loop(
                                                         Ok(()) => {}
                                                         Err(mpsc::error::TrySendError::Closed(_)) => {
                                                             warn!("Event receiver dropped, stopping client");
-                                                            should_break = true;
                                                             break;
                                                         }
                                                         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -360,7 +355,6 @@ async fn run_websocket_loop(
                                                                         "WebSocket lag stale ({}ms), reconnecting...",
                                                                         lag_ms
                                                                     );
-                                                                    should_break = true;
                                                                     break;
                                                                 }
                                                             }
@@ -372,7 +366,6 @@ async fn run_websocket_loop(
                                                         Ok(()) => {}
                                                         Err(mpsc::error::TrySendError::Closed(_)) => {
                                                             warn!("Event receiver dropped, stopping client");
-                                                            should_break = true;
                                                             break;
                                                         }
                                                         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -396,7 +389,6 @@ async fn run_websocket_loop(
                                         }
                                         Message::Close(_) => {
                                             info!("Server closed connection");
-                                            should_break = true;
                                             break;
                                         }
                                         Message::Ping(_) | Message::Pong(_) => {
@@ -407,12 +399,10 @@ async fn run_websocket_loop(
                                 }
                                 Some(Err(e)) => {
                                     error!("WebSocket error: {}", e);
-                                    should_break = true;
                                     break;
                                 }
                                 None => {
                                     info!("WebSocket stream ended");
-                                    should_break = true;
                                     break;
                                 }
                             }
@@ -426,9 +416,7 @@ async fn run_websocket_loop(
                 // Notify disconnection
                 let _ = status_tx.send(ConnectionStatus::Disconnected).await;
 
-                if should_break {
-                    warn!("Connection closed, will reconnect...");
-                }
+                warn!("Connection closed, will reconnect...");
             }
             Err(e) => {
                 error!("Failed to connect to {}: {}", config.url, e);

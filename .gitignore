@@ -34,3 +34,6 @@ run_tui2.sh
 run_tui3.sh
 target/
 .gemini-clipboard/
+.geminiignore
+HANDOFF_EXCHANGE_CONNECTION_ISSUES.md
+HANDOFF_LATENCY_OPTIMIZATION.md

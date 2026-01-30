@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use super::aggregator::{BarBuffer, MicroBar, MicroBarAggregator};
+use super::aggregator::{BarBuffer, MicroBarAggregator};
 use super::calc::{calc_correlation, calc_divergence_zscore, calc_lead_lag, calc_return};
 
 /// Computed signals for display

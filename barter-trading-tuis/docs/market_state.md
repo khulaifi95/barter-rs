@@ -425,6 +425,7 @@ pub struct FuelInput {
     pub rvol_5m: f64,            // vol_5m / (vol_1h / 12)
     pub oi_delta_usd_5m: f64,    // OI delta (USD)
     pub liq_rate_usd_per_min: f64,
+    pub liq_count_per_min: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]

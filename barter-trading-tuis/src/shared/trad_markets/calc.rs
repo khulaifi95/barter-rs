@@ -106,11 +106,6 @@ pub fn calc_lead_lag(
     (best_lag, best_corr)
 }
 
-/// Convert lag in bars to seconds for display
-pub fn lag_to_seconds(lag_bars: i32, bar_duration_secs: u64) -> i32 {
-    lag_bars * bar_duration_secs as i32
-}
-
 /// Calculate percentage return over a window of bars
 pub fn calc_return(bars: &[&super::aggregator::MicroBar]) -> f64 {
     if bars.len() < 2 {

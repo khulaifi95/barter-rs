@@ -57,14 +57,6 @@ fn get_ws_url() -> String {
     std::env::var("WS_URL").unwrap_or_else(|_| "ws://127.0.0.1:9001".to_string())
 }
 
-/// Get mega whale threshold from MEGA_WHALE_THRESHOLD env var (default: $5,000,000)
-fn mega_whale_threshold() -> f64 {
-    std::env::var("MEGA_WHALE_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5_000_000.0)
-}
-
 /// Get liq display danger threshold from LIQ_DISPLAY_DANGER_THRESHOLD env var (default: $1,000,000)
 fn liq_display_danger_threshold() -> f64 {
     std::env::var("LIQ_DISPLAY_DANGER_THRESHOLD")
@@ -1080,7 +1072,7 @@ struct AggWhale {
 fn current_whale_threshold_hint(snapshot: &AggregatedSnapshot) -> f64 {
     let mut min_thr = f64::MAX;
     let mut found = false;
-    for (ticker, snap) in &snapshot.tickers {
+    for (_ticker, snap) in &snapshot.tickers {
         let avg = snap.avg_trade_usd_5m;
         if avg > 0.0 {
             let thr = (avg * whale_multiplier_display()).max(whale_floor_display());

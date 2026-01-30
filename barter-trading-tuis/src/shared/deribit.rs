@@ -355,6 +355,7 @@ struct DeribitBookSummary {
     open_interest: Option<f64>,
     mark_iv: Option<f64>,
     #[serde(default)]
+    #[allow(dead_code)]
     greeks: Option<DeribitGreeks>,
 }
 

@@ -166,17 +166,6 @@ impl SignalState {
     }
 }
 
-// ============================================================================
-// HELPERS
-// ============================================================================
-fn scale_number(v: f64) -> (f64, &'static str) {
-    let abs = v.abs();
-    if abs >= 1_000_000_000.0 { (v / 1_000_000_000.0, "B") }
-    else if abs >= 1_000_000.0 { (v / 1_000_000.0, "M") }
-    else if abs >= 1_000.0 { (v / 1_000.0, "K") }
-    else { (v, "") }
-}
-
 fn get_ws_url() -> String {
     std::env::var("WS_URL").unwrap_or_else(|_| "ws://127.0.0.1:9001".to_string())
 }
@@ -185,16 +174,6 @@ fn whale_threshold() -> f64 {
     // Whale cutoff (default $500K unless overridden via env; clamp to at least $500K)
     let configured: f64 = std::env::var("WHALE_THRESHOLD_V2").ok().and_then(|v| v.parse().ok()).unwrap_or(500_000.0);
     configured.max(500_000.0)
-}
-
-/// Exchange-specific color for visual scanning (full exchange name).
-fn exchange_color(exchange: &str) -> Color {
-    match exchange {
-        "BinanceFuturesUsd" | "BinanceSpot" => Color::Yellow,
-        "BybitPerpetualsUsd" | "BybitSpot" => Color::Magenta,
-        "Okx" => Color::LightBlue,
-        _ => Color::DarkGray,
-    }
 }
 
 /// Exchange color by short name (BNC, BBT, OKX) for consistent styling.
@@ -242,21 +221,6 @@ fn bidir_bar(value: f64, width: usize) -> (String, Color) {
 
     let color = if value > 55.0 { C_BUY } else if value < 45.0 { C_SELL } else { C_NEUTRAL };
     (bar, color)
-}
-
-/// Compact bi-directional bar with label
-fn bidir_bar_labeled(value: f64, width: usize, show_pct: bool) -> Vec<Span<'static>> {
-    let (bar, color) = bidir_bar(value, width);
-    let label = if value > 55.0 { "BUY" } else if value < 45.0 { "SELL" } else { "BAL" };
-
-    if show_pct {
-        vec![
-            Span::styled(bar, Style::default().fg(color)),
-            Span::styled(format!(" {:>2.0}% {}", value, label), Style::default().fg(color)),
-        ]
-    } else {
-        vec![Span::styled(bar, Style::default().fg(color))]
-    }
 }
 
 // ============================================================================
@@ -1108,7 +1072,7 @@ fn render_whales(
 
 /// Footer
 fn render_footer(f: &mut ratatui::Frame, area: Rect, ticker: &str) {
-    let hl = |t: &str, active: bool| -> Style {
+    let hl = |_t: &str, active: bool| -> Style {
         if active { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) }
         else { Style::default().fg(C_DIM) }
     };

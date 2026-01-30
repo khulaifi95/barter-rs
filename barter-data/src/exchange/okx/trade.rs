@@ -4,6 +4,7 @@ use crate::{
     exchange::ExchangeSub,
     subscription::trade::PublicTrade,
 };
+use super::ctval;
 use barter_instrument::{Side, exchange::ExchangeId};
 use barter_integration::subscription::SubscriptionId;
 use chrono::{DateTime, Utc};
@@ -57,17 +58,22 @@ pub type OkxTrades = OkxMessage<OkxTrade>;
 /// ```
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
 pub struct OkxMessage<T> {
-    #[serde(
-        rename = "arg",
-        deserialize_with = "de_okx_message_arg_as_subscription_id"
-    )]
-    pub subscription_id: SubscriptionId,
+    #[serde(rename = "arg")]
+    pub arg: OkxMessageArg,
     pub data: Vec<T>,
+}
+
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OkxMessageArg {
+    pub channel: String,
+    #[serde(rename = "instId")]
+    pub inst_id: String,
 }
 
 impl<T> Identifier<Option<SubscriptionId>> for OkxMessage<T> {
     fn id(&self) -> Option<SubscriptionId> {
-        Some(self.subscription_id.clone())
+        Some(ExchangeSub::from((self.arg.channel.as_str(), self.arg.inst_id.as_str())).id())
     }
 }
 
@@ -97,6 +103,7 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, OkxTrades)>
 {
     fn from((exchange, instrument, trades): (ExchangeId, InstrumentKey, OkxTrades)) -> Self {
         tracing::debug!(trade_count = trades.data.len(), "OKX trades batch received");
+        let multiplier = ctval::ctval_multiplier_f64(&trades.arg.inst_id);
         trades
             .data
             .into_iter()
@@ -116,7 +123,7 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, OkxTrades)>
                     kind: PublicTrade {
                         id: trade.id,
                         price: trade.price,
-                        amount: trade.amount,
+                        amount: trade.amount * multiplier,
                         side: trade.side,
                     },
                 })
@@ -125,23 +132,6 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, OkxTrades)>
     }
 }
 
-/// Deserialize an [`OkxMessage`] "arg" field as a Barter [`SubscriptionId`].
-fn de_okx_message_arg_as_subscription_id<'de, D>(
-    deserializer: D,
-) -> Result<SubscriptionId, D::Error>
-where
-    D: serde::de::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Arg<'a> {
-        channel: &'a str,
-        inst_id: &'a str,
-    }
-
-    Deserialize::deserialize(deserializer)
-        .map(|arg: Arg<'_>| ExchangeSub::from((arg.channel, arg.inst_id)).id())
-}
 
 #[cfg(test)]
 mod tests {
@@ -175,7 +165,10 @@ mod tests {
 
             let actual = serde_json::from_str::<OkxTrades>(input);
             let expected: Result<OkxTrades, SocketError> = Ok(OkxTrades {
-                subscription_id: SubscriptionId::from("trades|BTC-USDT"),
+                arg: OkxMessageArg {
+                    channel: "trades".to_string(),
+                    inst_id: "BTC-USDT".to_string(),
+                },
                 data: vec![OkxTrade {
                     id: "130639474".to_string(),
                     price: 42219.9,

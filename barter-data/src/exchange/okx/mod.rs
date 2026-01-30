@@ -34,6 +34,8 @@ use url::Url;
 
 /// OrderBook types for [`Okx`].
 pub mod book;
+/// OKX contract value (ctVal) helpers.
+pub mod ctval;
 
 /// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
 /// into an exchange [`Connector`] specific channel used for generating [`Connector::requests`].

@@ -46,11 +46,13 @@ enum IbkrMessage {
     #[serde(rename = "welcome")]
     Welcome {
         #[serde(default)]
+        #[allow(dead_code)]
         message: Option<String>,
     },
     #[serde(rename = "status")]
     Status {
         #[serde(default)]
+        #[allow(dead_code)]
         connected: Option<bool>,
     },
 }

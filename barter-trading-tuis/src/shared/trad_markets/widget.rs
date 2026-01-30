@@ -22,6 +22,11 @@ const C_ACCENT: Color = Color::Rgb(100, 180, 220);
 const C_HEADER: Color = Color::Rgb(140, 140, 140);
 const C_YELLOW: Color = Color::Rgb(230, 200, 80);
 
+// ============================================================================
+// EXPERIMENTAL THRESHOLDS (TUI ONLY - NOT VALIDATED)
+// Last reviewed: 2026-01-30
+// TODO: Move to config after validation
+// ============================================================================
 const PRICE_PCT_THRESHOLD: f64 = 0.0;
 const VWAP_POINTS_THRESHOLD: f64 = 1.0;
 const FLOW_CONTRACT_THRESHOLD: f64 = 10.0;

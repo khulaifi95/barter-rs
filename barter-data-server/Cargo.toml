@@ -35,7 +35,30 @@ reqwest = { workspace = true }
 # Misc
 chrono = { workspace = true }
 bytes = { workspace = true }
+rust_decimal = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+# Parquet/Arrow for Nautilus-compatible data storage
+# Using version 54 for chrono 0.4.42 compatibility
+arrow = { version = "54", default-features = false, features = ["ipc"] }
+parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
+
+# AWS S3 for cloud storage
+aws-config = "1.5"
+aws-sdk-s3 = "1.65"
+
+# Additional utilities
+async-trait = { workspace = true }
+thiserror = { workspace = true }
 
 [[bin]]
 name = "load-test"
 path = "src/load_test.rs"
+
+[[bin]]
+name = "generate-sample-parquet"
+path = "src/bin/generate_sample_parquet.rs"
+
+[dev-dependencies]
+tempfile = "3"
+rust_decimal_macros = "1"

@@ -4,6 +4,7 @@ use crate::{
     exchange::ExchangeSub,
     subscription::open_interest::OpenInterest,
 };
+use super::ctval;
 use barter_instrument::exchange::ExchangeId;
 use barter_integration::subscription::SubscriptionId;
 use chrono::{DateTime, Utc};
@@ -63,13 +64,14 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, OkxOpenInterests)>
             .data
             .into_iter()
             .map(|oi| {
+                let multiplier = ctval::ctval_multiplier_f64(&oi.inst_id);
                 Ok(MarketEvent {
                     time_exchange: oi.time,
                     time_received: Utc::now(),
                     exchange,
                     instrument: instrument.clone(),
                     kind: OpenInterest {
-                        contracts: oi.contracts,
+                        contracts: oi.contracts * multiplier,
                         // Prefer USD notional if available, otherwise use currency notional
                         notional: oi.notional_usd.or(oi.notional_ccy),
                         time: Some(oi.time),
@@ -79,6 +81,7 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, OkxOpenInterests)>
             .collect()
     }
 }
+
 
 /// Deserialize an [`OkxOpenInterestMessage`] "arg" field as a Barter [`SubscriptionId`].
 fn de_okx_open_interest_arg_as_subscription_id<'de, D>(

@@ -219,17 +219,6 @@ pub(crate) fn format_compact(value: f64) -> String {
     format!("{:+.2}{}", scaled, suffix)
 }
 
-pub(crate) fn format_signed_pct(value: f64) -> String {
-    format!("{:+.2}%", value)
-}
-
-pub(crate) fn format_optional_pct(value: Option<f64>) -> String {
-    match value {
-        Some(v) => format!("{:.2}%", v),
-        None => "--".to_string(),
-    }
-}
-
 pub(crate) fn format_optional_price(value: Option<f64>) -> String {
     match value {
         Some(v) if v > 0.0 => format!("{:.0}", v),

@@ -4,6 +4,7 @@ use crate::{
     exchange::ExchangeSub,
     subscription::liquidation::Liquidation,
 };
+use super::ctval;
 use barter_instrument::{Side, exchange::ExchangeId};
 use barter_integration::subscription::SubscriptionId;
 use chrono::{DateTime, Utc};
@@ -72,6 +73,7 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, OkxLiquidations)>
             .into_iter()
             .flat_map(|liq| {
                 let instrument = instrument.clone();
+                let multiplier = ctval::ctval_multiplier_f64(&liq.inst_id);
                 liq.details.into_iter().map(move |detail| {
                     Ok(MarketEvent {
                         time_exchange: detail.time,
@@ -81,7 +83,7 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, OkxLiquidations)>
                         kind: Liquidation {
                             side: detail.side,
                             price: detail.price,
-                            quantity: detail.size,
+                            quantity: detail.size * multiplier,
                             time: detail.time,
                         },
                     })
@@ -90,6 +92,7 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, OkxLiquidations)>
             .collect()
     }
 }
+
 
 /// Deserialize an [`OkxLiquidationMessage`] "arg" field as a Barter [`SubscriptionId`].
 fn de_okx_liquidation_arg_as_subscription_id<'de, D>(
