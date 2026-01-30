@@ -1376,7 +1376,7 @@ async fn main() {
     let spot_cache = Arc::clone(&spot_cache);
 
     // Throttle state: per-instrument last broadcast time (L2 and Binance L1)
-    let mut l2_last_broadcast: HashMap<String, Instant> = HashMap::new();
+    let mut l2_last_broadcast: HashMap<(ExchangeId, String, String), Instant> = HashMap::new();
     let mut l1_last_broadcast: HashMap<String, Instant> = HashMap::new();
 
     // Process market events and broadcast to clients
@@ -1701,11 +1701,10 @@ async fn main() {
 
                         // Use compact key format: exchange:base:quote
                         // The key is still needed for HashMap but we avoid the throttle string format
-                        let key = format!(
-                            "{:?}:{}:{}",
+                        let key = (
                             market_event.exchange,
-                            market_event.instrument.base,
-                            market_event.instrument.quote
+                            market_event.instrument.base.to_string(),
+                            market_event.instrument.quote.to_string(),
                         );
 
                         let should_skip = if let Some(prev) = l2_last_broadcast.get(&key) {

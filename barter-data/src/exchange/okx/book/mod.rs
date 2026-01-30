@@ -38,8 +38,7 @@ impl<'de> Deserialize<'de> for OkxOrderBookMessage {
         if let Some(arg) = value.get("arg") {
             if let Some(channel) = arg.get("channel") {
                 if channel.as_str() == Some("books") {
-                    let raw = serde_json::to_string(&value).map_err(serde::de::Error::custom)?;
-                    return serde_json::from_str(&raw)
+                    return serde_json::from_value(value)
                         .map(OkxOrderBookMessage::Payload)
                         .map_err(serde::de::Error::custom);
                 }
