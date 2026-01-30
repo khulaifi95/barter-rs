@@ -5,6 +5,7 @@ use barter_data::{
     streams::{builder::dynamic::DynamicStreams, consumer::MarketStreamResult, reconnect::Event},
     subscription::funding::FundingRate,
     subscription::open_interest::OpenInterest,
+    subscription::SubKind,
     books::OrderBook,
 };
 use barter_instrument::{
@@ -29,7 +30,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use rust_decimal::prelude::ToPrimitive;
 use rustls::crypto::ring::default_provider;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::{AtomicI64, AtomicU64, Ordering}};
 use std::time::Instant;
@@ -92,6 +93,151 @@ const FEED_STALE_THRESHOLD_MS: i64 = 30_000; // 30 seconds
 const L2_THROTTLE_BYBIT_MS: u64 = 100;
 const L2_THROTTLE_OKX_MS: u64 = 150;
 const SNAPSHOT_VERSION: u16 = 2;
+
+fn parse_csv_set(var: &str) -> Option<HashSet<String>> {
+    let raw = std::env::var(var).ok()?;
+    let items: HashSet<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if items.is_empty() { None } else { Some(items) }
+}
+
+fn parse_bool_env(var: &str, default: bool) -> bool {
+    std::env::var(var)
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(default)
+}
+
+#[derive(Clone, Debug)]
+struct StreamFilter {
+    assets: Option<HashSet<String>>,
+    venues: Option<HashSet<String>>,
+    allow_spot: bool,
+    allow_perp: bool,
+    allow_trades: bool,
+    allow_l1: bool,
+    allow_l2: bool,
+    allow_oi: bool,
+    allow_liq: bool,
+    allow_cvd: bool,
+    allow_funding: bool,
+}
+
+impl StreamFilter {
+    fn from_env() -> Self {
+        Self {
+            assets: parse_csv_set("STREAM_ASSETS"),
+            venues: parse_csv_set("STREAM_VENUES"),
+            allow_spot: parse_bool_env("STREAM_SPOT", true),
+            allow_perp: parse_bool_env("STREAM_PERP", true),
+            allow_trades: parse_bool_env("STREAM_TRADES", true),
+            allow_l1: parse_bool_env("STREAM_L1", true),
+            allow_l2: parse_bool_env("STREAM_L2", true),
+            allow_oi: parse_bool_env("STREAM_OI", true),
+            allow_liq: parse_bool_env("STREAM_LIQ", true),
+            allow_cvd: parse_bool_env("STREAM_CVD", true),
+            allow_funding: parse_bool_env("STREAM_FUNDING", true),
+        }
+    }
+
+    fn allows(
+        &self,
+        exchange: ExchangeId,
+        base: &str,
+        kind: MarketDataInstrumentKind,
+        subkind: SubKind,
+    ) -> bool {
+        if let Some(assets) = &self.assets {
+            if !assets.contains(&base.to_uppercase()) {
+                return false;
+            }
+        }
+        if let Some(venues) = &self.venues {
+            let venue = exchange_to_venue(&exchange);
+            if !venues.contains(venue) {
+                return false;
+            }
+        }
+        match kind {
+            MarketDataInstrumentKind::Spot if !self.allow_spot => return false,
+            MarketDataInstrumentKind::Perpetual if !self.allow_perp => return false,
+            _ => {}
+        }
+        match subkind {
+            SubKind::PublicTrades if !self.allow_trades => return false,
+            SubKind::OrderBooksL1 if !self.allow_l1 => return false,
+            SubKind::OrderBooksL2 if !self.allow_l2 => return false,
+            SubKind::OpenInterest if !self.allow_oi => return false,
+            SubKind::Liquidations if !self.allow_liq => return false,
+            SubKind::CumulativeVolumeDelta if !self.allow_cvd => return false,
+            _ => {}
+        }
+        true
+    }
+
+    fn allows_funding(&self, exchange: ExchangeId, base: &str) -> bool {
+        if !self.allow_funding {
+            return false;
+        }
+        if let Some(assets) = &self.assets {
+            if !assets.contains(&base.to_uppercase()) {
+                return false;
+            }
+        }
+        if let Some(venues) = &self.venues {
+            let venue = exchange_to_venue(&exchange);
+            if !venues.contains(venue) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ParquetFilter {
+    assets: Option<HashSet<String>>,
+    venues: Option<HashSet<String>>,
+    instruments: Option<HashSet<String>>,
+    write_trades: bool,
+    write_bars: bool,
+    write_extended: bool,
+}
+
+impl ParquetFilter {
+    fn from_env() -> Self {
+        Self {
+            assets: parse_csv_set("PARQUET_ASSETS"),
+            venues: parse_csv_set("PARQUET_VENUES"),
+            instruments: parse_csv_set("PARQUET_INSTRUMENTS"),
+            write_trades: parse_bool_env("PARQUET_WRITE_TRADES", true),
+            write_bars: parse_bool_env("PARQUET_WRITE_BARS", true),
+            write_extended: parse_bool_env("PARQUET_WRITE_EXTENDED", true),
+        }
+    }
+
+    fn allows(&self, instrument_id: &str, base: &str, venue: &str) -> bool {
+        if let Some(instruments) = &self.instruments {
+            if !instruments.contains(&instrument_id.to_uppercase()) {
+                return false;
+            }
+        }
+        if let Some(assets) = &self.assets {
+            if !assets.contains(&base.to_uppercase()) {
+                return false;
+            }
+        }
+        if let Some(venues) = &self.venues {
+            if !venues.contains(&venue.to_uppercase()) {
+                return false;
+            }
+        }
+        true
+    }
+}
 
 /// Map ExchangeId to Nautilus-compatible venue name.
 /// Nautilus expects simple venue names like "BINANCE", "OKX", "BYBIT".
@@ -880,6 +1026,7 @@ async fn main() {
     let parquet_enabled = std::env::var("PARQUET_ENABLED")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
+    let parquet_filter = ParquetFilter::from_env();
     let parquet_buffer = std::env::var("PARQUET_BUFFER")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1048,7 +1195,7 @@ async fn main() {
     });
 
     // IBKR bridge feed (ES/NQ) -> trad_tick events
-    {
+    if parse_bool_env("ENABLE_IBKR", true) {
         let tx_trades = tx_trades.clone();
         let tx_uds = Arc::clone(&tx_uds);
         let broadcast_cfg = Arc::clone(&broadcast_config);
@@ -1059,7 +1206,7 @@ async fn main() {
     }
 
     // Deribit options feed (options_chain events)
-    {
+    if parse_bool_env("ENABLE_DERIBIT", true) {
         let tx_trades = tx_trades.clone();
         let tx_uds = Arc::clone(&tx_uds);
         let spot_cache = Arc::clone(&spot_cache);
@@ -1070,112 +1217,116 @@ async fn main() {
         });
     }
 
-    let tickers: Vec<String> = std::env::var("TICKERS")
-        .unwrap_or_else(|_| "BTC,ETH,SOL".to_string())
+    let tickers_raw = std::env::var("TICKERS")
+        .or_else(|_| std::env::var("STREAM_ASSETS"))
+        .unwrap_or_else(|_| "BTC,ETH,SOL".to_string());
+    let tickers: Vec<String> = tickers_raw
         .split(',')
         .map(|s| s.trim().to_uppercase())
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Seed volatility regime history (7-day hourly RV from 5m klines)
-    {
-        let vol_states = Arc::clone(&vol_states);
-        seed_vol_regime(vol_states, &tickers).await;
-    }
+    if parse_bool_env("ENABLE_BINANCE_KLINES", true) {
+        // Seed volatility regime history (7-day hourly RV from 5m klines)
+        {
+            let vol_states = Arc::clone(&vol_states);
+            seed_vol_regime(vol_states, &tickers).await;
+        }
 
-    // Binance kline feed (authoritative 1m candles for RV/ATR/tvVWAP)
-    {
-        let kline_cache = Arc::clone(&kline_cache);
-        let tx_uds = Arc::clone(&tx_uds);
-        let agg_tx = Arc::clone(&agg_event_tx);
-        seed_binance_klines(kline_cache, tx_uds, agg_tx, &tickers).await;
-    }
-    for ticker in &tickers {
-        let tx_trades = tx_trades.clone();
-        let tx_uds = Arc::clone(&tx_uds);
-        let kline_cache = Arc::clone(&kline_cache);
-        let agg_tx = Arc::clone(&agg_event_tx);
-        let broadcast_cfg = Arc::clone(&broadcast_config);
-        let ticker = ticker.clone();
-        tokio::spawn(async move {
-            run_binance_kline_stream(ticker, tx_trades, tx_uds, broadcast_cfg, kline_cache, agg_tx).await;
-        });
-    }
+        // Binance kline feed (authoritative 1m candles for RV/ATR/tvVWAP)
+        {
+            let kline_cache = Arc::clone(&kline_cache);
+            let tx_uds = Arc::clone(&tx_uds);
+            let agg_tx = Arc::clone(&agg_event_tx);
+            seed_binance_klines(kline_cache, tx_uds, agg_tx, &tickers).await;
+        }
+        for ticker in &tickers {
+            let tx_trades = tx_trades.clone();
+            let tx_uds = Arc::clone(&tx_uds);
+            let kline_cache = Arc::clone(&kline_cache);
+            let agg_tx = Arc::clone(&agg_event_tx);
+            let broadcast_cfg = Arc::clone(&broadcast_config);
+            let ticker = ticker.clone();
+            tokio::spawn(async move {
+                run_binance_kline_stream(ticker, tx_trades, tx_uds, broadcast_cfg, kline_cache, agg_tx).await;
+            });
+        }
 
-    // Background kline refresh task - checks for stale cache every 5 minutes
-    // Prevents per-client refresh during handshake (which can stall under burst connects)
-    {
-        let kline_cache = Arc::clone(&kline_cache);
-        let tx_uds = Arc::clone(&tx_uds);
-        let agg_tx = Arc::clone(&agg_event_tx);
-        let tickers = tickers.clone();
-        tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(300)); // 5 minutes
-            loop {
-                interval.tick().await;
-                let today = Utc::now().date_naive();
-                let mut stale_tickers: Vec<String> = Vec::new();
+        // Background kline refresh task - checks for stale cache every 5 minutes
+        // Prevents per-client refresh during handshake (which can stall under burst connects)
+        {
+            let kline_cache = Arc::clone(&kline_cache);
+            let tx_uds = Arc::clone(&tx_uds);
+            let agg_tx = Arc::clone(&agg_event_tx);
+            let tickers = tickers.clone();
+            tokio::spawn(async move {
+                let mut interval = interval(Duration::from_secs(300)); // 5 minutes
+                loop {
+                    interval.tick().await;
+                    let today = Utc::now().date_naive();
+                    let mut stale_tickers: Vec<String> = Vec::new();
 
-                // Check which tickers have stale cache
-                {
-                    let cache = kline_cache.lock().await;
-                    for ticker in &tickers {
-                        if let Some(candles) = cache.get(ticker) {
-                            let is_stale = candles.is_empty()
-                                || candles.back().map(|c| c.start_time.date_naive() != today).unwrap_or(true);
-                            if is_stale {
+                    // Check which tickers have stale cache
+                    {
+                        let cache = kline_cache.lock().await;
+                        for ticker in &tickers {
+                            if let Some(candles) = cache.get(ticker) {
+                                let is_stale = candles.is_empty()
+                                    || candles.back().map(|c| c.start_time.date_naive() != today).unwrap_or(true);
+                                if is_stale {
+                                    stale_tickers.push(ticker.clone());
+                                }
+                            } else {
                                 stale_tickers.push(ticker.clone());
                             }
-                        } else {
-                            stale_tickers.push(ticker.clone());
                         }
                     }
-                }
 
-                // Refresh stale tickers in background
-                for ticker in &stale_tickers {
-                    let symbol = ticker_to_binance_symbol(ticker);
-                    if let Ok(fresh_candles) = fetch_binance_1m_candles(symbol).await {
-                        let mut cache = kline_cache.lock().await;
-                        let entry = cache.entry(ticker.clone()).or_insert_with(VecDeque::new);
-                        entry.clear();
-                        for candle in &fresh_candles {
-                            entry.push_back(candle.clone());
-                        }
-                        while entry.len() > 300 {
-                            entry.pop_front();
-                        }
-                        info!("Background refresh: {} klines for {}", entry.len(), ticker);
+                    // Refresh stale tickers in background
+                    for ticker in &stale_tickers {
+                        let symbol = ticker_to_binance_symbol(ticker);
+                        if let Ok(fresh_candles) = fetch_binance_1m_candles(symbol).await {
+                            let mut cache = kline_cache.lock().await;
+                            let entry = cache.entry(ticker.clone()).or_insert_with(VecDeque::new);
+                            entry.clear();
+                            for candle in &fresh_candles {
+                                entry.push_back(candle.clone());
+                            }
+                            while entry.len() > 300 {
+                                entry.pop_front();
+                            }
+                            info!("Background refresh: {} klines for {}", entry.len(), ticker);
 
-                        // Also update aggregator
-                        let payload = CandleBackfill {
-                            ticker: ticker.clone(),
-                            candles: fresh_candles,
-                        };
-                        let event = MarketEventMessage {
-                            time_exchange: Utc::now(),
-                            time_received: Utc::now(),
-                            exchange: "barter-data-server".to_string(),
-                            instrument: InstrumentInfo {
-                                base: ticker.clone(),
-                                quote: "USD".to_string(),
-                                kind: "Kline".to_string(),
-                            },
-                            kind: "candle_backfill".to_string(),
-                            data: serde_json::to_value(&payload).unwrap_or_default(),
-                        };
-                        if let Some(frame) = serialize_for_uds(&event) {
-                            let _ = tx_uds.send(frame);
+                            // Also update aggregator
+                            let payload = CandleBackfill {
+                                ticker: ticker.clone(),
+                                candles: fresh_candles,
+                            };
+                            let event = MarketEventMessage {
+                                time_exchange: Utc::now(),
+                                time_received: Utc::now(),
+                                exchange: "barter-data-server".to_string(),
+                                instrument: InstrumentInfo {
+                                    base: ticker.clone(),
+                                    quote: "USD".to_string(),
+                                    kind: "Kline".to_string(),
+                                },
+                                kind: "candle_backfill".to_string(),
+                                data: serde_json::to_value(&payload).unwrap_or_default(),
+                            };
+                            if let Some(frame) = serialize_for_uds(&event) {
+                                let _ = tx_uds.send(frame);
+                            }
+                            let _ = agg_tx.send(event).await;
                         }
-                        let _ = agg_tx.send(event).await;
+                    }
+
+                    if !stale_tickers.is_empty() {
+                        info!("Background kline refresh completed for {} tickers", stale_tickers.len());
                     }
                 }
-
-                if !stale_tickers.is_empty() {
-                    info!("Background kline refresh completed for {} tickers", stale_tickers.len());
-                }
-            }
-        });
+            });
+        }
     }
 
     {
@@ -1357,16 +1508,17 @@ async fn main() {
     info!("WebSocket server listening on ws://{}", server_addr);
     info!("Clients can connect to receive real-time market data");
 
-    // Initialize market data streams
-    let streams = init_market_streams().await;
+    // Initialize market data streams (filtered by env)
+    let stream_filter = StreamFilter::from_env();
+    let streams = init_market_streams(&stream_filter).await;
 
     // Combine WebSocket and REST API streams
     let combined_stream = stream::select_all(vec![
         streams
             .select_all::<MarketStreamResult<MarketDataInstrument, DataKind>>()
             .boxed(),
-        binance_open_interest_stream().boxed(),
-        funding_rate_stream().boxed(),
+        binance_open_interest_stream(stream_filter.clone()).boxed(),
+        funding_rate_stream(stream_filter.clone()).boxed(),
     ]);
 
     futures::pin_mut!(combined_stream);
@@ -1467,6 +1619,7 @@ async fn main() {
                         // Build instrument_id in Nautilus format: {BASE}{QUOTE}-{KIND}.{VENUE}
                         // e.g., "BTCUSDT-PERP.BINANCE"
                         let venue = exchange_to_venue(&market_event.exchange);
+                        let base = market_event.instrument.base.to_string();
                         let instrument_id = format!(
                             "{}{}-{}.{}",
                             market_event.instrument.base,
@@ -1478,54 +1631,59 @@ async fn main() {
                             },
                             venue
                         ).to_uppercase();
+                        if !parquet_filter.allows(&instrument_id, &base, venue) {
+                            continue;
+                        }
                         let (price_precision, size_precision) = precision_config.get(&instrument_id);
 
-                        // Update extended bar builder with latest OI/Funding/L1
-                        match &market_event.kind {
-                            DataKind::OpenInterest(oi) => {
-                                let oi_value = oi.contracts;
-                                let mut ext_builders = extended_bar_builders.lock().await;
-                                let ext_builder = ext_builders
-                                    .entry(instrument_id.clone())
-                                    .or_insert_with(ExtendedBarBuilder::new);
-                                ext_builder.update_oi(oi_value);
-                            }
-                            DataKind::FundingRate(fr) => {
-                                let mut ext_builders = extended_bar_builders.lock().await;
-                                let ext_builder = ext_builders
-                                    .entry(instrument_id.clone())
-                                    .or_insert_with(ExtendedBarBuilder::new);
-                                ext_builder.update_funding(fr.rate);
-                            }
-                            DataKind::Liquidation(liq) => {
-                                let notional = liq.price * liq.quantity;
-                                let mut ext_builders = extended_bar_builders.lock().await;
-                                let ext_builder = ext_builders
-                                    .entry(instrument_id.clone())
-                                    .or_insert_with(ExtendedBarBuilder::new);
-                                ext_builder.update_liquidation(notional, liq.side);
-                            }
-                            DataKind::OrderBookL1(l1) => {
-                                let bid = l1.best_bid.and_then(|lvl| lvl.price.to_f64()).unwrap_or(0.0);
-                                let bid_size = l1.best_bid.and_then(|lvl| lvl.amount.to_f64()).unwrap_or(0.0);
-                                let ask = l1.best_ask.and_then(|lvl| lvl.price.to_f64()).unwrap_or(0.0);
-                                let ask_size = l1.best_ask.and_then(|lvl| lvl.amount.to_f64()).unwrap_or(0.0);
-                                if bid > 0.0 && ask > 0.0 {
+                        // Update extended bar builder with latest OI/Funding/L1/L2 only when enabled
+                        if parquet_filter.write_extended {
+                            match &market_event.kind {
+                                DataKind::OpenInterest(oi) => {
+                                    let oi_value = oi.contracts;
                                     let mut ext_builders = extended_bar_builders.lock().await;
                                     let ext_builder = ext_builders
                                         .entry(instrument_id.clone())
                                         .or_insert_with(ExtendedBarBuilder::new);
-                                    ext_builder.update_l1(bid, bid_size, ask, ask_size);
+                                    ext_builder.update_oi(oi_value);
                                 }
+                                DataKind::FundingRate(fr) => {
+                                    let mut ext_builders = extended_bar_builders.lock().await;
+                                    let ext_builder = ext_builders
+                                        .entry(instrument_id.clone())
+                                        .or_insert_with(ExtendedBarBuilder::new);
+                                    ext_builder.update_funding(fr.rate);
+                                }
+                                DataKind::Liquidation(liq) => {
+                                    let notional = liq.price * liq.quantity;
+                                    let mut ext_builders = extended_bar_builders.lock().await;
+                                    let ext_builder = ext_builders
+                                        .entry(instrument_id.clone())
+                                        .or_insert_with(ExtendedBarBuilder::new);
+                                    ext_builder.update_liquidation(notional, liq.side);
+                                }
+                                DataKind::OrderBookL1(l1) => {
+                                    let bid = l1.best_bid.and_then(|lvl| lvl.price.to_f64()).unwrap_or(0.0);
+                                    let bid_size = l1.best_bid.and_then(|lvl| lvl.amount.to_f64()).unwrap_or(0.0);
+                                    let ask = l1.best_ask.and_then(|lvl| lvl.price.to_f64()).unwrap_or(0.0);
+                                    let ask_size = l1.best_ask.and_then(|lvl| lvl.amount.to_f64()).unwrap_or(0.0);
+                                    if bid > 0.0 && ask > 0.0 {
+                                        let mut ext_builders = extended_bar_builders.lock().await;
+                                        let ext_builder = ext_builders
+                                            .entry(instrument_id.clone())
+                                            .or_insert_with(ExtendedBarBuilder::new);
+                                        ext_builder.update_l1(bid, bid_size, ask, ask_size);
+                                    }
+                                }
+                                DataKind::OrderBook(ob_event) => {
+                                    let mut cache = l2_book_cache.lock().await;
+                                    let book = cache
+                                        .entry(instrument_id.clone())
+                                        .or_insert_with(OrderBook::default);
+                                    book.update(ob_event);
+                                }
+                                _ => {}
                             }
-                            DataKind::OrderBook(ob_event) => {
-                                let mut cache = l2_book_cache.lock().await;
-                                let book = cache
-                                    .entry(instrument_id.clone())
-                                    .or_insert_with(OrderBook::default);
-                                book.update(ob_event);
-                            }
-                            _ => {}
                         }
 
                         if let DataKind::Trade(trade) = &market_event.kind {
@@ -1541,27 +1699,29 @@ async fn main() {
                                 ts_event_ns = ts_init_ns;
                             }
 
-                            let parquet_event = ParquetEvent::Trade(TradeEvent {
-                                instrument_id: instrument_id.clone(),
-                                price: trade.price,
-                                size: trade.amount,
-                                side: Some(trade.side),
-                                trade_id: trade.id.clone(),
-                                ts_event_ns,
-                                ts_init_ns,
-                                price_precision,
-                                size_precision,
-                            });
+                            if parquet_filter.write_trades {
+                                let parquet_event = ParquetEvent::Trade(TradeEvent {
+                                    instrument_id: instrument_id.clone(),
+                                    price: trade.price,
+                                    size: trade.amount,
+                                    side: Some(trade.side),
+                                    trade_id: trade.id.clone(),
+                                    ts_event_ns,
+                                    ts_init_ns,
+                                    price_precision,
+                                    size_precision,
+                                });
 
-                            if parquet_tx.try_send(parquet_event).is_err() {
-                                // Log and increment metric - completeness is critical
-                                let drops = PARQUET_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
-                                if drops % 1000 == 1 {
-                                    warn!("Parquet channel full, trade dropped (total drops: {})", drops);
+                                if parquet_tx.try_send(parquet_event).is_err() {
+                                    // Log and increment metric - completeness is critical
+                                    let drops = PARQUET_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if drops % 1000 == 1 {
+                                        warn!("Parquet channel full, trade dropped (total drops: {})", drops);
+                                    }
+                                } else {
+                                    // Increment heartbeat counter on successful send
+                                    heartbeat_trades_processed.fetch_add(1, Ordering::Relaxed);
                                 }
-                            } else {
-                                // Increment heartbeat counter on successful send
-                                heartbeat_trades_processed.fetch_add(1, Ordering::Relaxed);
                             }
 
                             // Aggregate trades into 1-minute bars
@@ -1580,107 +1740,111 @@ async fn main() {
                             };
 
                             if let Some(completed_bar) = completed_bar {
-                                // Send completed bar to Parquet writer (Nautilus-compatible core bar)
-                                // BLOCKING SEND: Core bars must never be dropped per PRD
-                                let bar_event = ParquetEvent::Bar(completed_bar.to_bar_event());
-                                if parquet_tx.send(bar_event).await.is_err() {
-                                    // Channel closed - receiver dropped
-                                    error!("Parquet channel closed, cannot send bar");
-                                } else {
-                                    // Increment heartbeat bar counter
-                                    heartbeat_bars_written.fetch_add(1, Ordering::Relaxed);
+                                if parquet_filter.write_bars {
+                                    // Send completed bar to Parquet writer (Nautilus-compatible core bar)
+                                    // BLOCKING SEND: Core bars must never be dropped per PRD
+                                    let bar_event = ParquetEvent::Bar(completed_bar.to_bar_event());
+                                    if parquet_tx.send(bar_event).await.is_err() {
+                                        // Channel closed - receiver dropped
+                                        error!("Parquet channel closed, cannot send bar");
+                                    } else {
+                                        // Increment heartbeat bar counter
+                                        heartbeat_bars_written.fetch_add(1, Ordering::Relaxed);
 
-                                    // Update heartbeat state with symbol and last bar time
-                                    if let Some(ref state) = heartbeat_state {
-                                        let bar_time = chrono::DateTime::from_timestamp_nanos(
-                                            completed_bar.ts_close_ns as i64,
+                                        // Update heartbeat state with symbol and last bar time
+                                        if let Some(ref state) = heartbeat_state {
+                                            let bar_time = chrono::DateTime::from_timestamp_nanos(
+                                                completed_bar.ts_close_ns as i64,
+                                            );
+                                            update_heartbeat_bar(
+                                                state,
+                                                &completed_bar.instrument_id,
+                                                bar_time,
+                                            )
+                                            .await;
+                                        }
+
+                                        debug!(
+                                            "Emitted 1m bar for {} close={} vol={:.4} trades={}",
+                                            completed_bar.instrument_id,
+                                            completed_bar.close,
+                                            completed_bar.volume,
+                                            completed_bar.trade_count
                                         );
-                                        update_heartbeat_bar(
-                                            state,
-                                            &completed_bar.instrument_id,
-                                            bar_time,
-                                        )
-                                        .await;
                                     }
-
-                                    debug!(
-                                        "Emitted 1m bar for {} close={} vol={:.4} trades={}",
-                                        completed_bar.instrument_id,
-                                        completed_bar.close,
-                                        completed_bar.volume,
-                                        completed_bar.trade_count
-                                    );
                                 }
 
-                                // Compute L2 depth bands from latest order book snapshot (if available)
-                                let depth_bands = {
-                                    let cache = l2_book_cache.lock().await;
-                                    cache
-                                        .get(&instrument_id)
-                                        .and_then(|book| compute_depth_bands(book))
-                                };
+                                if parquet_filter.write_extended {
+                                    // Compute L2 depth bands from latest order book snapshot (if available)
+                                    let depth_bands = {
+                                        let cache = l2_book_cache.lock().await;
+                                        cache
+                                            .get(&instrument_id)
+                                            .and_then(|book| compute_depth_bands(book))
+                                    };
 
-                                // Also create and send extended bar (Barter-only, with CVD/delta)
-                                let extended_bar = {
-                                    let mut ext_builders = extended_bar_builders.lock().await;
-                                    let ext_builder = ext_builders
-                                        .entry(instrument_id.clone())
-                                        .or_insert_with(ExtendedBarBuilder::new);
-                                    ext_builder.update_depth_bands(depth_bands);
-                                    ext_builder.build(completed_bar)
-                                };
+                                    // Also create and send extended bar (Barter-only, with CVD/delta)
+                                    let extended_bar = {
+                                        let mut ext_builders = extended_bar_builders.lock().await;
+                                        let ext_builder = ext_builders
+                                            .entry(instrument_id.clone())
+                                            .or_insert_with(ExtendedBarBuilder::new);
+                                        ext_builder.update_depth_bands(depth_bands);
+                                        ext_builder.build(completed_bar)
+                                    };
 
-                                let ext_bar_event = ParquetEvent::ExtendedBar(ExtendedBarEvent {
-                                    instrument_id: extended_bar.instrument_id,
-                                    ts_event_ns: extended_bar.ts_close_ns,
-                                    ts_init_ns: extended_bar.ts_init_ns,
-                                    ts_open_ns: extended_bar.ts_open_ns,
-                                    open: extended_bar.open,
-                                    high: extended_bar.high,
-                                    low: extended_bar.low,
-                                    close: extended_bar.close,
-                                    volume: extended_bar.volume,
-                                    quote_volume: extended_bar.quote_volume,
-                                    trade_count: extended_bar.trade_count,
-                                    buy_volume: extended_bar.buy_volume,
-                                    sell_volume: extended_bar.sell_volume,
-                                    delta: extended_bar.delta,
-                                    cvd: extended_bar.cvd,
-                                    open_interest: extended_bar.open_interest,
-                                    oi_change: extended_bar.oi_change,
-                                    funding_rate: extended_bar.funding_rate,
-                                    bid_price: extended_bar.bid_price,
-                                    bid_size: extended_bar.bid_size,
-                                    ask_price: extended_bar.ask_price,
-                                    ask_size: extended_bar.ask_size,
-                                    spread_bps: extended_bar.spread_bps,
-                                    book_imbalance: extended_bar.book_imbalance,
-                                    liq_buy_usd: extended_bar.liq_buy_usd,
-                                    liq_sell_usd: extended_bar.liq_sell_usd,
-                                    liq_total_usd: extended_bar.liq_total_usd,
-                                    liq_count: extended_bar.liq_count,
-                                    bid_depth_10bps_base: extended_bar.bid_depth_10bps_base,
-                                    ask_depth_10bps_base: extended_bar.ask_depth_10bps_base,
-                                    bid_depth_10bps_usd: extended_bar.bid_depth_10bps_usd,
-                                    ask_depth_10bps_usd: extended_bar.ask_depth_10bps_usd,
-                                    depth_imb_10bps: extended_bar.depth_imb_10bps,
-                                    bid_depth_50bps_base: extended_bar.bid_depth_50bps_base,
-                                    ask_depth_50bps_base: extended_bar.ask_depth_50bps_base,
-                                    bid_depth_50bps_usd: extended_bar.bid_depth_50bps_usd,
-                                    ask_depth_50bps_usd: extended_bar.ask_depth_50bps_usd,
-                                    depth_imb_50bps: extended_bar.depth_imb_50bps,
-                                    bid_depth_100bps_base: extended_bar.bid_depth_100bps_base,
-                                    ask_depth_100bps_base: extended_bar.ask_depth_100bps_base,
-                                    bid_depth_100bps_usd: extended_bar.bid_depth_100bps_usd,
-                                    ask_depth_100bps_usd: extended_bar.ask_depth_100bps_usd,
-                                    depth_imb_100bps: extended_bar.depth_imb_100bps,
-                                    price_precision: extended_bar.price_precision,
-                                    size_precision: extended_bar.size_precision,
-                                });
+                                    let ext_bar_event = ParquetEvent::ExtendedBar(ExtendedBarEvent {
+                                        instrument_id: extended_bar.instrument_id,
+                                        ts_event_ns: extended_bar.ts_close_ns,
+                                        ts_init_ns: extended_bar.ts_init_ns,
+                                        ts_open_ns: extended_bar.ts_open_ns,
+                                        open: extended_bar.open,
+                                        high: extended_bar.high,
+                                        low: extended_bar.low,
+                                        close: extended_bar.close,
+                                        volume: extended_bar.volume,
+                                        quote_volume: extended_bar.quote_volume,
+                                        trade_count: extended_bar.trade_count,
+                                        buy_volume: extended_bar.buy_volume,
+                                        sell_volume: extended_bar.sell_volume,
+                                        delta: extended_bar.delta,
+                                        cvd: extended_bar.cvd,
+                                        open_interest: extended_bar.open_interest,
+                                        oi_change: extended_bar.oi_change,
+                                        funding_rate: extended_bar.funding_rate,
+                                        bid_price: extended_bar.bid_price,
+                                        bid_size: extended_bar.bid_size,
+                                        ask_price: extended_bar.ask_price,
+                                        ask_size: extended_bar.ask_size,
+                                        spread_bps: extended_bar.spread_bps,
+                                        book_imbalance: extended_bar.book_imbalance,
+                                        liq_buy_usd: extended_bar.liq_buy_usd,
+                                        liq_sell_usd: extended_bar.liq_sell_usd,
+                                        liq_total_usd: extended_bar.liq_total_usd,
+                                        liq_count: extended_bar.liq_count,
+                                        bid_depth_10bps_base: extended_bar.bid_depth_10bps_base,
+                                        ask_depth_10bps_base: extended_bar.ask_depth_10bps_base,
+                                        bid_depth_10bps_usd: extended_bar.bid_depth_10bps_usd,
+                                        ask_depth_10bps_usd: extended_bar.ask_depth_10bps_usd,
+                                        depth_imb_10bps: extended_bar.depth_imb_10bps,
+                                        bid_depth_50bps_base: extended_bar.bid_depth_50bps_base,
+                                        ask_depth_50bps_base: extended_bar.ask_depth_50bps_base,
+                                        bid_depth_50bps_usd: extended_bar.bid_depth_50bps_usd,
+                                        ask_depth_50bps_usd: extended_bar.ask_depth_50bps_usd,
+                                        depth_imb_50bps: extended_bar.depth_imb_50bps,
+                                        bid_depth_100bps_base: extended_bar.bid_depth_100bps_base,
+                                        ask_depth_100bps_base: extended_bar.ask_depth_100bps_base,
+                                        bid_depth_100bps_usd: extended_bar.bid_depth_100bps_usd,
+                                        ask_depth_100bps_usd: extended_bar.ask_depth_100bps_usd,
+                                        depth_imb_100bps: extended_bar.depth_imb_100bps,
+                                        price_precision: extended_bar.price_precision,
+                                        size_precision: extended_bar.size_precision,
+                                    });
 
-                                // BLOCKING SEND: Extended bars should also not be dropped
-                                if parquet_tx.send(ext_bar_event).await.is_err() {
-                                    error!("Parquet channel closed, cannot send extended bar");
+                                    // BLOCKING SEND: Extended bars should also not be dropped
+                                    if parquet_tx.send(ext_bar_event).await.is_err() {
+                                        error!("Parquet channel closed, cannot send extended bar");
+                                    }
                                 }
                             }
                         }
@@ -2840,13 +3004,13 @@ async fn handle_client(
 }
 
 /// Initialize market data streams (same as the example)
-async fn init_market_streams() -> DynamicStreams<MarketDataInstrument> {
+async fn init_market_streams(filter: &StreamFilter) -> DynamicStreams<MarketDataInstrument> {
     use ExchangeId::*;
     use MarketDataInstrumentKind::*;
     use SubKind::*;
     use barter_data::subscription::SubKind;
 
-    DynamicStreams::init([
+    let specs = [
         // === SPOT SUBSCRIPTIONS (for basis calculation) ===
         // Bybit Spot
         vec![
@@ -2967,7 +3131,18 @@ async fn init_market_streams() -> DynamicStreams<MarketDataInstrument> {
         vec![(BinanceFuturesUsd, "sol", "usdt", Perpetual, PublicTrades)],
         vec![(BybitPerpetualsUsd, "sol", "usdt", Perpetual, PublicTrades)],
         vec![(Okx, "sol", "usdt", Perpetual, PublicTrades)],
-    ])
+    ];
+
+    let filtered = specs.map(|specs| {
+        specs
+            .into_iter()
+            .filter(|(ex, base, _quote, kind, subkind)| {
+                filter.allows(*ex, base, kind.clone(), *subkind)
+            })
+            .collect::<Vec<_>>()
+    });
+
+    DynamicStreams::init(filtered)
     .await
     .expect("Failed to initialize market streams")
 }
@@ -3119,52 +3294,33 @@ fn parse_i64(value: &str) -> Result<i64, DataError> {
 }
 
 /// Build a combined Stream of Binance open-interest polling events (REST fallback)
-fn binance_open_interest_stream()
+fn binance_open_interest_stream(filter: StreamFilter)
 -> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> {
-    let specs = vec![
-        (
-            "BTCUSDT",
-            MarketDataInstrument::from(("btc", "usdt", MarketDataInstrumentKind::Perpetual)),
-        ),
-        (
-            "ETHUSDT",
-            MarketDataInstrument::from(("eth", "usdt", MarketDataInstrumentKind::Perpetual)),
-        ),
-        (
-            "SOLUSDT",
-            MarketDataInstrument::from(("sol", "usdt", MarketDataInstrumentKind::Perpetual)),
-        ),
-        (
-            "XRPUSDT",
-            MarketDataInstrument::from(("xrp", "usdt", MarketDataInstrumentKind::Perpetual)),
-        ),
-    ];
+    let specs = vec![("BTCUSDT", "btc"), ("ETHUSDT", "eth"), ("SOLUSDT", "sol"), ("XRPUSDT", "xrp")];
 
     stream::select_all(
         specs
             .into_iter()
-            .map(|(symbol, instrument)| binance_open_interest_poller(symbol, instrument).boxed())
+            .filter(|(_, base)| {
+                filter.allows(
+                    ExchangeId::BinanceFuturesUsd,
+                    base,
+                    MarketDataInstrumentKind::Perpetual,
+                    SubKind::OpenInterest,
+                )
+            })
+            .map(|(symbol, base)| {
+                let instrument = MarketDataInstrument::from((base, "usdt", MarketDataInstrumentKind::Perpetual));
+                binance_open_interest_poller(symbol, instrument).boxed()
+            })
             .collect::<Vec<_>>(),
     )
 }
 
 /// Build a combined Stream of funding-rate polling events (REST)
-fn funding_rate_stream()
+fn funding_rate_stream(filter: StreamFilter)
 -> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> {
-    let specs = vec![
-        (
-            "BTCUSDT",
-            MarketDataInstrument::from(("btc", "usdt", MarketDataInstrumentKind::Perpetual)),
-        ),
-        (
-            "ETHUSDT",
-            MarketDataInstrument::from(("eth", "usdt", MarketDataInstrumentKind::Perpetual)),
-        ),
-        (
-            "SOLUSDT",
-            MarketDataInstrument::from(("sol", "usdt", MarketDataInstrumentKind::Perpetual)),
-        ),
-    ];
+    let specs = vec![("BTCUSDT", "btc"), ("ETHUSDT", "eth"), ("SOLUSDT", "sol")];
 
     let mut streams: Vec<
         futures::stream::BoxStream<
@@ -3173,9 +3329,15 @@ fn funding_rate_stream()
         >,
     > = Vec::new();
 
-    for (symbol, instrument) in &specs {
-        streams.push(binance_funding_rate_poller(symbol, instrument.clone()).boxed());
-        streams.push(bybit_funding_rate_poller(symbol, instrument.clone()).boxed());
+    for (symbol, base) in &specs {
+        let instrument =
+            MarketDataInstrument::from((*base, "usdt", MarketDataInstrumentKind::Perpetual));
+        if filter.allows_funding(ExchangeId::BinanceFuturesUsd, base) {
+            streams.push(binance_funding_rate_poller(symbol, instrument.clone()).boxed());
+        }
+        if filter.allows_funding(ExchangeId::BybitPerpetualsUsd, base) {
+            streams.push(bybit_funding_rate_poller(symbol, instrument.clone()).boxed());
+        }
     }
 
     let okx_specs = vec![
@@ -3184,9 +3346,11 @@ fn funding_rate_stream()
         ("SOL-USDT-SWAP", "sol"),
     ];
     for (symbol, base) in okx_specs {
-        let instrument =
-            MarketDataInstrument::from((base, "usdt", MarketDataInstrumentKind::Perpetual));
-        streams.push(okx_funding_rate_poller(symbol, instrument).boxed());
+        if filter.allows_funding(ExchangeId::Okx, base) {
+            let instrument =
+                MarketDataInstrument::from((base, "usdt", MarketDataInstrumentKind::Perpetual));
+            streams.push(okx_funding_rate_poller(symbol, instrument).boxed());
+        }
     }
 
     stream::select_all(streams)
