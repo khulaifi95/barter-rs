@@ -92,6 +92,9 @@ Parquet: bars=XX, extended=XX, trades=XX
 cd ~/projects/nautilus_trader && source .venv/bin/activate
 cd ~/projects/barter-rs
 python3 scripts/validation/validate_parquet.py /tmp/barter_validation_15m
+
+# Optional: API parity checks (time-aligned)
+python3 scripts/validation/validate_parquet.py --api /tmp/barter_validation_15m
 ```
 
 ### 2. Expected Results
@@ -101,11 +104,17 @@ python3 scripts/validation/validate_parquet.py /tmp/barter_validation_15m
 | Binance L1 (bid/ask > 0) | 100% | Yes |
 | Trades (volume > 0) | 100% | Yes |
 | Delta = buy_vol - sell_vol | 100% match | Yes |
+| CVD continuity | cvd_t = cvd_{t-1} + delta | Yes |
+| OI change continuity | oi_change = oi - prev_oi (contiguous bars) | Yes |
 | OI > 0 | >90% | Yes |
 | Funding rate set | >0 | Yes |
 | liq_total = liq_buy + liq_sell | 100% match | Yes |
 | spread_bps ≥ 0 | 100% | Yes |
 | book_imbalance ∈ [-1,1] | 100% | Yes |
+| Depth monotonicity | 10bps ≤ 50bps ≤ 100bps | Yes (if L2 enabled) |
+| OHLC integrity | high ≥ max(open,close), low ≤ min(open,close) | Yes |
+| Minute continuity | No 60s gaps | Yes |
+| Quote vol sanity | |qv−vol×close|/qv ≤ 5% | Warning |
 
 ### 3. Cross-Validation with API
 
