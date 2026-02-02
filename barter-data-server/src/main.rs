@@ -69,6 +69,7 @@ const L2_THROTTLE_BINANCE_MS: u64 = 100;
 // Metrics: trade throughput and timestamp skew tracking
 // Skew = time_received - time_exchange (positive = server behind, negative = exchange ahead)
 static TRADE_COUNT: AtomicU64 = AtomicU64::new(0);
+static INVALID_TRADE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SKEW_SUM_MS: AtomicI64 = AtomicI64::new(0);
 static SKEW_MAX_MS: AtomicI64 = AtomicI64::new(0);
 static SKEW_MIN_MS: AtomicI64 = AtomicI64::new(i64::MAX);
@@ -1539,6 +1540,24 @@ async fn main() {
             }
             Event::Item(result) => match result {
                 Ok(market_event) => {
+                    // Drop invalid trades early (prevents OHLC low=0 contamination)
+                    if let DataKind::Trade(trade) = &market_event.kind {
+                        if trade.price <= 0.0 || trade.amount <= 0.0 {
+                            let drops = INVALID_TRADE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                            if drops % 1000 == 1 {
+                                warn!(
+                                    "Dropped invalid trade: {} {}/{} price={} amount={} (total {})",
+                                    market_event.exchange,
+                                    market_event.instrument.base,
+                                    market_event.instrument.quote,
+                                    trade.price,
+                                    trade.amount,
+                                    drops
+                                );
+                            }
+                            continue;
+                        }
+                    }
                     snapshot_builder.lock().await.update(&market_event);
                     if let DataKind::Trade(trade) = &market_event.kind {
                         if matches!(market_event.instrument.kind, MarketDataInstrumentKind::Perpetual) {
