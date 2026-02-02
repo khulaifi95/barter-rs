@@ -199,11 +199,22 @@ def api_parity(df, symbol):
 
     klines = fetch_binance_klines(symbol, min_open_ms, max_open_ms)
     oi_hist = fetch_binance_oi_hist(symbol, min_open_ms, max_open_ms)
+    oi_hist_period = "1m"
+    if not oi_hist:
+        # Binance sometimes returns empty for 1m; fallback to 5m
+        oi_hist = fetch_binance_oi_hist(symbol, min_open_ms, max_open_ms, period="5m")
+        oi_hist_period = "5m"
+
     funding = fetch_binance_funding(symbol, min_open_ms, max_open_ms)
+    funding_mode = "window"
+    if not funding:
+        # Funding updates every 8h; fallback to latest as a coarse sanity check
+        funding = fetch_binance_funding_latest(symbol)
+        funding_mode = "latest"
 
     kline_map = {int(k[0]): k for k in klines}
     oi_map = {int(x["timestamp"]): x for x in oi_hist}
-    funding_map = {int(x["fundingTime"]): x for x in funding}
+    funding_map = {int(x["fundingTime"]): x for x in funding} if funding else {}
 
     # Compare each bar
     price_mismatch = 0
@@ -248,8 +259,11 @@ def api_parity(df, symbol):
 
     print(f"Bars checked: {total}")
     print(f"Price parity >1% mismatches: {price_mismatch}")
-    print(f"OI parity >1% mismatches: {oi_mismatch}")
-    print(f"Funding data present: {'✅' if funding_seen else '⚠️'}")
+    print(f"OI parity >1% mismatches ({oi_hist_period}): {oi_mismatch}")
+    if funding_mode == "latest":
+        print("Funding data present: ✅ (latest, not time-aligned)")
+    else:
+        print(f"Funding data present: {'✅' if funding_seen else '⚠️'} (window)")
 
 def fetch_json(url, params):
     query = urllib.parse.urlencode(params)
@@ -264,16 +278,22 @@ def fetch_binance_klines(symbol, start_ms, end_ms):
         {"symbol": symbol, "interval": "1m", "startTime": start_ms, "endTime": end_ms},
     )
 
-def fetch_binance_oi_hist(symbol, start_ms, end_ms):
+def fetch_binance_oi_hist(symbol, start_ms, end_ms, period="1m"):
     return fetch_json(
         "https://fapi.binance.com/futures/data/openInterestHist",
-        {"symbol": symbol, "period": "1m", "startTime": start_ms, "endTime": end_ms},
+        {"symbol": symbol, "period": period, "startTime": start_ms, "endTime": end_ms},
     )
 
 def fetch_binance_funding(symbol, start_ms, end_ms):
     return fetch_json(
         "https://fapi.binance.com/fapi/v1/fundingRate",
         {"symbol": symbol, "startTime": start_ms, "endTime": end_ms},
+    )
+
+def fetch_binance_funding_latest(symbol):
+    return fetch_json(
+        "https://fapi.binance.com/fapi/v1/fundingRate",
+        {"symbol": symbol, "limit": 1},
     )
 
 if __name__ == "__main__":
