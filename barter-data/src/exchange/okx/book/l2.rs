@@ -50,10 +50,7 @@ where
             .0
             .into_iter()
             .map(|(sub_id, instrument_key)| {
-                (
-                    sub_id,
-                    OkxOrderBookL2Meta::new(instrument_key, false, None),
-                )
+                (sub_id, OkxOrderBookL2Meta::new(instrument_key, false, None))
             })
             .collect();
 

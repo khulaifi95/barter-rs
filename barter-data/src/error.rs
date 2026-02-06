@@ -101,7 +101,9 @@ mod tests {
             },
             TestCase {
                 // TC2: is terminal w/ DataError::Socket containing "Terminated"
-                input: DataError::Socket("ExchangeStream terminated with closing frame".to_string()),
+                input: DataError::Socket(
+                    "ExchangeStream terminated with closing frame".to_string(),
+                ),
                 expected: true,
             },
             TestCase {
@@ -116,7 +118,9 @@ mod tests {
             },
             TestCase {
                 // TC5: is terminal w/ DataError::Socket containing "timeout"
-                input: DataError::Socket("WebSocket read timeout: no data received for 120 seconds".to_string()),
+                input: DataError::Socket(
+                    "WebSocket read timeout: no data received for 120 seconds".to_string(),
+                ),
                 expected: true,
             },
         ];

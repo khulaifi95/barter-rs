@@ -35,5 +35,11 @@ run_tui3.sh
 target/
 .gemini-clipboard/
 .geminiignore
+__pycache__/
+*.pyc
+**/*.egg-info/
+.last_quick_test_dir
+logs/
+test_output/
 HANDOFF_EXCHANGE_CONNECTION_ISSUES.md
 HANDOFF_LATENCY_OPTIMIZATION.md

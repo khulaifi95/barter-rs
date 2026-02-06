@@ -88,9 +88,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("missing columns: {:?}", missing).into());
     }
 
-    let mut reader = builder.build()?;
+    let reader = builder.build()?;
     let mut checked = false;
-    while let Some(batch) = reader.next() {
+    for batch in reader {
         let batch = batch?;
         let liq_total = batch
             .column_by_name("liq_total_usd")

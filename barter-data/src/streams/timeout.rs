@@ -56,7 +56,9 @@ where
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(item)) => {
                 // Reset the deadline since we received data
-                self.deadline.as_mut().reset(Instant::now() + timeout_duration);
+                self.deadline
+                    .as_mut()
+                    .reset(Instant::now() + timeout_duration);
                 Poll::Ready(Some(item))
             }
             Poll::Ready(None) => {
@@ -75,7 +77,9 @@ where
                         );
 
                         // Reset the deadline to avoid immediately timing out again if polled
-                        self.deadline.as_mut().reset(Instant::now() + timeout_duration);
+                        self.deadline
+                            .as_mut()
+                            .reset(Instant::now() + timeout_duration);
 
                         // Return None to signal stream termination, which triggers reconnection
                         Poll::Ready(None)

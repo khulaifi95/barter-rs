@@ -17,4 +17,4 @@ pub use depth_bands::compute_depth_bands;
 #[allow(unused_imports)]
 pub use extended_bar::ExtendedBar;
 #[allow(unused_imports)]
-pub use minute_bar::{MinuteBar, MinuteBarBuilder, MinuteBarAggregator};
+pub use minute_bar::{MinuteBar, MinuteBarAggregator, MinuteBarBuilder};

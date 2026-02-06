@@ -6,7 +6,9 @@
 //!   csv-to-parquet --input ./binance_data/BTCUSDT/klines --output ./parquet --symbol BTCUSDT
 //!   csv-to-parquet --input ./data.csv --output ./output.parquet --symbol BTCUSDT --single-file
 
-use barter_tools::convert::{convert_directory, convert_klines_to_parquet, convert_trades_to_parquet};
+use barter_tools::convert::{
+    convert_directory, convert_klines_to_parquet, convert_trades_to_parquet,
+};
 use barter_tools::PrecisionMode;
 use clap::Parser;
 use std::path::PathBuf;
@@ -63,8 +65,15 @@ fn main() -> anyhow::Result<()> {
     println!("Output:     {:?}", args.output);
     println!("Symbol:     {}", args.symbol);
     println!("Type:       {}", args.data_type);
-    println!("Precision:  {:?} ({}-byte)", precision_mode,
-             if matches!(precision_mode, PrecisionMode::High) { 16 } else { 8 });
+    println!(
+        "Precision:  {:?} ({}-byte)",
+        precision_mode,
+        if matches!(precision_mode, PrecisionMode::High) {
+            16
+        } else {
+            8
+        }
+    );
     println!("Price prec: {}", args.price_precision);
     println!("Size prec:  {}", args.size_precision);
     println!("========================================\n");

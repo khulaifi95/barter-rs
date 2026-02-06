@@ -132,7 +132,6 @@ impl VolRegimeEngine {
         }
     }
 
-
     /// Calculate mean of 1-minute returns
     fn returns_mean(&self) -> f64 {
         if self.returns_1m.is_empty() {
@@ -537,11 +536,18 @@ mod tests {
         let regime = engine.regime();
         let is_shock = engine.is_shock();
 
-        println!("Regime: {:?}, Percentile: {:.2}%", regime, engine.percentile());
+        println!(
+            "Regime: {:?}, Percentile: {:.2}%",
+            regime,
+            engine.percentile()
+        );
         println!("Z-score: {:.4}, Is shock: {}", engine.zscore_1m(), is_shock);
 
         assert!(!is_shock);
         // Regime could be Normal or Low depending on the exact values
-        assert!(matches!(regime, VolRegime::Low | VolRegime::Normal | VolRegime::High));
+        assert!(matches!(
+            regime,
+            VolRegime::Low | VolRegime::Normal | VolRegime::High
+        ));
     }
 }

@@ -305,8 +305,20 @@ impl OrderBook {
     /// Calculate the book imbalance ratio
     /// Returns value from -1.0 (all asks) to +1.0 (all bids)
     pub fn imbalance(&self, levels: usize) -> f64 {
-        let bid_vol: f64 = self.bids.levels.iter().take(levels).map(|l| l.amount_f64()).sum();
-        let ask_vol: f64 = self.asks.levels.iter().take(levels).map(|l| l.amount_f64()).sum();
+        let bid_vol: f64 = self
+            .bids
+            .levels
+            .iter()
+            .take(levels)
+            .map(|l| l.amount_f64())
+            .sum();
+        let ask_vol: f64 = self
+            .asks
+            .levels
+            .iter()
+            .take(levels)
+            .map(|l| l.amount_f64())
+            .sum();
         let total = bid_vol + ask_vol;
         if total > 0.0 {
             (bid_vol - ask_vol) / total
@@ -317,8 +329,20 @@ impl OrderBook {
 
     /// Calculate the bid imbalance percentage (0-100%)
     pub fn bid_imbalance_pct(&self, levels: usize) -> f64 {
-        let bid_vol: f64 = self.bids.levels.iter().take(levels).map(|l| l.amount_f64()).sum();
-        let ask_vol: f64 = self.asks.levels.iter().take(levels).map(|l| l.amount_f64()).sum();
+        let bid_vol: f64 = self
+            .bids
+            .levels
+            .iter()
+            .take(levels)
+            .map(|l| l.amount_f64())
+            .sum();
+        let ask_vol: f64 = self
+            .asks
+            .levels
+            .iter()
+            .take(levels)
+            .map(|l| l.amount_f64())
+            .sum();
         let total = bid_vol + ask_vol;
         if total > 0.0 {
             (bid_vol / total) * 100.0
@@ -347,12 +371,22 @@ impl OrderBook {
 
     /// Get total bid volume within N levels
     pub fn bid_volume(&self, levels: usize) -> f64 {
-        self.bids.levels.iter().take(levels).map(|l| l.amount_f64()).sum()
+        self.bids
+            .levels
+            .iter()
+            .take(levels)
+            .map(|l| l.amount_f64())
+            .sum()
     }
 
     /// Get total ask volume within N levels
     pub fn ask_volume(&self, levels: usize) -> f64 {
-        self.asks.levels.iter().take(levels).map(|l| l.amount_f64()).sum()
+        self.asks
+            .levels
+            .iter()
+            .take(levels)
+            .map(|l| l.amount_f64())
+            .sum()
     }
 }
 

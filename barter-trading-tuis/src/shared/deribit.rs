@@ -291,12 +291,10 @@ impl DeribitClient for DeribitRestClient {
         // Build map of instrument -> greeks
         let mut greeks_map: HashMap<String, DeribitGreeks> = HashMap::new();
         let mut greeks_fetched = 0;
-        for result in ticker_results {
-            if let Ok(ticker_data) = result {
-                if let Some(greeks) = ticker_data.greeks {
-                    greeks_map.insert(ticker_data.instrument_name, greeks);
-                    greeks_fetched += 1;
-                }
+        for ticker_data in ticker_results.into_iter().flatten() {
+            if let Some(greeks) = ticker_data.greeks {
+                greeks_map.insert(ticker_data.instrument_name, greeks);
+                greeks_fetched += 1;
             }
         }
 
@@ -691,7 +689,11 @@ mod tests {
         println!("Fetching BTC options chain from Deribit...");
         let result = client.fetch_options_chain("BTC").await;
 
-        assert!(result.is_ok(), "Failed to fetch options chain: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to fetch options chain: {:?}",
+            result.err()
+        );
 
         let chain = result.unwrap();
         println!("Got {} contracts", chain.contracts.len());

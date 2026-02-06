@@ -17,12 +17,20 @@ use std::{
 };
 
 use barter_trading_tuis::{
-    AggregatedSnapshot, Aggregator, ConnectionStatus, DivergenceSignal, FlowSignal,
-    Side, VolTrend, WebSocketClient, WebSocketConfig,
+    render_trad_markets_panel,
+    AggregatedSnapshot,
+    Aggregator,
+    ConnectionStatus,
+    DivergenceSignal,
+    FlowSignal,
     // Trad markets (ES/NQ) correlation
-    IbkrConnectionStatus, TradMarketState, render_trad_markets_panel,
+    IbkrConnectionStatus,
+    Side,
+    TradMarketState,
+    VolTrend,
+    WebSocketClient,
+    WebSocketConfig,
 };
-use rustls::crypto::ring::default_provider;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -36,20 +44,21 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
-use tokio::sync::Mutex;
 use reqwest::Client;
+use rustls::crypto::ring::default_provider;
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 // ============================================================================
 // COLORS - Balanced palette for easy reading
 // ============================================================================
-const C_BUY: Color = Color::Rgb(100, 220, 100);       // Green
-const C_SELL: Color = Color::Rgb(220, 100, 100);      // Red
-const C_NEUTRAL: Color = Color::Rgb(180, 180, 100);   // Yellow
-const C_DIM: Color = Color::Rgb(120, 120, 120);       // Gray
-const C_BRIGHT: Color = Color::Rgb(220, 220, 220);    // White
-const C_ACCENT: Color = Color::Rgb(100, 180, 220);    // Cyan
-const C_HEADER: Color = Color::Rgb(180, 130, 220);    // Purple
+const C_BUY: Color = Color::Rgb(100, 220, 100); // Green
+const C_SELL: Color = Color::Rgb(220, 100, 100); // Red
+const C_NEUTRAL: Color = Color::Rgb(180, 180, 100); // Yellow
+const C_DIM: Color = Color::Rgb(120, 120, 120); // Gray
+const C_BRIGHT: Color = Color::Rgb(220, 220, 220); // White
+const C_ACCENT: Color = Color::Rgb(100, 180, 220); // Cyan
+const C_HEADER: Color = Color::Rgb(180, 130, 220); // Purple
 
 // ============================================================================
 // CONSTANTS
@@ -77,7 +86,8 @@ struct VenueThrottle {
 impl VenueThrottle {
     fn get_throttled(&mut self, raw: f64, interval_ms: u128) -> f64 {
         let now = Instant::now();
-        let time_ok = self.last_update
+        let time_ok = self
+            .last_update
             .map(|t| now.duration_since(t).as_millis() >= interval_ms)
             .unwrap_or(true);
         if time_ok && raw > 0.0 {
@@ -100,7 +110,8 @@ struct BarState {
 impl BarState {
     fn should_update_pressure(&mut self, pressure: f64) -> bool {
         let now = Instant::now();
-        let time_ok = self.last_update
+        let time_ok = self
+            .last_update
             .map(|t| now.duration_since(t).as_millis() >= BANNER_INTERVAL_MS)
             .unwrap_or(true);
         if time_ok {
@@ -122,8 +133,15 @@ impl BarState {
 }
 
 impl SignalState {
-    fn update_divergence(&mut self, ticker: &str, signal: DivergenceSignal) -> Option<DivergenceSignal> {
-        let dominated = matches!(signal, DivergenceSignal::Bullish | DivergenceSignal::Bearish);
+    fn update_divergence(
+        &mut self,
+        ticker: &str,
+        signal: DivergenceSignal,
+    ) -> Option<DivergenceSignal> {
+        let dominated = matches!(
+            signal,
+            DivergenceSignal::Bullish | DivergenceSignal::Bearish
+        );
         if !dominated {
             self.divergence_start.remove(ticker);
             return None;
@@ -138,7 +156,8 @@ impl SignalState {
                 }
             }
             _ => {
-                self.divergence_start.insert(ticker.to_string(), (signal, now));
+                self.divergence_start
+                    .insert(ticker.to_string(), (signal, now));
                 None
             }
         }
@@ -172,7 +191,10 @@ fn get_ws_url() -> String {
 
 fn whale_threshold() -> f64 {
     // Whale cutoff (default $500K unless overridden via env; clamp to at least $500K)
-    let configured: f64 = std::env::var("WHALE_THRESHOLD_V2").ok().and_then(|v| v.parse().ok()).unwrap_or(500_000.0);
+    let configured: f64 = std::env::var("WHALE_THRESHOLD_V2")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500_000.0);
     configured.max(500_000.0)
 }
 
@@ -190,7 +212,10 @@ async fn fetch_bvol24h(client: &Client) -> Result<f64, reqwest::Error> {
     let url = "https://www.bitmex.com/api/v1/instrument?symbol=.BVOL24H";
     let resp = client.get(url).send().await?.error_for_status()?;
     let v: Value = resp.json().await?;
-    Ok(v.get(0).and_then(|o| o.get("lastPrice")).and_then(|p| p.as_f64()).unwrap_or(0.0))
+    Ok(v.get(0)
+        .and_then(|o| o.get("lastPrice"))
+        .and_then(|p| p.as_f64())
+        .unwrap_or(0.0))
 }
 
 /// Bi-directional bar: center = 50%, left = SELL, right = BUY
@@ -219,7 +244,13 @@ fn bidir_bar(value: f64, width: usize) -> (String, Color) {
         "░".repeat(right_empty)
     );
 
-    let color = if value > 55.0 { C_BUY } else if value < 45.0 { C_SELL } else { C_NEUTRAL };
+    let color = if value > 55.0 {
+        C_BUY
+    } else if value < 45.0 {
+        C_SELL
+    } else {
+        C_NEUTRAL
+    };
     (bar, color)
 }
 
@@ -253,7 +284,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(async move {
             let client = Client::new();
             loop {
-                if let Ok(val) = fetch_bvol24h(&client).await { *bvol.lock().await = Some(val); }
+                if let Ok(val) = fetch_bvol24h(&client).await {
+                    *bvol.lock().await = Some(val);
+                }
                 tokio::time::sleep(Duration::from_secs(300)).await;
             }
         });
@@ -261,7 +294,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Trad markets (ES/NQ) correlation state
     let trad_state = Arc::new(Mutex::new(TradMarketState::new()));
-    let (ibkr_status_tx, ibkr_status_rx) = tokio::sync::watch::channel(IbkrConnectionStatus::Disconnected);
+    let (ibkr_status_tx, ibkr_status_rx) =
+        tokio::sync::watch::channel(IbkrConnectionStatus::Disconnected);
     let trad_last_ms = Arc::new(AtomicI64::new(0));
 
     let stale_timeout_secs = std::env::var("WS_STALE_SECS")
@@ -303,14 +337,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             while let Some(event) = event_rx.recv().await {
                 if event.kind == "trad_tick" {
-                    if let Ok(tick) = serde_json::from_value::<barter_trading_tuis::shared::types::TradTickData>(event.data.clone()) {
+                    if let Ok(tick) = serde_json::from_value::<
+                        barter_trading_tuis::shared::types::TradTickData,
+                    >(event.data.clone())
+                    {
                         let size = if tick.sz > 0.0 { tick.sz } else { 1.0 };
                         let mut trad_guard = trad.lock().await;
-                            match tick.symbol.as_str() {
-                                "ES" => trad_guard.update_es_tick(tick.px, size, tick.ts, tick.bid, tick.ask, tick.vwap),
-                                "NQ" => trad_guard.update_nq_tick(tick.px, size, tick.ts, tick.bid, tick.ask, tick.vwap),
-                                _ => {}
-                            }
+                        match tick.symbol.as_str() {
+                            "ES" => trad_guard.update_es_tick(
+                                tick.px, size, tick.ts, tick.bid, tick.ask, tick.vwap,
+                            ),
+                            "NQ" => trad_guard.update_nq_tick(
+                                tick.px, size, tick.ts, tick.bid, tick.ask, tick.vwap,
+                            ),
+                            _ => {}
+                        }
                     }
                     trad_last_ms.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
                     let _ = ibkr_status_tx.send(IbkrConnectionStatus::Connected);
@@ -329,7 +370,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     latency_samples.push(latency_ms);
 
                     // Latency tracking (silent - no console output)
-                    if last_latency_log.elapsed() >= Duration::from_secs(5) && !latency_samples.is_empty() {
+                    if last_latency_log.elapsed() >= Duration::from_secs(5)
+                        && !latency_samples.is_empty()
+                    {
                         // Stats available but not printed to avoid TUI noise
                         // let avg = latency_samples.iter().sum::<i64>() / latency_samples.len() as i64;
                         latency_samples.clear();
@@ -339,9 +382,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 // Feed BTC trades to trad_state for ES/BTC correlation
                 if event.kind == "trade" && event.instrument.base.to_lowercase() == "btc" {
-                    if let Ok(trade) = serde_json::from_value::<barter_trading_tuis::TradeData>(event.data.clone()) {
+                    if let Ok(trade) =
+                        serde_json::from_value::<barter_trading_tuis::TradeData>(event.data.clone())
+                    {
                         let ts = event.time_exchange.timestamp_millis();
-                        trad.lock().await.update_btc_trade(trade.price, trade.amount, ts);
+                        trad.lock()
+                            .await
+                            .update_btc_trade(trade.price, trade.amount, ts);
                     }
                 }
                 agg.lock().await.process_event(event);
@@ -353,7 +400,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let conn = Arc::clone(&connected);
         tokio::spawn(async move {
             while let Some(status) = status_rx.recv().await {
-                conn.store(matches!(status, ConnectionStatus::Connected), Ordering::Relaxed);
+                conn.store(
+                    matches!(status, ConnectionStatus::Connected),
+                    Ordering::Relaxed,
+                );
             }
         });
     }
@@ -397,9 +447,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                    KeyCode::Char('b') | KeyCode::Char('B') => focus_index.store(0, Ordering::Relaxed),
-                    KeyCode::Char('e') | KeyCode::Char('E') => focus_index.store(1, Ordering::Relaxed),
-                    KeyCode::Char('s') | KeyCode::Char('S') => focus_index.store(2, Ordering::Relaxed),
+                    KeyCode::Char('b') | KeyCode::Char('B') => {
+                        focus_index.store(0, Ordering::Relaxed)
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        focus_index.store(1, Ordering::Relaxed)
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        focus_index.store(2, Ordering::Relaxed)
+                    }
                     KeyCode::Tab => {
                         let c = focus_index.load(Ordering::Relaxed);
                         focus_index.store((c + 1) % 3, Ordering::Relaxed);
@@ -423,8 +479,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let ticker = TICKERS[idx];
 
             let debounced = snapshot.tickers.get(ticker).map(|t| {
-                (signal_state.update_divergence(ticker, t.cvd_divergence_15s),
-                 signal_state.update_flow(ticker, t.flow_signal))
+                (
+                    signal_state.update_divergence(ticker, t.cvd_divergence_15s),
+                    signal_state.update_flow(ticker, t.flow_signal),
+                )
             });
 
             let bvol = *bvol24h.lock().await;
@@ -434,7 +492,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let ibkr_status = *ibkr_status_rx.borrow();
 
             terminal.draw(|f| {
-                render_ui(f, f.area(), &snapshot, connected_now, ticker, debounced, &mut bar_state, bvol, &trad_signals, ibkr_status);
+                render_ui(
+                    f,
+                    f.area(),
+                    &snapshot,
+                    connected_now,
+                    ticker,
+                    debounced,
+                    &mut bar_state,
+                    bvol,
+                    &trad_signals,
+                    ibkr_status,
+                );
             })?;
             last_draw = Instant::now();
         }
@@ -442,7 +511,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     result
 }
@@ -450,6 +523,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 // ============================================================================
 // RENDER - New optimized layout
 // ============================================================================
+#[allow(clippy::too_many_arguments)]
 fn render_ui(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -466,12 +540,12 @@ fn render_ui(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),   // Header with full context
-            Constraint::Length(4),   // BIG SIGNAL
-            Constraint::Length(8),   // Flow + Book (side by side)
-            Constraint::Length(5),   // Exchanges + Volatility (compressed)
-            Constraint::Min(16),     // Whales + Trad Markets (side by side, needs height)
-            Constraint::Length(1),   // Footer
+            Constraint::Length(3), // Header with full context
+            Constraint::Length(4), // BIG SIGNAL
+            Constraint::Length(8), // Flow + Book (side by side)
+            Constraint::Length(5), // Exchanges + Volatility (compressed)
+            Constraint::Min(16),   // Whales + Trad Markets (side by side, needs height)
+            Constraint::Length(1), // Footer
         ])
         .split(area);
 
@@ -535,14 +609,31 @@ fn render_header(
         let status_color = if connected { C_BUY } else { C_SELL };
 
         let spread = t.latest_spread_pct.unwrap_or(0.0);
-        let spread_color = if spread > 0.03 { C_SELL } else if spread > 0.01 { C_NEUTRAL } else { C_DIM };
+        let spread_color = if spread > 0.03 {
+            C_SELL
+        } else if spread > 0.01 {
+            C_NEUTRAL
+        } else {
+            C_DIM
+        };
 
-        let lead = t.exchange_dominance.iter()
+        let lead = t
+            .exchange_dominance
+            .iter()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(k, _)| {
                 let u = k.to_uppercase();
-                if u.starts_with("BNC") { "BNC" } else if u.starts_with("BBT") { "BBT" } else if u.starts_with("OKX") { "OKX" } else { "OTH" }
-            }).unwrap_or("--");
+                if u.starts_with("BNC") {
+                    "BNC"
+                } else if u.starts_with("BBT") {
+                    "BBT"
+                } else if u.starts_with("OKX") {
+                    "OKX"
+                } else {
+                    "OTH"
+                }
+            })
+            .unwrap_or("--");
 
         // Fair value deviation in bps (price vs VWM across venues)
         let fv_bps = t.fair_value_deviation_bps;
@@ -560,8 +651,20 @@ fn render_header(
         // OI: show raw delta + freshness (e.g., "OI:↑142K 3s")
         let oi_delta = t.oi_delta_5m;
         // Use 100 contracts as threshold for BTC/ETH (more meaningful than 10)
-        let oi_arrow = if oi_delta > 100.0 { "↑" } else if oi_delta < -100.0 { "↓" } else { "→" };
-        let oi_color = if oi_delta > 100.0 { C_BUY } else if oi_delta < -100.0 { C_SELL } else { C_DIM };
+        let oi_arrow = if oi_delta > 100.0 {
+            "↑"
+        } else if oi_delta < -100.0 {
+            "↓"
+        } else {
+            "→"
+        };
+        let oi_color = if oi_delta > 100.0 {
+            C_BUY
+        } else if oi_delta < -100.0 {
+            C_SELL
+        } else {
+            C_DIM
+        };
         // Format delta with K/M suffix
         let oi_delta_str = if oi_delta.abs() >= 1_000_000.0 {
             format!("{:+.1}M", oi_delta / 1_000_000.0)
@@ -572,11 +675,27 @@ fn render_header(
         };
         // Freshness color: green < 5s, yellow 5-15s, red > 15s
         let oi_age = t.oi_freshness_secs;
-        let oi_age_color = if oi_age < 5.0 { C_BUY } else if oi_age < 15.0 { C_NEUTRAL } else { C_SELL };
-        let oi_age_str = if oi_age > 99.0 { "??s".to_string() } else { format!("{:.0}s", oi_age) };
+        let oi_age_color = if oi_age < 5.0 {
+            C_BUY
+        } else if oi_age < 15.0 {
+            C_NEUTRAL
+        } else {
+            C_SELL
+        };
+        let oi_age_str = if oi_age > 99.0 {
+            "??s".to_string()
+        } else {
+            format!("{:.0}s", oi_age)
+        };
 
         let basis = t.basis.as_ref().map(|b| b.basis_pct).unwrap_or(0.0);
-        let basis_color = if basis > 0.02 { C_BUY } else if basis < -0.02 { C_SELL } else { C_DIM };
+        let basis_color = if basis > 0.02 {
+            C_BUY
+        } else if basis < -0.02 {
+            C_SELL
+        } else {
+            C_DIM
+        };
         let lag_stale_secs = std::env::var("LAG_STALE_SECS")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -629,10 +748,7 @@ fn render_header(
             format!("OI:{}{} ", oi_arrow, oi_delta_str),
             Style::default().fg(oi_color),
         ));
-        spans.push(Span::styled(
-            oi_age_str,
-            Style::default().fg(oi_age_color),
-        ));
+        spans.push(Span::styled(oi_age_str, Style::default().fg(oi_age_color)));
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("Basis:{:+.2}%", basis),
@@ -641,7 +757,10 @@ fn render_header(
 
         if let Some(bvol) = bvol24h {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(format!("BVOL:{:.1}", bvol), Style::default().fg(C_DIM)));
+            spans.push(Span::styled(
+                format!("BVOL:{:.1}", bvol),
+                Style::default().fg(C_DIM),
+            ));
         }
 
         f.render_widget(Paragraph::new(Line::from(spans)), inner);
@@ -661,8 +780,13 @@ fn render_signal(
         // Composite pressure
         let flow_imb = t.orderflow_1m.imbalance_pct;
         let cvd_dir = if t.cvd_1m_total > 0.0 { 1.0 } else { -1.0 };
-        let book_imb = if t.aggregated_book_imbalance > 0.0 { t.aggregated_book_imbalance } else { 50.0 };
-        let pressure_raw = (flow_imb * 0.4 + book_imb * 0.3 + (50.0 + cvd_dir * 20.0) * 0.3).clamp(0.0, 100.0);
+        let book_imb = if t.aggregated_book_imbalance > 0.0 {
+            t.aggregated_book_imbalance
+        } else {
+            50.0
+        };
+        let pressure_raw =
+            (flow_imb * 0.4 + book_imb * 0.3 + (50.0 + cvd_dir * 20.0) * 0.3).clamp(0.0, 100.0);
 
         let _ = bar_state.should_update_pressure(pressure_raw);
         let pressure = bar_state.last_pressure;
@@ -700,11 +824,17 @@ fn render_signal(
         let (bar, bar_color) = bidir_bar(pressure, bar_width);
 
         // Line 1: Signal text (with optional divergence badge)
-        let mut line1_spans = vec![
-            Span::styled(signal_display, Style::default().fg(fg_color).add_modifier(Modifier::BOLD)),
-        ];
+        let mut line1_spans = vec![Span::styled(
+            signal_display,
+            Style::default().fg(fg_color).add_modifier(Modifier::BOLD),
+        )];
         if let Some((badge, badge_color)) = div_badge {
-            line1_spans.push(Span::styled(badge, Style::default().fg(badge_color).add_modifier(Modifier::BOLD)));
+            line1_spans.push(Span::styled(
+                badge,
+                Style::default()
+                    .fg(badge_color)
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
 
         // Line 2: Bar with SELL/BUY labels
@@ -714,25 +844,17 @@ fn render_signal(
             Span::styled(" BUY", Style::default().fg(C_BUY)),
         ];
 
-        let lines = vec![
-            Line::from(line1_spans),
-            Line::from(line2_spans),
-        ];
+        let lines = vec![Line::from(line1_spans), Line::from(line2_spans)];
 
         f.render_widget(
             Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
-            inner
+            inner,
         );
     }
 }
 
 /// FLOW section - CVD with bi-directional bars
-fn render_flow(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    snapshot: &AggregatedSnapshot,
-    ticker: &str,
-) {
+fn render_flow(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot, ticker: &str) {
     let block = Block::default()
         .title(" NET FLOW ")
         .borders(Borders::ALL)
@@ -761,9 +883,9 @@ fn render_flow(
             } else if abs >= 1_000.0 {
                 format!("{:+.0}K", v / 1_000.0)
             } else if abs >= 1.0 {
-                format!("{:+.0}", v)  // Show actual small values
+                format!("{:+.0}", v) // Show actual small values
             } else {
-                "~0".to_string()  // Only show ~0 for truly near-zero values
+                "~0".to_string() // Only show ~0 for truly near-zero values
             }
         };
 
@@ -778,7 +900,13 @@ fn render_flow(
             let formatted = format_delta(cvd);
             let imb = cvd_to_imb(cvd);
             let (bar, color) = bidir_bar(imb, bar_width);
-            let cvd_color = if cvd > 0.0 { C_BUY } else if cvd < 0.0 { C_SELL } else { C_DIM };
+            let cvd_color = if cvd > 0.0 {
+                C_BUY
+            } else if cvd < 0.0 {
+                C_SELL
+            } else {
+                C_DIM
+            };
 
             lines.push(Line::from(vec![
                 Span::styled(format!("{}: ", label), Style::default().fg(C_DIM)),
@@ -801,7 +929,12 @@ fn render_flow(
         };
 
         lines.push(Line::from(vec![])); // spacer
-        lines.push(Line::from(Span::styled(align_text, Style::default().fg(align_color).add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(Span::styled(
+            align_text,
+            Style::default()
+                .fg(align_color)
+                .add_modifier(Modifier::BOLD),
+        )));
     }
 
     f.render_widget(Paragraph::new(lines), inner);
@@ -825,9 +958,21 @@ fn render_book(
     let mut lines = Vec::new();
 
     if let Some(t) = snapshot.tickers.get(ticker) {
-        let raw_bnc = t.per_exchange_book_imbalance.get("BNC").copied().unwrap_or(0.0);
-        let raw_bbt = t.per_exchange_book_imbalance.get("BBT").copied().unwrap_or(0.0);
-        let raw_okx = t.per_exchange_book_imbalance.get("OKX").copied().unwrap_or(0.0);
+        let raw_bnc = t
+            .per_exchange_book_imbalance
+            .get("BNC")
+            .copied()
+            .unwrap_or(0.0);
+        let raw_bbt = t
+            .per_exchange_book_imbalance
+            .get("BBT")
+            .copied()
+            .unwrap_or(0.0);
+        let raw_okx = t
+            .per_exchange_book_imbalance
+            .get("OKX")
+            .copied()
+            .unwrap_or(0.0);
 
         let (bnc, bbt, okx) = bar_state.get_l2_throttled(raw_bnc, raw_bbt, raw_okx);
 
@@ -838,12 +983,21 @@ fn render_book(
             let label_color = exchange_color_short(label);
             if imb > 1.0 {
                 let (bar, color) = bidir_bar(imb, bar_width);
-                let dir = if imb > 55.0 { "BID" } else if imb < 45.0 { "ASK" } else { "BAL" };
+                let dir = if imb > 55.0 {
+                    "BID"
+                } else if imb < 45.0 {
+                    "ASK"
+                } else {
+                    "BAL"
+                };
 
                 lines.push(Line::from(vec![
                     Span::styled(format!("{}: ", label), Style::default().fg(label_color)),
                     Span::styled(bar, Style::default().fg(color)),
-                    Span::styled(format!(" {:>2.0}% {}", imb, dir), Style::default().fg(color)),
+                    Span::styled(
+                        format!(" {:>2.0}% {}", imb, dir),
+                        Style::default().fg(color),
+                    ),
                 ]));
             } else {
                 lines.push(Line::from(vec![
@@ -857,12 +1011,21 @@ fn render_book(
         let agg = t.aggregated_book_imbalance;
         if agg > 1.0 {
             let (bar, color) = bidir_bar(agg, bar_width);
-            let dir = if agg > 55.0 { "BID" } else if agg < 45.0 { "ASK" } else { "BAL" };
+            let dir = if agg > 55.0 {
+                "BID"
+            } else if agg < 45.0 {
+                "ASK"
+            } else {
+                "BAL"
+            };
             lines.push(Line::from(vec![])); // spacer
             lines.push(Line::from(vec![
                 Span::styled("AGG: ", Style::default().fg(C_BRIGHT)),
                 Span::styled(bar, Style::default().fg(color)),
-                Span::styled(format!(" {:>2.0}% {}", agg, dir), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(" {:>2.0}% {}", agg, dir),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
             ]));
         }
     }
@@ -890,16 +1053,30 @@ fn render_exchanges(
         // Header (colors match whale tape for consistency)
         lines.push(Line::from(vec![
             Span::styled("         ", Style::default()),
-            Span::styled(format!("{:^10}", "OKX"), Style::default().fg(exchange_color_short("OKX"))),
-            Span::styled(format!("{:^10}", "BNC"), Style::default().fg(exchange_color_short("BNC"))),
-            Span::styled(format!("{:^10}", "BBT"), Style::default().fg(exchange_color_short("BBT"))),
+            Span::styled(
+                format!("{:^10}", "OKX"),
+                Style::default().fg(exchange_color_short("OKX")),
+            ),
+            Span::styled(
+                format!("{:^10}", "BNC"),
+                Style::default().fg(exchange_color_short("BNC")),
+            ),
+            Span::styled(
+                format!("{:^10}", "BBT"),
+                Style::default().fg(exchange_color_short("BBT")),
+            ),
         ]));
 
         let norm = |n: &str| -> &'static str {
-            if n.to_lowercase().contains("binance") { "binance" }
-            else if n.to_lowercase().contains("bybit") { "bybit" }
-            else if n.to_lowercase().contains("okx") { "okx" }
-            else { "other" }
+            if n.to_lowercase().contains("binance") {
+                "binance"
+            } else if n.to_lowercase().contains("bybit") {
+                "bybit"
+            } else if n.to_lowercase().contains("okx") {
+                "okx"
+            } else {
+                "other"
+            }
         };
 
         // Format CVD with proper small value handling
@@ -917,13 +1094,24 @@ fn render_exchanges(
         };
 
         let get_stats = |ex: &str| -> (String, f64, String, f64) {
-            t.per_exchange_30s.iter()
+            t.per_exchange_30s
+                .iter()
                 .find(|(k, _)| norm(k) == norm(ex))
                 .map(|(_, v)| {
                     let cvd_str = format_cvd(v.cvd_30s);
                     let buy = (v.total_30s + v.cvd_30s) / 2.0;
-                    let imb = if v.total_30s > 0.0 { (buy / v.total_30s * 100.0).round() } else { 50.0 };
-                    let label = if imb >= 55.0 { "BUY" } else if imb <= 45.0 { "SELL" } else { "BAL" };
+                    let imb = if v.total_30s > 0.0 {
+                        (buy / v.total_30s * 100.0).round()
+                    } else {
+                        50.0
+                    };
+                    let label = if imb >= 55.0 {
+                        "BUY"
+                    } else if imb <= 45.0 {
+                        "SELL"
+                    } else {
+                        "BAL"
+                    };
                     (cvd_str, v.cvd_30s, format!("{:.0}% {}", imb, label), imb)
                 })
                 .unwrap_or(("--".to_string(), 0.0, "--".to_string(), 50.0))
@@ -933,21 +1121,55 @@ fn render_exchanges(
         let (cvd_bnc, cvd_bnc_raw, imb_bnc, imb_bnc_raw) = get_stats("BinanceFuturesUsd");
         let (cvd_bbt, cvd_bbt_raw, imb_bbt, imb_bbt_raw) = get_stats("BybitPerpetualsUsd");
 
-        let cvd_color = |v: f64| if v > 0.0 { C_BUY } else if v < 0.0 { C_SELL } else { C_DIM };
-        let imb_color = |v: f64| if v >= 55.0 { C_BUY } else if v <= 45.0 { C_SELL } else { C_NEUTRAL };
+        let cvd_color = |v: f64| {
+            if v > 0.0 {
+                C_BUY
+            } else if v < 0.0 {
+                C_SELL
+            } else {
+                C_DIM
+            }
+        };
+        let imb_color = |v: f64| {
+            if v >= 55.0 {
+                C_BUY
+            } else if v <= 45.0 {
+                C_SELL
+            } else {
+                C_NEUTRAL
+            }
+        };
 
         lines.push(Line::from(vec![
             Span::styled("CVD:     ", Style::default().fg(C_DIM)),
-            Span::styled(format!("{:^10}", cvd_okx), Style::default().fg(cvd_color(cvd_okx_raw))),
-            Span::styled(format!("{:^10}", cvd_bnc), Style::default().fg(cvd_color(cvd_bnc_raw))),
-            Span::styled(format!("{:^10}", cvd_bbt), Style::default().fg(cvd_color(cvd_bbt_raw))),
+            Span::styled(
+                format!("{:^10}", cvd_okx),
+                Style::default().fg(cvd_color(cvd_okx_raw)),
+            ),
+            Span::styled(
+                format!("{:^10}", cvd_bnc),
+                Style::default().fg(cvd_color(cvd_bnc_raw)),
+            ),
+            Span::styled(
+                format!("{:^10}", cvd_bbt),
+                Style::default().fg(cvd_color(cvd_bbt_raw)),
+            ),
         ]));
 
         lines.push(Line::from(vec![
             Span::styled("FLOW:    ", Style::default().fg(C_DIM)),
-            Span::styled(format!("{:^10}", imb_okx), Style::default().fg(imb_color(imb_okx_raw))),
-            Span::styled(format!("{:^10}", imb_bnc), Style::default().fg(imb_color(imb_bnc_raw))),
-            Span::styled(format!("{:^10}", imb_bbt), Style::default().fg(imb_color(imb_bbt_raw))),
+            Span::styled(
+                format!("{:^10}", imb_okx),
+                Style::default().fg(imb_color(imb_okx_raw)),
+            ),
+            Span::styled(
+                format!("{:^10}", imb_bnc),
+                Style::default().fg(imb_color(imb_bnc_raw)),
+            ),
+            Span::styled(
+                format!("{:^10}", imb_bbt),
+                Style::default().fg(imb_color(imb_bbt_raw)),
+            ),
         ]));
     }
 
@@ -977,7 +1199,8 @@ fn render_volatility(
             Span::styled(format!("${:.0}", atr), Style::default().fg(C_BRIGHT)),
         ]));
 
-        let vwap_str = t.tv_vwap_deviation
+        let vwap_str = t
+            .tv_vwap_deviation
             .map(|d| (format!("{:+.2}%", d), if d > 0.0 { C_BUY } else { C_SELL }))
             .unwrap_or(("--".to_string(), C_DIM));
         lines.push(Line::from(vec![
@@ -993,10 +1216,19 @@ fn render_volatility(
             VolTrend::Contracting => "-CTR",
             VolTrend::Stable => "+STB",
         };
-        let rv_color = if rv1h > rv30 { C_SELL } else if rv1h < rv30 { C_BUY } else { C_DIM };
+        let rv_color = if rv1h > rv30 {
+            C_SELL
+        } else if rv1h < rv30 {
+            C_BUY
+        } else {
+            C_DIM
+        };
         lines.push(Line::from(vec![
             Span::styled("RV30/1h: ", Style::default().fg(C_DIM)),
-            Span::styled(format!("{:.2}%/{:.2}% {}", rv30, rv1h, rv_trend), Style::default().fg(rv_color)),
+            Span::styled(
+                format!("{:.2}%/{:.2}% {}", rv30, rv1h, rv_trend),
+                Style::default().fg(rv_color),
+            ),
         ]));
     }
 
@@ -1004,12 +1236,7 @@ fn render_volatility(
 }
 
 /// Whale tape
-fn render_whales(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    snapshot: &AggregatedSnapshot,
-    ticker: &str,
-) {
+fn render_whales(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot, ticker: &str) {
     let threshold_k = whale_threshold() / 1000.0;
     let block = Block::default()
         .title(format!(" WHALES (>${:.0}K, 5m) ", threshold_k))
@@ -1025,13 +1252,18 @@ fn render_whales(
         let now_local = chrono::Utc::now();
 
         let threshold = whale_threshold();
-        let recent: Vec<_> = t.whales.iter()
+        let recent: Vec<_> = t
+            .whales
+            .iter()
             .filter(|w| w.volume_usd >= threshold)
             .take(rows)
             .collect();
 
         if recent.is_empty() {
-            lines.push(Line::from(Span::styled("No whale trades above threshold in last 5m", Style::default().fg(C_DIM))));
+            lines.push(Line::from(Span::styled(
+                "No whale trades above threshold in last 5m",
+                Style::default().fg(C_DIM),
+            )));
         } else {
             for w in recent {
                 let age = (now_local - w.time).num_milliseconds() as f64 / 1000.0;
@@ -1042,9 +1274,16 @@ fn render_whales(
                     "Okx" => "OKX",
                     _ => "OTH",
                 };
-                let vol = if w.volume_usd >= 1_000_000.0 { format!("${:.1}M", w.volume_usd / 1_000_000.0) }
-                    else { format!("${:.0}K", w.volume_usd / 1_000.0) };
-                let price = if w.price >= 1000.0 { format!("@{:.0}", w.price) } else { format!("@{:.2}", w.price) };
+                let vol = if w.volume_usd >= 1_000_000.0 {
+                    format!("${:.1}M", w.volume_usd / 1_000_000.0)
+                } else {
+                    format!("${:.0}K", w.volume_usd / 1_000.0)
+                };
+                let price = if w.price >= 1000.0 {
+                    format!("@{:.0}", w.price)
+                } else {
+                    format!("@{:.2}", w.price)
+                };
 
                 // Hybrid coloring: BUY/SELL stays green/red, exchange gets distinct color
                 let exch_color = exchange_color_short(ex);
@@ -1053,13 +1292,22 @@ fn render_whales(
                     // Exchange-colored arrow for quick visual scan
                     Span::styled("→ ", Style::default().fg(exch_color)),
                     // Volume in BUY/SELL color (critical distinction)
-                    Span::styled(format!("{:>7} ", vol), Style::default().fg(side_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{:>7} ", vol),
+                        Style::default().fg(side_color).add_modifier(Modifier::BOLD),
+                    ),
                     // Side in BUY/SELL color (critical distinction)
-                    Span::styled(format!("{:4} ", w.side.as_str().to_uppercase()), Style::default().fg(side_color)),
+                    Span::styled(
+                        format!("{:4} ", w.side.as_str().to_uppercase()),
+                        Style::default().fg(side_color),
+                    ),
                     // Price stays neutral
                     Span::styled(format!("{} ", price), Style::default().fg(C_BRIGHT)),
                     // Exchange label in exchange color (scannable)
-                    Span::styled(format!("[{}] ", ex), Style::default().fg(exch_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("[{}] ", ex),
+                        Style::default().fg(exch_color).add_modifier(Modifier::BOLD),
+                    ),
                     // Age stays dim
                     Span::styled(format!("{:.0}s", age), Style::default().fg(C_DIM)),
                 ]));
@@ -1073,8 +1321,13 @@ fn render_whales(
 /// Footer
 fn render_footer(f: &mut ratatui::Frame, area: Rect, ticker: &str) {
     let hl = |_t: &str, active: bool| -> Style {
-        if active { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) }
-        else { Style::default().fg(C_DIM) }
+        if active {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(C_DIM)
+        }
     };
 
     let line = Line::from(vec![

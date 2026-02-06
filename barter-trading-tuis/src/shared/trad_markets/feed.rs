@@ -67,8 +67,7 @@ struct TickData {
 
 /// Get ibkr-bridge WebSocket URL from environment
 fn get_ibkr_ws_url() -> String {
-    std::env::var("IBKR_BRIDGE_WS_URL")
-        .unwrap_or_else(|_| "ws://127.0.0.1:8765/ws".to_string())
+    std::env::var("IBKR_BRIDGE_WS_URL").unwrap_or_else(|_| "ws://127.0.0.1:8765/ws".to_string())
 }
 
 /// Spawn ibkr-bridge WebSocket handler
@@ -99,21 +98,44 @@ pub fn spawn_ibkr_feed(
                                     Ok(ibkr_msg) => {
                                         let mut state_guard = state.lock().await;
                                         match ibkr_msg {
-                                            IbkrMessage::Tick { symbol, ts, px, sz, bid, ask, vwap } => {
+                                            IbkrMessage::Tick {
+                                                symbol,
+                                                ts,
+                                                px,
+                                                sz,
+                                                bid,
+                                                ask,
+                                                vwap,
+                                            } => {
                                                 let size = if sz > 0.0 { sz } else { 1.0 };
                                                 match symbol.as_str() {
-                                                    "ES" => state_guard.update_es_tick(px, size, ts, bid, ask, vwap),
-                                                    "NQ" => state_guard.update_nq_tick(px, size, ts, bid, ask, vwap),
+                                                    "ES" => state_guard.update_es_tick(
+                                                        px, size, ts, bid, ask, vwap,
+                                                    ),
+                                                    "NQ" => state_guard.update_nq_tick(
+                                                        px, size, ts, bid, ask, vwap,
+                                                    ),
                                                     _ => {}
                                                 }
                                             }
                                             IbkrMessage::TickBackfill { symbol, ticks } => {
-                                                debug!("Received {} tick backfill for {}", ticks.len(), symbol);
+                                                debug!(
+                                                    "Received {} tick backfill for {}",
+                                                    ticks.len(),
+                                                    symbol
+                                                );
                                                 for tick in ticks {
-                                                    let size = if tick.sz > 0.0 { tick.sz } else { 1.0 };
+                                                    let size =
+                                                        if tick.sz > 0.0 { tick.sz } else { 1.0 };
                                                     match symbol.as_str() {
-                                                        "ES" => state_guard.update_es_tick(tick.px, size, tick.ts, None, None, None),
-                                                        "NQ" => state_guard.update_nq_tick(tick.px, size, tick.ts, None, None, None),
+                                                        "ES" => state_guard.update_es_tick(
+                                                            tick.px, size, tick.ts, None, None,
+                                                            None,
+                                                        ),
+                                                        "NQ" => state_guard.update_nq_tick(
+                                                            tick.px, size, tick.ts, None, None,
+                                                            None,
+                                                        ),
                                                         _ => {}
                                                     }
                                                 }
@@ -128,7 +150,11 @@ pub fn spawn_ibkr_feed(
                                     }
                                     Err(e) => {
                                         // Don't spam logs for every unparseable message
-                                        debug!("Failed to parse ibkr message: {} - {}", e, &text[..text.len().min(100)]);
+                                        debug!(
+                                            "Failed to parse ibkr message: {} - {}",
+                                            e,
+                                            &text[..text.len().min(100)]
+                                        );
                                     }
                                 }
                             }

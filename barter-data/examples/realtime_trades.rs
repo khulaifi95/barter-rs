@@ -22,7 +22,7 @@ async fn main() {
     println!("   • Binance Futures");
     println!("   • Bybit Perpetuals");
     println!("   • OKX");
-    println!("");
+    println!();
     println!("🎯 Tracking: BTC and ETH perpetual trades");
     println!("⏰ Current Time: {}", Local::now().format("%Y-%m-%d %H:%M:%S"));
     println!("════════════════════════════════════════════════════════════");
@@ -45,8 +45,8 @@ async fn main() {
         ])
         // OKX BTC and ETH
         .subscribe([
-            (Okx::default(), "btc", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
-            (Okx::default(), "eth", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
+            (Okx, "btc", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
+            (Okx, "eth", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
         ])
         .init()
         .await
@@ -109,7 +109,7 @@ async fn main() {
             }
 
             // Print statistics every 100 trades
-            if stats.total_trades % 100 == 0 && stats.total_trades > 0 {
+            if stats.total_trades.is_multiple_of(100) && stats.total_trades > 0 {
                 stats.print_summary();
             }
         }

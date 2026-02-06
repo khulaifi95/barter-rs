@@ -103,7 +103,10 @@ async fn main() -> anyhow::Result<()> {
     println!("========================================");
     println!("Symbol:     {}", args.symbol);
     println!("Date range: {} to {}", start_date, end_date);
-    println!("Market:     {}", if futures { "Futures (Perps)" } else { "Spot" });
+    println!(
+        "Market:     {}",
+        if futures { "Futures (Perps)" } else { "Spot" }
+    );
     println!("Output:     {:?}", args.output);
     println!("Data types: {:?}", data_types);
     println!("========================================\n");
@@ -120,19 +123,15 @@ async fn main() -> anyhow::Result<()> {
         let pb = ProgressBar::new(total_days);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+                )
                 .unwrap()
                 .progress_chars("#>-"),
         );
 
         let stats = downloader
-            .download_range(
-                &args.symbol,
-                data_type,
-                start_date,
-                end_date,
-                futures,
-            )
+            .download_range(&args.symbol, data_type, start_date, end_date, futures)
             .await?;
 
         pb.finish_with_message("Done");

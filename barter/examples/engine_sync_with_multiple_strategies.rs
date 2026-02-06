@@ -60,6 +60,7 @@ use tracing::debug;
 const FILE_PATH_SYSTEM_CONFIG: &str = "barter/examples/config/system_config.json";
 const RISK_FREE_RETURN: Decimal = dec!(0.05);
 
+#[allow(dead_code)]
 struct MultiStrategy {
     strategy_a: StrategyA,
     strategy_b: StrategyB,
@@ -157,7 +158,7 @@ impl ClosePositionsStrategy for MultiStrategy {
                                 position_a,
                                 StrategyA::ID,
                                 price,
-                                || ClientOrderId::random(),
+                                ClientOrderId::random,
                             )
                         });
 
@@ -174,7 +175,7 @@ impl ClosePositionsStrategy for MultiStrategy {
                                 position_b,
                                 StrategyB::ID,
                                 price,
-                                || ClientOrderId::random(),
+                                ClientOrderId::random,
                             )
                         });
 
@@ -338,7 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DefaultStrategy::default(),
         DefaultRiskManager::default(),
         market_stream,
-        DefaultGlobalData::default(),
+        DefaultGlobalData,
         |_| MultiStrategyCustomInstrumentData::init(Utc::now()),
     );
 

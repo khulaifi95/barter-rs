@@ -59,7 +59,10 @@ impl S3Storage {
                 Ok(result) => return Ok(result),
                 Err(e) if attempts < MAX_RETRIES => {
                     let delay = RETRY_BASE_DELAY_MS * 2u64.pow(attempts - 1);
-                    warn!("S3 operation failed (attempt {}), retrying in {}ms: {}", attempts, delay, e);
+                    warn!(
+                        "S3 operation failed (attempt {}), retrying in {}ms: {}",
+                        attempts, delay, e
+                    );
                     sleep(Duration::from_millis(delay)).await;
                 }
                 Err(e) => return Err(e),

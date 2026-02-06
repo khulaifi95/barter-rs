@@ -41,8 +41,8 @@ impl PrecisionMode {
 
     pub fn multiplier(self) -> f64 {
         match self {
-            PrecisionMode::Standard => 1_000_000_000.0,          // 1e9
-            PrecisionMode::High => 10_000_000_000_000_000.0,     // 1e16
+            PrecisionMode::Standard => 1_000_000_000.0,      // 1e9
+            PrecisionMode::High => 10_000_000_000_000_000.0, // 1e16
         }
     }
 }

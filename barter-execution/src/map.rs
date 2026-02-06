@@ -82,13 +82,11 @@ impl ExecutionInstrumentMap {
     }
 
     pub fn exchange_assets(&self) -> impl Iterator<Item = &AssetNameExchange> {
-        self.asset_names.iter().map(|(asset, _)| asset)
+        self.asset_names.keys()
     }
 
     pub fn exchange_instruments(&self) -> impl Iterator<Item = &InstrumentNameExchange> {
-        self.instrument_names
-            .iter()
-            .map(|(instrument, _)| instrument)
+        self.instrument_names.keys()
     }
 
     pub fn find_exchange_id(&self, exchange: ExchangeIndex) -> Result<ExchangeId, KeyError> {
@@ -377,11 +375,7 @@ mod tests {
 
         // Verify it contains the USDC-USDT instrument
         let usdc_usdt = test_utils::instrument(ExchangeId::Kraken, "USDC", "USDT");
-        assert!(
-            exchange_instruments
-                .iter()
-                .any(|instr| *instr == &usdc_usdt.name_exchange)
-        );
+        assert!(exchange_instruments.contains(&&usdc_usdt.name_exchange));
     }
 
     #[test]

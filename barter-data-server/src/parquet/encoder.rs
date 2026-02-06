@@ -46,8 +46,8 @@ impl PrecisionMode {
     /// Fixed-point multiplier for this precision mode.
     pub fn multiplier(self) -> f64 {
         match self {
-            PrecisionMode::Standard => 1_000_000_000.0,          // 1e9
-            PrecisionMode::High => 10_000_000_000_000_000.0,     // 1e16
+            PrecisionMode::Standard => 1_000_000_000.0,      // 1e9
+            PrecisionMode::High => 10_000_000_000_000_000.0, // 1e16
         }
     }
 }
@@ -74,11 +74,11 @@ impl FixedBytes {
 pub fn encode_fixed_point(value: f64, mode: PrecisionMode) -> FixedBytes {
     match mode {
         PrecisionMode::Standard => {
-            let fixed = (value * mode.multiplier()).round() as i64;
+            let fixed = scaled_i64(value, mode.multiplier()).unwrap_or(0);
             FixedBytes::B8(fixed.to_le_bytes())
         }
         PrecisionMode::High => {
-            let fixed = (value * mode.multiplier()).round() as i128;
+            let fixed = scaled_i128(value, mode.multiplier()).unwrap_or(0);
             FixedBytes::B16(fixed.to_le_bytes())
         }
     }
@@ -88,14 +88,14 @@ pub fn encode_fixed_point(value: f64, mode: PrecisionMode) -> FixedBytes {
 #[inline]
 #[allow(dead_code)]
 pub fn encode_fixed_point_i128(value: f64, mode: PrecisionMode) -> i128 {
-    (value * mode.multiplier()).round() as i128
+    scaled_i128(value, mode.multiplier()).unwrap_or(0)
 }
 
 /// Legacy: Encode a floating-point value to a fixed-point i64 (× 1e9).
 /// Only use for extended bar schema (Barter-only, not Nautilus core).
 #[inline]
 pub fn encode_fixed_point_i64(value: f64) -> i64 {
-    (value * 1_000_000_000.0).round() as i64
+    scaled_i64(value, 1_000_000_000.0).unwrap_or(0)
 }
 
 /// Decode a Nautilus fixed-point value back to f64.
@@ -123,11 +123,41 @@ pub fn decode_fixed_point(bytes: &[u8]) -> f64 {
 #[inline]
 #[allow(dead_code)]
 pub fn encode_price_checked(value: f64, mode: PrecisionMode) -> Option<FixedBytes> {
-    let scaled = value * mode.multiplier();
+    match mode {
+        PrecisionMode::Standard => {
+            scaled_i64(value, mode.multiplier()).map(|fixed| FixedBytes::B8(fixed.to_le_bytes()))
+        }
+        PrecisionMode::High => {
+            scaled_i128(value, mode.multiplier()).map(|fixed| FixedBytes::B16(fixed.to_le_bytes()))
+        }
+    }
+}
+
+#[inline]
+fn scaled_i64(value: f64, multiplier: f64) -> Option<i64> {
+    let scaled = value * multiplier;
     if !scaled.is_finite() {
         return None;
     }
-    Some(encode_fixed_point(value, mode))
+    let rounded = scaled.round();
+    if rounded > i64::MAX as f64 || rounded < i64::MIN as f64 {
+        return None;
+    }
+    Some(rounded as i64)
+}
+
+#[inline]
+fn scaled_i128(value: f64, multiplier: f64) -> Option<i128> {
+    let scaled = value * multiplier;
+    if !scaled.is_finite() {
+        return None;
+    }
+    let rounded = scaled.round();
+    let limit = i128::MAX as f64;
+    if rounded > limit || rounded < -limit {
+        return None;
+    }
+    Some(rounded as i128)
 }
 
 #[cfg(test)]
@@ -152,7 +182,11 @@ mod tests {
     #[test]
     fn test_encode_returns_16_bytes() {
         let encoded = encode_fixed_point(100000.00, PrecisionMode::High);
-        assert_eq!(encoded.as_slice().len(), 16, "High-precision requires 16 bytes");
+        assert_eq!(
+            encoded.as_slice().len(),
+            16,
+            "High-precision requires 16 bytes"
+        );
     }
 
     #[test]

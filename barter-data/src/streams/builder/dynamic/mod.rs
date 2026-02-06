@@ -785,22 +785,22 @@ where
                                             ))
                                         })
                                     }
-                                    (ExchangeId::Okx, SubKind::OrderBooksL2) => {
-                                        init_market_stream(
-                                            STREAM_RECONNECTION_POLICY,
-                                            subs.into_iter()
-                                                .map(|sub| {
-                                                    Subscription::new(Okx, sub.instrument, OrderBooksL2)
-                                                })
-                                                .collect(),
-                                        )
-                                        .await
-                                        .map(|stream| {
-                                            tokio::spawn(stream.forward_to(
+                                    (ExchangeId::Okx, SubKind::OrderBooksL2) => init_market_stream(
+                                        STREAM_RECONNECTION_POLICY,
+                                        subs.into_iter()
+                                            .map(|sub| {
+                                                Subscription::new(Okx, sub.instrument, OrderBooksL2)
+                                            })
+                                            .collect(),
+                                    )
+                                    .await
+                                    .map(|stream| {
+                                        tokio::spawn(
+                                            stream.forward_to(
                                                 txs.l2s.get(&exchange).unwrap().clone(),
-                                            ))
-                                        })
-                                    }
+                                            ),
+                                        )
+                                    }),
                                     (exchange, sub_kind) => {
                                         Err(DataError::Unsupported { exchange, sub_kind })
                                     }

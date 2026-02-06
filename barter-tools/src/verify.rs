@@ -71,7 +71,9 @@ pub fn verify_bar_file(path: &Path) -> Result<VerifyResult, VerifyError> {
     let mut result = VerifyResult::default();
 
     // Verify schema
-    let expected_cols = ["open", "high", "low", "close", "volume", "ts_event", "ts_init"];
+    let expected_cols = [
+        "open", "high", "low", "close", "volume", "ts_event", "ts_init",
+    ];
     for col in &expected_cols {
         if schema.field_with_name(col).is_err() {
             result.errors.push(format!("Missing column: {}", col));
@@ -400,7 +402,10 @@ fn find_parquet_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, VerifyError
 }
 
 /// Verify a directory of Parquet files.
-pub fn verify_directory(dir: &Path, data_type: &str) -> Result<Vec<(std::path::PathBuf, VerifyResult)>, VerifyError> {
+pub fn verify_directory(
+    dir: &Path,
+    data_type: &str,
+) -> Result<Vec<(std::path::PathBuf, VerifyResult)>, VerifyError> {
     let files = find_parquet_files(dir)?;
     let mut results = Vec::new();
 
@@ -455,11 +460,11 @@ mod tests {
         let mut ts_inits = arrow::array::UInt64Builder::with_capacity(capacity);
 
         for &ts in timestamps {
-            opens.append_value(&[0u8; 16])?;
-            highs.append_value(&[0u8; 16])?;
-            lows.append_value(&[0u8; 16])?;
-            closes.append_value(&[0u8; 16])?;
-            volumes.append_value(&[0u8; 16])?;
+            opens.append_value([0u8; 16])?;
+            highs.append_value([0u8; 16])?;
+            lows.append_value([0u8; 16])?;
+            closes.append_value([0u8; 16])?;
+            volumes.append_value([0u8; 16])?;
             ts_events.append_value(ts);
             ts_inits.append_value(ts + 100);
         }
@@ -491,7 +496,7 @@ mod tests {
 
         // Create test file with ordered timestamps (60 second intervals in nanos)
         let timestamps: Vec<u64> = (0..10)
-            .map(|i| 1706540400_000_000_000 + (i as u64 * 60_000_000_000))
+            .map(|i| 1_706_540_400_000_000_000 + (i as u64 * 60_000_000_000))
             .collect();
 
         create_test_bar_parquet(&path, &timestamps).unwrap();
@@ -510,10 +515,10 @@ mod tests {
 
         // Create test file with duplicate timestamp
         let timestamps = vec![
-            1706540400_000_000_000,
-            1706540460_000_000_000,
-            1706540460_000_000_000, // Duplicate!
-            1706540520_000_000_000,
+            1_706_540_400_000_000_000,
+            1_706_540_460_000_000_000,
+            1_706_540_460_000_000_000, // Duplicate!
+            1_706_540_520_000_000_000,
         ];
 
         create_test_bar_parquet(&path, &timestamps).unwrap();
@@ -531,10 +536,10 @@ mod tests {
 
         // Create test file with out-of-order timestamp
         let timestamps = vec![
-            1706540400_000_000_000,
-            1706540520_000_000_000,
-            1706540460_000_000_000, // Out of order!
-            1706540580_000_000_000,
+            1_706_540_400_000_000_000,
+            1_706_540_520_000_000_000,
+            1_706_540_460_000_000_000, // Out of order!
+            1_706_540_580_000_000_000,
         ];
 
         create_test_bar_parquet(&path, &timestamps).unwrap();
@@ -552,12 +557,12 @@ mod tests {
 
         // Create file with a gap (missing 2 minutes)
         let timestamps = vec![
-            1706540400_000_000_000, // 0
-            1706540460_000_000_000, // +1 min
-            1706540520_000_000_000, // +2 min
+            1_706_540_400_000_000_000, // 0
+            1_706_540_460_000_000_000, // +1 min
+            1_706_540_520_000_000_000, // +2 min
             // Gap here: 3 minutes missing
-            1706540760_000_000_000, // +6 min
-            1706540820_000_000_000, // +7 min
+            1_706_540_760_000_000_000, // +6 min
+            1_706_540_820_000_000_000, // +7 min
         ];
 
         create_test_bar_parquet(&path, &timestamps).unwrap();
@@ -572,8 +577,8 @@ mod tests {
     #[test]
     fn test_gap_display() {
         let gap = Gap {
-            start_ns: 1706540400_000_000_000,
-            end_ns: 1706540640_000_000_000,
+            start_ns: 1_706_540_400_000_000_000,
+            end_ns: 1_706_540_640_000_000_000,
             missing_intervals: 3,
         };
 

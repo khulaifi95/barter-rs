@@ -9,22 +9,25 @@
 //! **NOTE**: Uses `NAUTILUS_PRECISION` (high or standard) to select 16-byte or 8-byte encoding.
 
 use arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, Float64Builder, Int64Builder, StringBuilder, UInt64Builder,
-    UInt8Builder,
+    ArrayRef, FixedSizeBinaryBuilder, Float64Builder, Int64Builder, StringBuilder, UInt8Builder,
+    UInt64Builder,
 };
 use arrow::record_batch::RecordBatch;
-use barter_data_server::parquet::{
-    bar_schema, extended_bar_schema, trade_schema, BarMetadata, ExtendedBarMetadata,
-    PrecisionMode, TradeMetadata,
-};
 use barter_data_server::parquet::encoder::{encode_fixed_point, encode_fixed_point_i64};
+use barter_data_server::parquet::{
+    BarMetadata, ExtendedBarMetadata, PrecisionMode, TradeMetadata, bar_schema,
+    extended_bar_schema, trade_schema,
+};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::fs::File;
 use std::sync::Arc;
 
-fn generate_bars(path: &str, precision_mode: PrecisionMode) -> Result<(), Box<dyn std::error::Error>> {
+fn generate_bars(
+    path: &str,
+    precision_mode: PrecisionMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("Generating bars to {}...", path);
 
     // Nautilus bar_type format: {instrument_id}-{step}-{aggregation}-{price_type}-EXTERNAL
@@ -41,7 +44,7 @@ fn generate_bars(path: &str, precision_mode: PrecisionMode) -> Result<(), Box<dy
     // Generate 10 sample 1-minute bars
     let num_bars = 10;
     let base_price = 100_000.0;
-    let base_time_ns: u64 = 1706540400_000_000_000; // 2024-01-29 15:00:00 UTC in nanos
+    let base_time_ns: u64 = 1_706_540_400_000_000_000; // 2024-01-29 15:00:00 UTC in nanos
 
     let bytes_len = precision_mode.bytes_len();
     let mut opens = FixedSizeBinaryBuilder::with_capacity(num_bars, bytes_len);
@@ -106,7 +109,10 @@ fn generate_bars(path: &str, precision_mode: PrecisionMode) -> Result<(), Box<dy
     Ok(())
 }
 
-fn generate_trades(path: &str, precision_mode: PrecisionMode) -> Result<(), Box<dyn std::error::Error>> {
+fn generate_trades(
+    path: &str,
+    precision_mode: PrecisionMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("Generating trades to {}...", path);
 
     let instrument_id = "BTCUSDT-PERP.BINANCE";
@@ -120,7 +126,7 @@ fn generate_trades(path: &str, precision_mode: PrecisionMode) -> Result<(), Box<
     // Generate 100 sample trades
     let num_trades = 100;
     let base_price = 100_000.0;
-    let base_time_ns: u64 = 1706540400_000_000_000; // 2024-01-29 15:00:00 UTC in nanos
+    let base_time_ns: u64 = 1_706_540_400_000_000_000; // 2024-01-29 15:00:00 UTC in nanos
 
     let bytes_len = precision_mode.bytes_len();
     let mut prices = FixedSizeBinaryBuilder::with_capacity(num_trades, bytes_len);
@@ -175,7 +181,10 @@ fn generate_trades(path: &str, precision_mode: PrecisionMode) -> Result<(), Box<
     writer.write(&batch)?;
     writer.close()?;
 
-    println!("  Wrote {} trades with instrument_id={}", num_trades, instrument_id);
+    println!(
+        "  Wrote {} trades with instrument_id={}",
+        num_trades, instrument_id
+    );
     println!("  Schema metadata: {:?}", batch.schema().metadata());
     Ok(())
 }
@@ -188,7 +197,7 @@ fn generate_extended_bars(path: &str) -> Result<(), Box<dyn std::error::Error>> 
     let schema = extended_bar_schema(&meta);
 
     let num_bars = 10;
-    let base_time_ns: u64 = 1706540400_000_000_000; // 2024-01-29 15:00:00 UTC in nanos
+    let base_time_ns: u64 = 1_706_540_400_000_000_000; // 2024-01-29 15:00:00 UTC in nanos
 
     let mut ts_events = UInt64Builder::with_capacity(num_bars);
     let mut ts_inits = UInt64Builder::with_capacity(num_bars);
@@ -392,7 +401,10 @@ fn generate_extended_bars(path: &str) -> Result<(), Box<dyn std::error::Error>> 
     writer.write(&batch)?;
     writer.close()?;
 
-    println!("  Wrote {} extended bars with instrument_id={}", num_bars, instrument_id);
+    println!(
+        "  Wrote {} extended bars with instrument_id={}",
+        num_bars, instrument_id
+    );
     println!("  Schema metadata: {:?}", batch.schema().metadata());
     Ok(())
 }

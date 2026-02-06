@@ -1,51 +1,70 @@
 use barter_data::{
+    books::OrderBook,
     error::DataError,
     event::{DataKind, MarketEvent, MarketEventEnvelope},
+    exchange::okx::ctval,
     snapshot::{MarketSnapshot, SnapshotPerExchangeShort, SnapshotTicker},
     streams::{builder::dynamic::DynamicStreams, consumer::MarketStreamResult, reconnect::Event},
+    subscription::SubKind,
+    subscription::book::OrderBookEvent,
     subscription::funding::FundingRate,
     subscription::open_interest::OpenInterest,
-    subscription::SubKind,
-    books::OrderBook,
 };
 use barter_instrument::{
+    Side,
     exchange::ExchangeId,
     instrument::market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
-    Side,
 };
 use barter_trading_tuis::shared::{
     audit::AuditLogger,
     config::Config,
-    market_state::{ConfigProvider, OptionContract, OptionsChain, Signal, TradMarketStatus, VolRegime, VolatilityEngine},
+    market_state::{
+        ConfigProvider, OptionContract, OptionsChain, Signal, TradMarketStatus, VolRegime,
+        VolatilityEngine,
+    },
     options_state::{OptionsContext, OptionsContextBuilder},
     orchestrator::{OrchestratorResult, StateOrchestrator},
     snapshot_bridge::build_market_data_input,
-    state::{Aggregator, AggregatedSnapshot, Candle1m, CandleBackfill, fetch_binance_1m_candles, ticker_to_binance_symbol},
+    state::{
+        AggregatedSnapshot, Aggregator, Candle1m, CandleBackfill, fetch_binance_1m_candles,
+        ticker_to_binance_symbol,
+    },
     types::{InstrumentInfo, MarketEventMessage},
     vol_regime::VolRegimeEngine,
 };
-use chrono::{DateTime, TimeZone, Utc, Duration as ChronoDuration};
+use bytes::Bytes;
+use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use futures::{SinkExt, StreamExt, stream};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use rustls::crypto::ring::default_provider;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{Arc, atomic::{AtomicI64, AtomicU64, Ordering}};
+#[cfg(unix)]
+use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicI64, AtomicU64, Ordering},
+};
 use std::time::Instant;
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc, watch},
-    time::{interval, Duration},
+    time::{Duration, interval},
 };
-#[cfg(unix)]
-use std::path::Path;
-#[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
-use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
-use bytes::Bytes;
+use tokio_tungstenite::{
+    accept_hdr_async_with_config, connect_async,
+    tungstenite::{
+        Message,
+        handshake::server::{ErrorResponse, Request, Response},
+        http::{Response as HttpResponse, StatusCode},
+        protocol::WebSocketConfig,
+    },
+};
 use tracing::{debug, error, info, warn};
 
 // Parquet/Nautilus integration modules
@@ -54,17 +73,35 @@ mod health;
 mod parquet;
 mod storage;
 
-use parquet::writer::{ParquetConfig, ParquetEvent, TradeEvent, ExtendedBarEvent, run_parquet_writer_task};
-use health::heartbeat::{HeartbeatConfig, HeartbeatState, run_heartbeat_task, update_heartbeat_bar};
-use aggregator::minute_bar::MinuteBarAggregator;
-use aggregator::extended_bar::ExtendedBarBuilder;
 use aggregator::compute_depth_bands;
+use aggregator::extended_bar::ExtendedBarBuilder;
+use aggregator::minute_bar::MinuteBarAggregator;
+use health::heartbeat::{
+    HeartbeatConfig, HeartbeatState, run_heartbeat_task, update_heartbeat_bar,
+};
+use parquet::encoder::encode_fixed_point_i64;
+use parquet::writer::{
+    ExtendedBarEvent, OrderBookDeltaEvent, ParquetConfig, ParquetEvent, TradeEvent,
+    run_parquet_writer_task,
+};
 
 // Parquet channel drop tracking
 static PARQUET_DROPS: AtomicU64 = AtomicU64::new(0);
+static PARQUET_L2_DROPS: AtomicU64 = AtomicU64::new(0);
 
 // L2 throttling per exchange (OKX is noisier, needs higher throttle)
 const L2_THROTTLE_BINANCE_MS: u64 = 100;
+// Order book delta encoding (Nautilus-compatible)
+const BOOK_ACTION_ADD: u8 = 1;
+const BOOK_ACTION_UPDATE: u8 = 2;
+const BOOK_ACTION_DELETE: u8 = 3;
+const BOOK_ACTION_CLEAR: u8 = 4;
+const BOOK_SIDE_NONE: u8 = 0;
+const BOOK_SIDE_BUY: u8 = 1;
+const BOOK_SIDE_SELL: u8 = 2;
+const BOOK_FLAG_SNAPSHOT: u8 = 1 << 5; // RecordFlag::F_SNAPSHOT
+const BOOK_FLAG_MBP: u8 = 1 << 4; // RecordFlag::F_MBP (aggregated price level)
+const BOOK_FLAG_LAST: u8 = 1 << 7; // RecordFlag::F_LAST
 
 // Metrics: trade throughput and timestamp skew tracking
 // Skew = time_received - time_exchange (positive = server behind, negative = exchange ahead)
@@ -95,6 +132,50 @@ const L2_THROTTLE_BYBIT_MS: u64 = 100;
 const L2_THROTTLE_OKX_MS: u64 = 150;
 const SNAPSHOT_VERSION: u16 = 2;
 
+#[derive(Debug, Clone, Serialize)]
+struct ExtendedBar1mLive {
+    ts_open_ns: u64,
+    open: i64,
+    high: i64,
+    low: i64,
+    close: i64,
+    volume: i64,
+    quote_volume: i64,
+    trade_count: u64,
+    buy_volume: i64,
+    sell_volume: i64,
+    delta: i64,
+    cvd: i64,
+    open_interest: i64,
+    oi_change: i64,
+    funding_rate: f64,
+    bid_price: i64,
+    bid_size: i64,
+    ask_price: i64,
+    ask_size: i64,
+    spread_bps: f64,
+    book_imbalance: f64,
+    liq_buy_usd: i64,
+    liq_sell_usd: i64,
+    liq_total_usd: i64,
+    liq_count: u64,
+    bid_depth_10bps_base: i64,
+    ask_depth_10bps_base: i64,
+    bid_depth_10bps_usd: i64,
+    ask_depth_10bps_usd: i64,
+    depth_imb_10bps: f64,
+    bid_depth_50bps_base: i64,
+    ask_depth_50bps_base: i64,
+    bid_depth_50bps_usd: i64,
+    ask_depth_50bps_usd: i64,
+    depth_imb_50bps: f64,
+    bid_depth_100bps_base: i64,
+    ask_depth_100bps_base: i64,
+    bid_depth_100bps_usd: i64,
+    ask_depth_100bps_usd: i64,
+    depth_imb_100bps: f64,
+}
+
 fn parse_csv_set(var: &str) -> Option<HashSet<String>> {
     let raw = std::env::var(var).ok()?;
     let items: HashSet<String> = raw
@@ -105,6 +186,29 @@ fn parse_csv_set(var: &str) -> Option<HashSet<String>> {
     if items.is_empty() { None } else { Some(items) }
 }
 
+fn parse_csv_set_or_default(
+    var: &str,
+    default: Option<HashSet<String>>,
+) -> Option<HashSet<String>> {
+    if std::env::var_os(var).is_some() {
+        parse_csv_set(var)
+    } else {
+        default
+    }
+}
+
+fn default_asset_filter() -> HashSet<String> {
+    let mut set = HashSet::new();
+    set.insert("BTC".to_string());
+    set
+}
+
+fn default_venue_filter() -> HashSet<String> {
+    let mut set = HashSet::new();
+    set.insert("BINANCE".to_string());
+    set
+}
+
 fn parse_bool_env(var: &str, default: bool) -> bool {
     std::env::var(var)
         .ok()
@@ -112,10 +216,103 @@ fn parse_bool_env(var: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn parse_u64_env(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_usize_env(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn websocket_config_from_env() -> WebSocketConfig {
+    let mut config = WebSocketConfig::default();
+    let max_message_bytes = parse_usize_env("WS_MAX_MESSAGE_BYTES", 4 * 1024 * 1024);
+    let max_frame_bytes = parse_usize_env("WS_MAX_FRAME_BYTES", 1024 * 1024);
+
+    config.read_buffer_size = parse_usize_env("WS_READ_BUFFER_BYTES", config.read_buffer_size);
+    config.write_buffer_size = parse_usize_env("WS_WRITE_BUFFER_BYTES", config.write_buffer_size);
+    config.max_write_buffer_size =
+        parse_usize_env("WS_MAX_WRITE_BUFFER_BYTES", config.max_write_buffer_size);
+    config.max_message_size = if max_message_bytes == 0 {
+        None
+    } else {
+        Some(max_message_bytes)
+    };
+    config.max_frame_size = if max_frame_bytes == 0 {
+        None
+    } else {
+        Some(max_frame_bytes)
+    };
+
+    config
+}
+
+fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return "<omitted>".to_string();
+    }
+    let mut iter = text.chars();
+    let mut out: String = iter.by_ref().take(max_chars).collect();
+    if iter.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BarTsEventMode {
+    Open,
+    Close,
+}
+
+impl BarTsEventMode {
+    fn from_env() -> Self {
+        match std::env::var("BAR_TS_EVENT_MODE")
+            .ok()
+            .map(|v| v.trim().to_lowercase())
+            .as_deref()
+        {
+            Some("open") | Some("start") => Self::Open,
+            _ => Self::Close,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ParquetTradeSendMode {
+    Drop,
+    Block,
+    BlockTimeout(Duration),
+}
+
+impl ParquetTradeSendMode {
+    fn from_env() -> Self {
+        let mode = std::env::var("PARQUET_TRADE_SEND_MODE")
+            .ok()
+            .map(|v| v.trim().to_lowercase());
+        if matches!(mode.as_deref(), Some("drop")) {
+            return Self::Drop;
+        }
+        let timeout_ms = parse_u64_env("PARQUET_TRADE_SEND_TIMEOUT_MS", 0);
+        if timeout_ms > 0 {
+            Self::BlockTimeout(Duration::from_millis(timeout_ms))
+        } else {
+            Self::Block
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct StreamFilter {
     assets: Option<HashSet<String>>,
     venues: Option<HashSet<String>>,
+    deny_okx: bool,
     allow_spot: bool,
     allow_perp: bool,
     allow_trades: bool,
@@ -130,9 +327,10 @@ struct StreamFilter {
 impl StreamFilter {
     fn from_env() -> Self {
         Self {
-            assets: parse_csv_set("STREAM_ASSETS"),
-            venues: parse_csv_set("STREAM_VENUES"),
-            allow_spot: parse_bool_env("STREAM_SPOT", true),
+            assets: parse_csv_set_or_default("STREAM_ASSETS", Some(default_asset_filter())),
+            venues: parse_csv_set_or_default("STREAM_VENUES", Some(default_venue_filter())),
+            deny_okx: false,
+            allow_spot: parse_bool_env("STREAM_SPOT", false),
             allow_perp: parse_bool_env("STREAM_PERP", true),
             allow_trades: parse_bool_env("STREAM_TRADES", true),
             allow_l1: parse_bool_env("STREAM_L1", true),
@@ -151,10 +349,13 @@ impl StreamFilter {
         kind: MarketDataInstrumentKind,
         subkind: SubKind,
     ) -> bool {
-        if let Some(assets) = &self.assets {
-            if !assets.contains(&base.to_uppercase()) {
-                return false;
-            }
+        if self.deny_okx && exchange_to_venue(&exchange) == "OKX" {
+            return false;
+        }
+        if let Some(assets) = &self.assets
+            && !assets.contains(&base.to_uppercase())
+        {
+            return false;
         }
         if let Some(venues) = &self.venues {
             let venue = exchange_to_venue(&exchange);
@@ -183,10 +384,13 @@ impl StreamFilter {
         if !self.allow_funding {
             return false;
         }
-        if let Some(assets) = &self.assets {
-            if !assets.contains(&base.to_uppercase()) {
-                return false;
-            }
+        if self.deny_okx && exchange_to_venue(&exchange) == "OKX" {
+            return false;
+        }
+        if let Some(assets) = &self.assets
+            && !assets.contains(&base.to_uppercase())
+        {
+            return false;
         }
         if let Some(venues) = &self.venues {
             let venue = exchange_to_venue(&exchange);
@@ -196,6 +400,161 @@ impl StreamFilter {
         }
         true
     }
+
+    fn binance_only(&self) -> Self {
+        let mut venues = HashSet::new();
+        venues.insert("BINANCE".to_string());
+        Self {
+            venues: Some(venues),
+            ..self.clone()
+        }
+    }
+
+    fn trades_only(&self) -> Self {
+        Self {
+            allow_trades: true,
+            allow_l1: false,
+            allow_l2: false,
+            allow_oi: false,
+            allow_liq: false,
+            allow_cvd: false,
+            allow_funding: false,
+            ..self.clone()
+        }
+    }
+
+    fn disable_okx(&self) -> Self {
+        Self {
+            deny_okx: true,
+            ..self.clone()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxInstrumentsResponse {
+    data: Vec<OkxInstrument>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxInstrument {
+    #[serde(rename = "instId")]
+    inst_id: String,
+    #[serde(rename = "ctVal")]
+    ct_val: Option<String>,
+}
+
+async fn refresh_okx_ctval(filter: &StreamFilter, strict: bool) -> bool {
+    if filter.deny_okx {
+        return true;
+    }
+    if let Some(venues) = &filter.venues
+        && !venues.contains("OKX")
+    {
+        return true;
+    }
+
+    let client = match Client::builder().timeout(Duration::from_secs(3)).build() {
+        Ok(client) => client,
+        Err(err) => {
+            warn!(
+                "OKX ctVal fetch skipped: failed to build HTTP client: {}",
+                err
+            );
+            return false;
+        }
+    };
+
+    let url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP";
+    let response = match client.get(url).send().await {
+        Ok(response) => {
+            if strict {
+                match response.error_for_status() {
+                    Ok(ok) => ok,
+                    Err(err) => {
+                        warn!("OKX ctVal fetch failed: {}", err);
+                        return false;
+                    }
+                }
+            } else if !response.status().is_success() {
+                warn!("OKX ctVal fetch failed: http_status={}", response.status());
+                return false;
+            } else {
+                response
+            }
+        }
+        Err(err) => {
+            warn!("OKX ctVal fetch failed: {}", err);
+            return false;
+        }
+    };
+
+    let payload = match response.json::<OkxInstrumentsResponse>().await {
+        Ok(payload) => payload,
+        Err(err) => {
+            warn!("OKX ctVal parse failed: {}", err);
+            return false;
+        }
+    };
+
+    let mut map_f64 = HashMap::new();
+    let mut map_dec = HashMap::new();
+    let asset_filter = filter.assets.as_ref();
+
+    for instrument in payload.data {
+        let inst_id = instrument.inst_id.to_uppercase();
+        let base = inst_id.split('-').next().unwrap_or("");
+        if let Some(assets) = asset_filter
+            && !assets.contains(base)
+        {
+            continue;
+        }
+        let ct_val = match instrument.ct_val {
+            Some(ct_val) => ct_val,
+            None => continue,
+        };
+        let dec = match ct_val.parse::<Decimal>() {
+            Ok(dec) => dec,
+            Err(_) => continue,
+        };
+        let f64_val = match ct_val.parse::<f64>() {
+            Ok(f64_val) => f64_val,
+            Err(_) => continue,
+        };
+        map_dec.insert(inst_id.clone(), dec);
+        map_f64.insert(inst_id, f64_val);
+    }
+
+    if map_f64.is_empty() {
+        warn!("OKX ctVal fetch returned no instruments (keeping static defaults)");
+        return false;
+    }
+
+    if strict && let Some(assets) = asset_filter {
+        let mut missing = Vec::new();
+        for base in assets {
+            let prefix = format!("{}-", base.to_uppercase());
+            if !map_f64.keys().any(|k| k.starts_with(&prefix)) {
+                missing.push(base.clone());
+            }
+        }
+        if !missing.is_empty() {
+            warn!(
+                "OKX ctVal strict enabled, but missing ctVal entries for assets={:?}. \
+                 Disabling OKX streams. (You can override ctVal via OKX_CTVAL_<BASE>=... or disable strict mode.)",
+                missing
+            );
+            return false;
+        }
+    }
+
+    let entries = map_f64.len();
+    ctval::set_dynamic_ctval(map_f64, map_dec);
+    info!(
+        "OKX ctVal cache populated from API ({} instruments)",
+        entries
+    );
+    true
 }
 
 #[derive(Clone, Debug)]
@@ -206,35 +565,37 @@ struct ParquetFilter {
     write_trades: bool,
     write_bars: bool,
     write_extended: bool,
+    write_l2: bool,
 }
 
 impl ParquetFilter {
     fn from_env() -> Self {
         Self {
-            assets: parse_csv_set("PARQUET_ASSETS"),
-            venues: parse_csv_set("PARQUET_VENUES"),
+            assets: parse_csv_set_or_default("PARQUET_ASSETS", Some(default_asset_filter())),
+            venues: parse_csv_set_or_default("PARQUET_VENUES", Some(default_venue_filter())),
             instruments: parse_csv_set("PARQUET_INSTRUMENTS"),
             write_trades: parse_bool_env("PARQUET_WRITE_TRADES", true),
             write_bars: parse_bool_env("PARQUET_WRITE_BARS", true),
             write_extended: parse_bool_env("PARQUET_WRITE_EXTENDED", true),
+            write_l2: parse_bool_env("PARQUET_WRITE_L2", false),
         }
     }
 
     fn allows(&self, instrument_id: &str, base: &str, venue: &str) -> bool {
-        if let Some(instruments) = &self.instruments {
-            if !instruments.contains(&instrument_id.to_uppercase()) {
-                return false;
-            }
+        if let Some(instruments) = &self.instruments
+            && !instruments.contains(&instrument_id.to_uppercase())
+        {
+            return false;
         }
-        if let Some(assets) = &self.assets {
-            if !assets.contains(&base.to_uppercase()) {
-                return false;
-            }
+        if let Some(assets) = &self.assets
+            && !assets.contains(&base.to_uppercase())
+        {
+            return false;
         }
-        if let Some(venues) = &self.venues {
-            if !venues.contains(&venue.to_uppercase()) {
-                return false;
-            }
+        if let Some(venues) = &self.venues
+            && !venues.contains(&venue.to_uppercase())
+        {
+            return false;
         }
         true
     }
@@ -245,16 +606,22 @@ impl ParquetFilter {
 fn exchange_to_venue(exchange: &barter_instrument::exchange::ExchangeId) -> &'static str {
     use barter_instrument::exchange::ExchangeId;
     match exchange {
-        ExchangeId::BinanceFuturesUsd | ExchangeId::BinanceFuturesCoin |
-        ExchangeId::BinanceSpot | ExchangeId::BinanceOptions |
-        ExchangeId::BinancePortfolioMargin | ExchangeId::BinanceUs => "BINANCE",
+        ExchangeId::BinanceFuturesUsd
+        | ExchangeId::BinanceFuturesCoin
+        | ExchangeId::BinanceSpot
+        | ExchangeId::BinanceOptions
+        | ExchangeId::BinancePortfolioMargin
+        | ExchangeId::BinanceUs => "BINANCE",
         ExchangeId::Okx => "OKX",
         ExchangeId::BybitPerpetualsUsd | ExchangeId::BybitSpot => "BYBIT",
         ExchangeId::Coinbase | ExchangeId::CoinbaseInternational => "COINBASE",
         ExchangeId::Kraken => "KRAKEN",
-        ExchangeId::GateioSpot | ExchangeId::GateioFuturesUsd | ExchangeId::GateioFuturesBtc |
-        ExchangeId::GateioPerpetualsUsd | ExchangeId::GateioPerpetualsBtc |
-        ExchangeId::GateioOptions => "GATEIO",
+        ExchangeId::GateioSpot
+        | ExchangeId::GateioFuturesUsd
+        | ExchangeId::GateioFuturesBtc
+        | ExchangeId::GateioPerpetualsUsd
+        | ExchangeId::GateioPerpetualsBtc
+        | ExchangeId::GateioOptions => "GATEIO",
         ExchangeId::Htx => "HTX",
         ExchangeId::Kucoin => "KUCOIN",
         ExchangeId::Bitfinex => "BITFINEX",
@@ -270,8 +637,148 @@ fn exchange_to_venue(exchange: &barter_instrument::exchange::ExchangeId) -> &'st
     }
 }
 
-/// OKX perpetuals report sizes in contracts. Convert to base units using ctVal.
+fn build_order_book_deltas(
+    instrument_id: &str,
+    ob_event: &OrderBookEvent,
+    ts_event_ns: u64,
+    ts_init_ns: u64,
+    price_precision: u8,
+    size_precision: u8,
+    max_depth: usize,
+) -> Vec<OrderBookDeltaEvent> {
+    let mut deltas = Vec::new();
+    match ob_event {
+        OrderBookEvent::Snapshot(book) => {
+            let seq = book.sequence();
+            let flags = BOOK_FLAG_SNAPSHOT | BOOK_FLAG_MBP;
+            deltas.push(OrderBookDeltaEvent {
+                instrument_id: instrument_id.to_string(),
+                action: BOOK_ACTION_CLEAR,
+                side: BOOK_SIDE_NONE,
+                price: 0.0,
+                size: 0.0,
+                order_id: 0,
+                flags,
+                sequence: seq,
+                ts_event_ns,
+                ts_init_ns,
+                price_precision,
+                size_precision,
+            });
 
+            for level in book.bids().levels().iter().take(max_depth) {
+                let Some(price) = level.price.to_f64() else {
+                    continue;
+                };
+                let Some(size) = level.amount.to_f64() else {
+                    continue;
+                };
+                deltas.push(OrderBookDeltaEvent {
+                    instrument_id: instrument_id.to_string(),
+                    action: BOOK_ACTION_ADD,
+                    side: BOOK_SIDE_BUY,
+                    price,
+                    size,
+                    order_id: 0,
+                    flags,
+                    sequence: seq,
+                    ts_event_ns,
+                    ts_init_ns,
+                    price_precision,
+                    size_precision,
+                });
+            }
+
+            for level in book.asks().levels().iter().take(max_depth) {
+                let Some(price) = level.price.to_f64() else {
+                    continue;
+                };
+                let Some(size) = level.amount.to_f64() else {
+                    continue;
+                };
+                deltas.push(OrderBookDeltaEvent {
+                    instrument_id: instrument_id.to_string(),
+                    action: BOOK_ACTION_ADD,
+                    side: BOOK_SIDE_SELL,
+                    price,
+                    size,
+                    order_id: 0,
+                    flags,
+                    sequence: seq,
+                    ts_event_ns,
+                    ts_init_ns,
+                    price_precision,
+                    size_precision,
+                });
+            }
+        }
+        OrderBookEvent::Update(book) => {
+            let seq = book.sequence();
+            let flags = BOOK_FLAG_MBP;
+            for level in book.bids().levels().iter().take(max_depth) {
+                let Some(price) = level.price.to_f64() else {
+                    continue;
+                };
+                let Some(size) = level.amount.to_f64() else {
+                    continue;
+                };
+                let action = if size == 0.0 {
+                    BOOK_ACTION_DELETE
+                } else {
+                    BOOK_ACTION_UPDATE
+                };
+                deltas.push(OrderBookDeltaEvent {
+                    instrument_id: instrument_id.to_string(),
+                    action,
+                    side: BOOK_SIDE_BUY,
+                    price,
+                    size,
+                    order_id: 0,
+                    flags,
+                    sequence: seq,
+                    ts_event_ns,
+                    ts_init_ns,
+                    price_precision,
+                    size_precision,
+                });
+            }
+
+            for level in book.asks().levels().iter().take(max_depth) {
+                let Some(price) = level.price.to_f64() else {
+                    continue;
+                };
+                let Some(size) = level.amount.to_f64() else {
+                    continue;
+                };
+                let action = if size == 0.0 {
+                    BOOK_ACTION_DELETE
+                } else {
+                    BOOK_ACTION_UPDATE
+                };
+                deltas.push(OrderBookDeltaEvent {
+                    instrument_id: instrument_id.to_string(),
+                    action,
+                    side: BOOK_SIDE_SELL,
+                    price,
+                    size,
+                    order_id: 0,
+                    flags,
+                    sequence: seq,
+                    ts_event_ns,
+                    ts_init_ns,
+                    price_precision,
+                    size_precision,
+                });
+            }
+        }
+    }
+    if let Some(last) = deltas.last_mut() {
+        last.flags |= BOOK_FLAG_LAST;
+    }
+    deltas
+}
+
+/// OKX perpetuals report sizes in contracts. Convert to base units using ctVal.
 /// Serialization config for broadcast messages (read once at startup)
 /// Also caches hot-path config values to avoid env var parsing per-event
 struct BroadcastConfig {
@@ -307,15 +814,23 @@ impl PrecisionConfig {
         let mut map = HashMap::new();
         if let Ok(raw) = std::env::var("PRECISION_MAP") {
             for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-                let Some((instrument_id, prec)) = entry.split_once('=') else { continue };
-                let Some((p_str, s_str)) = prec.split_once(':') else { continue };
+                let Some((instrument_id, prec)) = entry.split_once('=') else {
+                    continue;
+                };
+                let Some((p_str, s_str)) = prec.split_once(':') else {
+                    continue;
+                };
                 if let (Ok(p), Ok(s)) = (p_str.parse::<u8>(), s_str.parse::<u8>()) {
                     map.insert(instrument_id.to_string(), (p, s));
                 }
             }
         }
 
-        Self { default_price, default_size, map }
+        Self {
+            default_price,
+            default_size,
+            map,
+        }
     }
 
     fn get(&self, instrument_id: &str) -> (u8, u8) {
@@ -332,8 +847,8 @@ impl BroadcastConfig {
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
             .unwrap_or(false);
-        let source = std::env::var("WS_SOURCE")
-            .unwrap_or_else(|_| "barter-data-server".to_string());
+        let source =
+            std::env::var("WS_SOURCE").unwrap_or_else(|_| "barter-data-server".to_string());
         // Default to binary frames for performance; set WS_BINARY_FRAMES=0 for text
         let use_binary_frames = std::env::var("WS_BINARY_FRAMES")
             .ok()
@@ -348,7 +863,13 @@ impl BroadcastConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(50_000.0);
-        Self { use_envelope, source, use_binary_frames, l1_throttle_ms, spot_log_threshold }
+        Self {
+            use_envelope,
+            source,
+            use_binary_frames,
+            l1_throttle_ms,
+            spot_log_threshold,
+        }
     }
 }
 
@@ -366,14 +887,18 @@ impl UdsConfig {
             .ok()
             .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE"))
             .unwrap_or(default_enabled);
-        let path = std::env::var("UDS_PATH")
-            .unwrap_or_else(|_| "/tmp/barter-data.sock".to_string());
+        let path =
+            std::env::var("UDS_PATH").unwrap_or_else(|_| "/tmp/barter-data.sock".to_string());
         let buffer = std::env::var("UDS_BUFFER")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100_000_usize)
             .clamp(1_000, 500_000);
-        Self { enabled, path, buffer }
+        Self {
+            enabled,
+            path,
+            buffer,
+        }
     }
 }
 
@@ -391,14 +916,17 @@ impl TcpConfig {
             .ok()
             .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE"))
             .unwrap_or(default_enabled);
-        let addr = std::env::var("TCP_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:9102".to_string());
+        let addr = std::env::var("TCP_ADDR").unwrap_or_else(|_| "127.0.0.1:9102".to_string());
         let buffer = std::env::var("TCP_BUFFER")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100_000_usize)
             .clamp(1_000, 500_000);
-        Self { enabled, addr, buffer }
+        Self {
+            enabled,
+            addr,
+            buffer,
+        }
     }
 }
 
@@ -470,7 +998,10 @@ fn get_l2_throttle_ms_for_exchange(exchange: &ExchangeId) -> u64 {
 }
 
 fn trad_tick_event(tick: TradMarketTick) -> MarketEventMessage {
-    let exchange_time = chrono::Utc.timestamp_millis_opt(tick.ts).single().unwrap_or_else(Utc::now);
+    let exchange_time = chrono::Utc
+        .timestamp_millis_opt(tick.ts)
+        .single()
+        .unwrap_or_else(Utc::now);
     MarketEventMessage {
         time_exchange: exchange_time,
         time_received: Utc::now(),
@@ -517,7 +1048,9 @@ struct SnapshotBuilder {
 
 impl SnapshotBuilder {
     fn new() -> Self {
-        Self { tickers: HashMap::new() }
+        Self {
+            tickers: HashMap::new(),
+        }
     }
 
     fn update(&mut self, event: &MarketEvent<MarketDataInstrument, DataKind>) {
@@ -577,10 +1110,14 @@ impl TickerDerivedState {
                 let notional = trade.price * trade.amount;
                 self.trade_volumes.push_back((now, notional));
                 let exchange = format!("{:?}", event.exchange);
-                let signed = if trade.side == Side::Buy { notional } else { -notional };
+                let signed = if trade.side == Side::Buy {
+                    notional
+                } else {
+                    -notional
+                };
                 self.trade_flows_by_exchange
                     .entry(exchange)
-                    .or_insert_with(VecDeque::new)
+                    .or_default()
                     .push_back((now, signed, notional));
                 self.prune_trade_volumes(now);
                 self.prune_trade_flows(now);
@@ -589,7 +1126,7 @@ impl TickerDerivedState {
                 let entry = self
                     .cvd_by_exchange
                     .entry(format!("{:?}", event.exchange))
-                    .or_insert_with(VecDeque::new);
+                    .or_default();
                 entry.push_back((now, cvd.delta_quote));
                 self.prune_cvd(now);
             }
@@ -598,7 +1135,7 @@ impl TickerDerivedState {
                 let entry = self
                     .oi_by_exchange
                     .entry(format!("{:?}", event.exchange))
-                    .or_insert_with(VecDeque::new);
+                    .or_default();
                 entry.push_back((now, value));
                 self.prune_oi(now);
             }
@@ -606,7 +1143,7 @@ impl TickerDerivedState {
                 let entry = self
                     .funding_by_exchange
                     .entry(format!("{:?}", event.exchange))
-                    .or_insert_with(VecDeque::new);
+                    .or_default();
                 entry.push_back((now, fr.rate));
                 self.prune_funding(now);
             }
@@ -660,7 +1197,12 @@ impl TickerDerivedState {
         }
     }
 
-    fn sum_window(&self, data: &VecDeque<(DateTime<Utc>, f64)>, now: DateTime<Utc>, window_secs: i64) -> f64 {
+    fn sum_window(
+        &self,
+        data: &VecDeque<(DateTime<Utc>, f64)>,
+        now: DateTime<Utc>,
+        window_secs: i64,
+    ) -> f64 {
         data.iter()
             .filter(|(ts, _)| (now - *ts).num_seconds() <= window_secs)
             .map(|(_, v)| *v)
@@ -807,7 +1349,11 @@ impl TickerDerivedState {
         Self::prune_queue(&mut self.liq_notional, now, 60);
     }
 
-    fn prune_queue(queue: &mut VecDeque<(DateTime<Utc>, f64)>, now: DateTime<Utc>, window_secs: i64) {
+    fn prune_queue(
+        queue: &mut VecDeque<(DateTime<Utc>, f64)>,
+        now: DateTime<Utc>,
+        window_secs: i64,
+    ) {
         while let Some((ts, _)) = queue.front() {
             if (now - *ts).num_seconds() > window_secs {
                 queue.pop_front();
@@ -818,21 +1364,19 @@ impl TickerDerivedState {
     }
 }
 
-fn market_event_to_message(event: MarketEvent<MarketDataInstrument, DataKind>) -> MarketEventMessage {
+fn market_event_to_message(
+    event: MarketEvent<MarketDataInstrument, DataKind>,
+) -> MarketEventMessage {
     let (kind_name, data) = match &event.kind {
         DataKind::Trade(trade) => ("trade", serde_json::to_value(trade).unwrap_or_default()),
-        DataKind::Liquidation(liq) => (
-            "liquidation",
-            serde_json::to_value(liq).unwrap_or_default(),
-        ),
+        DataKind::Liquidation(liq) => {
+            ("liquidation", serde_json::to_value(liq).unwrap_or_default())
+        }
         DataKind::OpenInterest(oi) => (
             "open_interest",
             serde_json::to_value(oi).unwrap_or_default(),
         ),
-        DataKind::FundingRate(fr) => (
-            "funding_rate",
-            serde_json::to_value(fr).unwrap_or_default(),
-        ),
+        DataKind::FundingRate(fr) => ("funding_rate", serde_json::to_value(fr).unwrap_or_default()),
         DataKind::CumulativeVolumeDelta(cvd) => (
             "cumulative_volume_delta",
             serde_json::to_value(cvd).unwrap_or_default(),
@@ -872,11 +1416,23 @@ enum IbkrMessage {
     #[serde(rename = "tick")]
     Tick(TradMarketTick),
     #[serde(rename = "tick_backfill")]
-    TickBackfill { #[allow(dead_code)] symbol: String, ticks: Vec<TradMarketTick> },
+    TickBackfill {
+        #[allow(dead_code)]
+        symbol: String,
+        ticks: Vec<TradMarketTick>,
+    },
     #[serde(rename = "welcome")]
-    Welcome { #[serde(default)] #[allow(dead_code)] message: Option<String> },
+    Welcome {
+        #[serde(default)]
+        #[allow(dead_code)]
+        message: Option<String>,
+    },
     #[serde(rename = "status")]
-    Status { #[serde(default)] #[allow(dead_code)] connected: Option<bool> },
+    Status {
+        #[serde(default)]
+        #[allow(dead_code)]
+        connected: Option<bool>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -1028,10 +1584,14 @@ async fn main() {
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
     let parquet_filter = ParquetFilter::from_env();
+    let parquet_l2_max_depth = parse_usize_env("PARQUET_L2_MAX_DEPTH", 50);
+    let parquet_l2_sample_ms = parse_u64_env("PARQUET_L2_SAMPLE_MS", 0);
     let parquet_buffer = std::env::var("PARQUET_BUFFER")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(50_000_usize);
+
+    let parquet_trade_send_mode = ParquetTradeSendMode::from_env();
 
     let (parquet_tx, parquet_rx) = mpsc::channel::<ParquetEvent>(parquet_buffer);
     let parquet_tx = Arc::new(parquet_tx);
@@ -1048,12 +1608,16 @@ async fn main() {
     let l2_book_cache: Arc<tokio::sync::Mutex<HashMap<String, OrderBook>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
+    // Forward testing can run without Parquet, but still needs bar/extended aggregation.
+    let forward_enabled = uds_config.enabled || tcp_config.enabled;
+
     if parquet_enabled {
         let config = ParquetConfig::from_env();
         info!(
             "Parquet writer enabled: output_dir={:?}, flush_interval={}s, buffer={}",
             config.output_dir, config.flush_interval_secs, parquet_buffer
         );
+        info!("Parquet trade send mode: {:?}", parquet_trade_send_mode);
         tokio::spawn(async move {
             run_parquet_writer_task(parquet_rx, config).await;
         });
@@ -1090,15 +1654,17 @@ async fn main() {
     };
 
     // Start WebSocket server
-    // Configurable via WS_ADDR env var (default: 0.0.0.0:9001)
-    let server_addr_str = std::env::var("WS_ADDR").unwrap_or_else(|_| "0.0.0.0:9001".to_string());
+    // Configurable via WS_ADDR env var (default: 127.0.0.1:9001)
+    let server_addr_str = std::env::var("WS_ADDR").unwrap_or_else(|_| "127.0.0.1:9001".to_string());
     let server_addr = server_addr_str
         .parse::<SocketAddr>()
-        .unwrap_or_else(|_| "0.0.0.0:9001".parse().unwrap());
+        .unwrap_or_else(|_| "127.0.0.1:9001".parse().unwrap());
     let tx_trades_clone = tx_trades.clone();
     let tx_l2_clone = tx_l2.clone();
     let kline_cache_clone = Arc::clone(&kline_cache);
     let broadcast_cfg = Arc::clone(&broadcast_config);
+    let bar_ts_mode = BarTsEventMode::from_env();
+    info!("Bar ts_event mode: {:?}", bar_ts_mode);
     tokio::spawn(async move {
         start_websocket_server(
             server_addr,
@@ -1144,7 +1710,11 @@ async fn main() {
             let skew_max = SKEW_MAX_MS.swap(0, Ordering::Relaxed);
             let skew_min = SKEW_MIN_MS.swap(i64::MAX, Ordering::Relaxed);
             let skew_count = SKEW_COUNT.swap(0, Ordering::Relaxed);
-            let skew_avg = if skew_count > 0 { skew_sum / skew_count as i64 } else { 0 };
+            let skew_avg = if skew_count > 0 {
+                skew_sum / skew_count as i64
+            } else {
+                0
+            };
             let skew_min_display = if skew_min == i64::MAX { 0 } else { skew_min };
 
             // Per-feed event counts (reset each interval)
@@ -1176,21 +1746,33 @@ async fn main() {
 
             // Stale feed alerts
             if binance_last > 0 && (now_ms - binance_last) > FEED_STALE_THRESHOLD_MS {
-                warn!("STALE: Binance feed stale for {}s", (now_ms - binance_last) / 1000);
+                warn!(
+                    "STALE: Binance feed stale for {}s",
+                    (now_ms - binance_last) / 1000
+                );
             }
             if okx_last > 0 && (now_ms - okx_last) > FEED_STALE_THRESHOLD_MS {
                 warn!("STALE: OKX feed stale for {}s", (now_ms - okx_last) / 1000);
             }
             if bybit_last > 0 && (now_ms - bybit_last) > FEED_STALE_THRESHOLD_MS {
-                warn!("STALE: Bybit feed stale for {}s", (now_ms - bybit_last) / 1000);
+                warn!(
+                    "STALE: Bybit feed stale for {}s",
+                    (now_ms - bybit_last) / 1000
+                );
             }
             if ibkr_last > 0 && (now_ms - ibkr_last) > FEED_STALE_THRESHOLD_MS {
-                warn!("STALE: IBKR feed stale for {}s", (now_ms - ibkr_last) / 1000);
+                warn!(
+                    "STALE: IBKR feed stale for {}s",
+                    (now_ms - ibkr_last) / 1000
+                );
             }
 
             // Backpressure alert
             if agg_dropped > 0 {
-                warn!("BACKPRESSURE: {} events dropped from aggregator channel", agg_dropped);
+                warn!(
+                    "BACKPRESSURE: {} events dropped from aggregator channel",
+                    agg_dropped
+                );
             }
         }
     });
@@ -1214,13 +1796,14 @@ async fn main() {
         let options_cache = Arc::clone(&options_cache);
         let broadcast_cfg = Arc::clone(&broadcast_config);
         tokio::spawn(async move {
-            start_deribit_options_feed(tx_trades, tx_uds, broadcast_cfg, spot_cache, options_cache).await;
+            start_deribit_options_feed(tx_trades, tx_uds, broadcast_cfg, spot_cache, options_cache)
+                .await;
         });
     }
 
     let tickers_raw = std::env::var("TICKERS")
         .or_else(|_| std::env::var("STREAM_ASSETS"))
-        .unwrap_or_else(|_| "BTC,ETH,SOL".to_string());
+        .unwrap_or_else(|_| "BTC".to_string());
     let tickers: Vec<String> = tickers_raw
         .split(',')
         .map(|s| s.trim().to_uppercase())
@@ -1249,7 +1832,15 @@ async fn main() {
             let broadcast_cfg = Arc::clone(&broadcast_config);
             let ticker = ticker.clone();
             tokio::spawn(async move {
-                run_binance_kline_stream(ticker, tx_trades, tx_uds, broadcast_cfg, kline_cache, agg_tx).await;
+                run_binance_kline_stream(
+                    ticker,
+                    tx_trades,
+                    tx_uds,
+                    broadcast_cfg,
+                    kline_cache,
+                    agg_tx,
+                )
+                .await;
             });
         }
 
@@ -1273,7 +1864,10 @@ async fn main() {
                         for ticker in &tickers {
                             if let Some(candles) = cache.get(ticker) {
                                 let is_stale = candles.is_empty()
-                                    || candles.back().map(|c| c.start_time.date_naive() != today).unwrap_or(true);
+                                    || candles
+                                        .back()
+                                        .map(|c| c.start_time.date_naive() != today)
+                                        .unwrap_or(true);
                                 if is_stale {
                                     stale_tickers.push(ticker.clone());
                                 }
@@ -1323,7 +1917,10 @@ async fn main() {
                     }
 
                     if !stale_tickers.is_empty() {
-                        info!("Background kline refresh completed for {} tickers", stale_tickers.len());
+                        info!(
+                            "Background kline refresh completed for {} tickers",
+                            stale_tickers.len()
+                        );
                     }
                 }
             });
@@ -1355,10 +1952,12 @@ async fn main() {
                         .get(ticker)
                         .and_then(|t| t.realized_vol_1h)
                         .unwrap_or(0.0);
-                    let state = engines.entry(ticker.clone()).or_insert_with(|| VolRegimeState {
-                        engine: VolRegimeEngine::default(),
-                        last_hour: None,
-                    });
+                    let state = engines
+                        .entry(ticker.clone())
+                        .or_insert_with(|| VolRegimeState {
+                            engine: VolRegimeEngine::default(),
+                            last_hour: None,
+                        });
                     let now_hour = Utc::now().timestamp() / 3600;
                     if rv > 0.0 && state.last_hour != Some(now_hour) {
                         state.engine.push_rv(rv);
@@ -1437,11 +2036,8 @@ async fn main() {
                         .server_snapshot
                         .as_ref()
                         .and_then(|snap| snap.tickers.get(ticker));
-                    let mut input = build_market_data_input(
-                        ticker_snap,
-                        server_ticker,
-                        trad_status,
-                    );
+                    let mut input =
+                        build_market_data_input(ticker_snap, server_ticker, trad_status);
                     input.timestamps.trad_markets_ts = trad_ts;
                     if let Some(ctx) = options_snapshot.get(ticker) {
                         input.options_context = Some(ctx.clone());
@@ -1510,7 +2106,15 @@ async fn main() {
     info!("Clients can connect to receive real-time market data");
 
     // Initialize market data streams (filtered by env)
+    let okx_ctval_strict = parse_bool_env("OKX_CTVAL_STRICT", false);
     let stream_filter = StreamFilter::from_env();
+    let okx_ctval_ok = refresh_okx_ctval(&stream_filter, okx_ctval_strict).await;
+    let stream_filter = if okx_ctval_strict && !okx_ctval_ok {
+        warn!("OKX_CTVAL_STRICT=1 and ctVal refresh failed; disabling OKX streams.");
+        stream_filter.disable_okx()
+    } else {
+        stream_filter
+    };
     let streams = init_market_streams(&stream_filter).await;
 
     // Combine WebSocket and REST API streams
@@ -1530,6 +2134,7 @@ async fn main() {
 
     // Throttle state: per-instrument last broadcast time (L2 and Binance L1)
     let mut l2_last_broadcast: HashMap<(ExchangeId, String, String), Instant> = HashMap::new();
+    let mut l2_last_parquet: HashMap<(ExchangeId, String, String), Instant> = HashMap::new();
     let mut l1_last_broadcast: HashMap<String, Instant> = HashMap::new();
 
     // Process market events and broadcast to clients
@@ -1541,32 +2146,35 @@ async fn main() {
             Event::Item(result) => match result {
                 Ok(market_event) => {
                     // Drop invalid trades early (prevents OHLC low=0 contamination)
-                    if let DataKind::Trade(trade) = &market_event.kind {
-                        if trade.price <= 0.0 || trade.amount <= 0.0 {
-                            let drops = INVALID_TRADE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                            if drops % 1000 == 1 {
-                                warn!(
-                                    "Dropped invalid trade: {} {}/{} price={} amount={} (total {})",
-                                    market_event.exchange,
-                                    market_event.instrument.base,
-                                    market_event.instrument.quote,
-                                    trade.price,
-                                    trade.amount,
-                                    drops
-                                );
-                            }
-                            continue;
-                        }
-                    }
-                    snapshot_builder.lock().await.update(&market_event);
-                    if let DataKind::Trade(trade) = &market_event.kind {
-                        if matches!(market_event.instrument.kind, MarketDataInstrumentKind::Perpetual) {
-                            let mut cache = spot_cache.lock().await;
-                            cache.insert(
-                                market_event.instrument.base.to_string().to_uppercase(),
+                    if let DataKind::Trade(trade) = &market_event.kind
+                        && (trade.price <= 0.0 || trade.amount <= 0.0)
+                    {
+                        let drops = INVALID_TRADE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                        if drops % 1000 == 1 {
+                            warn!(
+                                "Dropped invalid trade: {} {}/{} price={} amount={} (total {})",
+                                market_event.exchange,
+                                market_event.instrument.base,
+                                market_event.instrument.quote,
                                 trade.price,
+                                trade.amount,
+                                drops
                             );
                         }
+                        continue;
+                    }
+                    snapshot_builder.lock().await.update(&market_event);
+                    if let DataKind::Trade(trade) = &market_event.kind
+                        && matches!(
+                            market_event.instrument.kind,
+                            MarketDataInstrumentKind::Perpetual
+                        )
+                    {
+                        let mut cache = spot_cache.lock().await;
+                        cache.insert(
+                            market_event.instrument.base.to_string().to_uppercase(),
+                            trade.price,
+                        );
                     }
                     // Debug logging for large spot trades to verify spot streams
                     // Uses cached threshold (no env var parsing in hot path)
@@ -1617,10 +2225,7 @@ async fn main() {
                     let is_open_interest = matches!(&market_event.kind, DataKind::OpenInterest(_));
                     let is_trade = matches!(&market_event.kind, DataKind::Trade(_));
                     let is_orderbook_l2 = matches!(&market_event.kind, DataKind::OrderBook(_));
-                    let is_orderbook_l1 = matches!(
-                        &market_event.kind,
-                        DataKind::OrderBookL1(_)
-                    );
+                    let is_orderbook_l1 = matches!(&market_event.kind, DataKind::OrderBookL1(_));
 
                     // Extract notional value for trades
                     let trade_notional = if let DataKind::Trade(t) = &market_event.kind {
@@ -1629,11 +2234,14 @@ async fn main() {
                         None
                     };
 
-                    // Send trades/bars to Parquet writer (if enabled).
+                    // Process trades/bars for Parquet and/or forward testing.
                     // Per requirement: only persist PERP data (avoid mixing spot/perp).
                     // Uses try_send for non-blocking - drops with logging/metrics if full.
-                    if parquet_enabled
-                        && matches!(market_event.instrument.kind, MarketDataInstrumentKind::Perpetual)
+                    if (parquet_enabled || forward_enabled)
+                        && matches!(
+                            market_event.instrument.kind,
+                            MarketDataInstrumentKind::Perpetual
+                        )
                     {
                         // Build instrument_id in Nautilus format: {BASE}{QUOTE}-{KIND}.{VENUE}
                         // e.g., "BTCUSDT-PERP.BINANCE"
@@ -1649,11 +2257,13 @@ async fn main() {
                                 _ => "OTHER",
                             },
                             venue
-                        ).to_uppercase();
+                        )
+                        .to_uppercase();
                         if !parquet_filter.allows(&instrument_id, &base, venue) {
                             continue;
                         }
-                        let (price_precision, size_precision) = precision_config.get(&instrument_id);
+                        let (price_precision, size_precision) =
+                            precision_config.get(&instrument_id);
 
                         // Update extended bar builder with latest OI/Funding/L1/L2 only when enabled
                         if parquet_filter.write_extended {
@@ -1682,10 +2292,22 @@ async fn main() {
                                     ext_builder.update_liquidation(notional, liq.side);
                                 }
                                 DataKind::OrderBookL1(l1) => {
-                                    let bid = l1.best_bid.and_then(|lvl| lvl.price.to_f64()).unwrap_or(0.0);
-                                    let bid_size = l1.best_bid.and_then(|lvl| lvl.amount.to_f64()).unwrap_or(0.0);
-                                    let ask = l1.best_ask.and_then(|lvl| lvl.price.to_f64()).unwrap_or(0.0);
-                                    let ask_size = l1.best_ask.and_then(|lvl| lvl.amount.to_f64()).unwrap_or(0.0);
+                                    let bid = l1
+                                        .best_bid
+                                        .and_then(|lvl| lvl.price.to_f64())
+                                        .unwrap_or(0.0);
+                                    let bid_size = l1
+                                        .best_bid
+                                        .and_then(|lvl| lvl.amount.to_f64())
+                                        .unwrap_or(0.0);
+                                    let ask = l1
+                                        .best_ask
+                                        .and_then(|lvl| lvl.price.to_f64())
+                                        .unwrap_or(0.0);
+                                    let ask_size = l1
+                                        .best_ask
+                                        .and_then(|lvl| lvl.amount.to_f64())
+                                        .unwrap_or(0.0);
                                     if bid > 0.0 && ask > 0.0 {
                                         let mut ext_builders = extended_bar_builders.lock().await;
                                         let ext_builder = ext_builders
@@ -1705,20 +2327,90 @@ async fn main() {
                             }
                         }
 
-                        if let DataKind::Trade(trade) = &market_event.kind {
+                        if parquet_enabled
+                            && parquet_filter.write_l2
+                            && let DataKind::OrderBook(ob_event) = &market_event.kind
+                        {
+                            let should_emit = if parquet_l2_sample_ms > 0 {
+                                let now = Instant::now();
+                                let key = (
+                                    market_event.exchange,
+                                    market_event.instrument.base.to_string(),
+                                    market_event.instrument.quote.to_string(),
+                                );
+                                let allow = match l2_last_parquet.get(&key) {
+                                    Some(prev) => {
+                                        now.duration_since(*prev)
+                                            >= Duration::from_millis(parquet_l2_sample_ms)
+                                    }
+                                    None => true,
+                                };
+                                if allow {
+                                    l2_last_parquet.insert(key, now);
+                                }
+                                allow
+                            } else {
+                                true
+                            };
+                            if should_emit {
+                                let ts_init_ns = market_event
+                                    .time_received
+                                    .timestamp_nanos_opt()
+                                    .unwrap_or(0)
+                                    as u64;
+                                let mut ts_event_ns = market_event
+                                    .time_exchange
+                                    .timestamp_nanos_opt()
+                                    .unwrap_or(0)
+                                    as u64;
+                                if ts_event_ns == 0 {
+                                    ts_event_ns = ts_init_ns;
+                                }
 
-                            let ts_init_ns = market_event.time_received
+                                let deltas = build_order_book_deltas(
+                                    &instrument_id,
+                                    ob_event,
+                                    ts_event_ns,
+                                    ts_init_ns,
+                                    price_precision,
+                                    size_precision,
+                                    parquet_l2_max_depth,
+                                );
+
+                                for delta in deltas {
+                                    if parquet_tx
+                                        .try_send(ParquetEvent::OrderBookDelta(delta))
+                                        .is_err()
+                                    {
+                                        let drops =
+                                            PARQUET_L2_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                                        if drops % 1000 == 1 {
+                                            warn!(
+                                                "Parquet channel full, L2 delta dropped (total drops: {})",
+                                                drops
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let DataKind::Trade(trade) = &market_event.kind {
+                            let ts_init_ns = market_event
+                                .time_received
                                 .timestamp_nanos_opt()
                                 .unwrap_or(0) as u64;
-                            let mut ts_event_ns = market_event.time_exchange
+                            let mut ts_event_ns = market_event
+                                .time_exchange
                                 .timestamp_nanos_opt()
-                                .unwrap_or(0) as u64;
+                                .unwrap_or(0)
+                                as u64;
                             if ts_event_ns == 0 {
                                 // Fallback to receive time if exchange timestamp is missing/invalid.
                                 ts_event_ns = ts_init_ns;
                             }
 
-                            if parquet_filter.write_trades {
+                            if parquet_enabled && parquet_filter.write_trades {
                                 let parquet_event = ParquetEvent::Trade(TradeEvent {
                                     instrument_id: instrument_id.clone(),
                                     price: trade.price,
@@ -1731,15 +2423,58 @@ async fn main() {
                                     size_precision,
                                 });
 
-                                if parquet_tx.try_send(parquet_event).is_err() {
-                                    // Log and increment metric - completeness is critical
-                                    let drops = PARQUET_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
-                                    if drops % 1000 == 1 {
-                                        warn!("Parquet channel full, trade dropped (total drops: {})", drops);
+                                match parquet_trade_send_mode {
+                                    ParquetTradeSendMode::Drop => {
+                                        if parquet_tx.try_send(parquet_event).is_err() {
+                                            // Log and increment metric - completeness is critical
+                                            let drops =
+                                                PARQUET_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                                            if drops % 1000 == 1 {
+                                                warn!(
+                                                    "Parquet channel full, trade dropped (total drops: {})",
+                                                    drops
+                                                );
+                                            }
+                                        } else {
+                                            heartbeat_trades_processed
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
                                     }
-                                } else {
-                                    // Increment heartbeat counter on successful send
-                                    heartbeat_trades_processed.fetch_add(1, Ordering::Relaxed);
+                                    ParquetTradeSendMode::Block => {
+                                        if parquet_tx.send(parquet_event).await.is_err() {
+                                            error!("Parquet channel closed, cannot send trade");
+                                        } else {
+                                            heartbeat_trades_processed
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    ParquetTradeSendMode::BlockTimeout(timeout) => {
+                                        match tokio::time::timeout(
+                                            timeout,
+                                            parquet_tx.send(parquet_event),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(())) => {
+                                                heartbeat_trades_processed
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            Ok(Err(_)) => {
+                                                error!("Parquet channel closed, cannot send trade");
+                                            }
+                                            Err(_) => {
+                                                let drops = PARQUET_DROPS
+                                                    .fetch_add(1, Ordering::Relaxed)
+                                                    + 1;
+                                                if drops % 1000 == 1 {
+                                                    warn!(
+                                                        "Parquet send timeout, trade dropped (total drops: {})",
+                                                        drops
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
@@ -1759,10 +2494,14 @@ async fn main() {
                             };
 
                             if let Some(completed_bar) = completed_bar {
-                                if parquet_filter.write_bars {
+                                if parquet_enabled && parquet_filter.write_bars {
                                     // Send completed bar to Parquet writer (Nautilus-compatible core bar)
                                     // BLOCKING SEND: Core bars must never be dropped per PRD
-                                    let bar_event = ParquetEvent::Bar(completed_bar.to_bar_event());
+                                    let mut bar_event = completed_bar.to_bar_event();
+                                    if matches!(bar_ts_mode, BarTsEventMode::Open) {
+                                        bar_event.ts_event_ns = completed_bar.ts_open_ns;
+                                    }
+                                    let bar_event = ParquetEvent::Bar(bar_event);
                                     if parquet_tx.send(bar_event).await.is_err() {
                                         // Channel closed - receiver dropped
                                         error!("Parquet channel closed, cannot send bar");
@@ -1797,9 +2536,7 @@ async fn main() {
                                     // Compute L2 depth bands from latest order book snapshot (if available)
                                     let depth_bands = {
                                         let cache = l2_book_cache.lock().await;
-                                        cache
-                                            .get(&instrument_id)
-                                            .and_then(|book| compute_depth_bands(book))
+                                        cache.get(&instrument_id).and_then(compute_depth_bands)
                                     };
 
                                     // Also create and send extended bar (Barter-only, with CVD/delta)
@@ -1812,57 +2549,183 @@ async fn main() {
                                         ext_builder.build(completed_bar)
                                     };
 
-                                    let ext_bar_event = ParquetEvent::ExtendedBar(ExtendedBarEvent {
-                                        instrument_id: extended_bar.instrument_id,
-                                        ts_event_ns: extended_bar.ts_close_ns,
-                                        ts_init_ns: extended_bar.ts_init_ns,
-                                        ts_open_ns: extended_bar.ts_open_ns,
-                                        open: extended_bar.open,
-                                        high: extended_bar.high,
-                                        low: extended_bar.low,
-                                        close: extended_bar.close,
-                                        volume: extended_bar.volume,
-                                        quote_volume: extended_bar.quote_volume,
-                                        trade_count: extended_bar.trade_count,
-                                        buy_volume: extended_bar.buy_volume,
-                                        sell_volume: extended_bar.sell_volume,
-                                        delta: extended_bar.delta,
-                                        cvd: extended_bar.cvd,
-                                        open_interest: extended_bar.open_interest,
-                                        oi_change: extended_bar.oi_change,
-                                        funding_rate: extended_bar.funding_rate,
-                                        bid_price: extended_bar.bid_price,
-                                        bid_size: extended_bar.bid_size,
-                                        ask_price: extended_bar.ask_price,
-                                        ask_size: extended_bar.ask_size,
-                                        spread_bps: extended_bar.spread_bps,
-                                        book_imbalance: extended_bar.book_imbalance,
-                                        liq_buy_usd: extended_bar.liq_buy_usd,
-                                        liq_sell_usd: extended_bar.liq_sell_usd,
-                                        liq_total_usd: extended_bar.liq_total_usd,
-                                        liq_count: extended_bar.liq_count,
-                                        bid_depth_10bps_base: extended_bar.bid_depth_10bps_base,
-                                        ask_depth_10bps_base: extended_bar.ask_depth_10bps_base,
-                                        bid_depth_10bps_usd: extended_bar.bid_depth_10bps_usd,
-                                        ask_depth_10bps_usd: extended_bar.ask_depth_10bps_usd,
-                                        depth_imb_10bps: extended_bar.depth_imb_10bps,
-                                        bid_depth_50bps_base: extended_bar.bid_depth_50bps_base,
-                                        ask_depth_50bps_base: extended_bar.ask_depth_50bps_base,
-                                        bid_depth_50bps_usd: extended_bar.bid_depth_50bps_usd,
-                                        ask_depth_50bps_usd: extended_bar.ask_depth_50bps_usd,
-                                        depth_imb_50bps: extended_bar.depth_imb_50bps,
-                                        bid_depth_100bps_base: extended_bar.bid_depth_100bps_base,
-                                        ask_depth_100bps_base: extended_bar.ask_depth_100bps_base,
-                                        bid_depth_100bps_usd: extended_bar.bid_depth_100bps_usd,
-                                        ask_depth_100bps_usd: extended_bar.ask_depth_100bps_usd,
-                                        depth_imb_100bps: extended_bar.depth_imb_100bps,
-                                        price_precision: extended_bar.price_precision,
-                                        size_precision: extended_bar.size_precision,
-                                    });
+                                    let ext_ts_event_ns =
+                                        if matches!(bar_ts_mode, BarTsEventMode::Open) {
+                                            extended_bar.ts_open_ns
+                                        } else {
+                                            extended_bar.ts_close_ns
+                                        };
+                                    let ext_bar_event =
+                                        ParquetEvent::ExtendedBar(ExtendedBarEvent {
+                                            instrument_id: extended_bar.instrument_id,
+                                            ts_event_ns: ext_ts_event_ns,
+                                            ts_init_ns: extended_bar.ts_init_ns,
+                                            ts_open_ns: extended_bar.ts_open_ns,
+                                            open: extended_bar.open,
+                                            high: extended_bar.high,
+                                            low: extended_bar.low,
+                                            close: extended_bar.close,
+                                            volume: extended_bar.volume,
+                                            quote_volume: extended_bar.quote_volume,
+                                            trade_count: extended_bar.trade_count,
+                                            buy_volume: extended_bar.buy_volume,
+                                            sell_volume: extended_bar.sell_volume,
+                                            delta: extended_bar.delta,
+                                            cvd: extended_bar.cvd,
+                                            open_interest: extended_bar.open_interest,
+                                            oi_change: extended_bar.oi_change,
+                                            funding_rate: extended_bar.funding_rate,
+                                            bid_price: extended_bar.bid_price,
+                                            bid_size: extended_bar.bid_size,
+                                            ask_price: extended_bar.ask_price,
+                                            ask_size: extended_bar.ask_size,
+                                            spread_bps: extended_bar.spread_bps,
+                                            book_imbalance: extended_bar.book_imbalance,
+                                            liq_buy_usd: extended_bar.liq_buy_usd,
+                                            liq_sell_usd: extended_bar.liq_sell_usd,
+                                            liq_total_usd: extended_bar.liq_total_usd,
+                                            liq_count: extended_bar.liq_count,
+                                            bid_depth_10bps_base: extended_bar.bid_depth_10bps_base,
+                                            ask_depth_10bps_base: extended_bar.ask_depth_10bps_base,
+                                            bid_depth_10bps_usd: extended_bar.bid_depth_10bps_usd,
+                                            ask_depth_10bps_usd: extended_bar.ask_depth_10bps_usd,
+                                            depth_imb_10bps: extended_bar.depth_imb_10bps,
+                                            bid_depth_50bps_base: extended_bar.bid_depth_50bps_base,
+                                            ask_depth_50bps_base: extended_bar.ask_depth_50bps_base,
+                                            bid_depth_50bps_usd: extended_bar.bid_depth_50bps_usd,
+                                            ask_depth_50bps_usd: extended_bar.ask_depth_50bps_usd,
+                                            depth_imb_50bps: extended_bar.depth_imb_50bps,
+                                            bid_depth_100bps_base: extended_bar
+                                                .bid_depth_100bps_base,
+                                            ask_depth_100bps_base: extended_bar
+                                                .ask_depth_100bps_base,
+                                            bid_depth_100bps_usd: extended_bar.bid_depth_100bps_usd,
+                                            ask_depth_100bps_usd: extended_bar.ask_depth_100bps_usd,
+                                            depth_imb_100bps: extended_bar.depth_imb_100bps,
+                                            price_precision: extended_bar.price_precision,
+                                            size_precision: extended_bar.size_precision,
+                                        });
 
                                     // BLOCKING SEND: Extended bars should also not be dropped
-                                    if parquet_tx.send(ext_bar_event).await.is_err() {
+                                    if parquet_enabled
+                                        && parquet_tx.send(ext_bar_event).await.is_err()
+                                    {
                                         error!("Parquet channel closed, cannot send extended bar");
+                                    }
+
+                                    // Broadcast extended bar for forward testing (UDS + WS)
+                                    let ext_live = ExtendedBar1mLive {
+                                        ts_open_ns: extended_bar.ts_open_ns,
+                                        open: encode_fixed_point_i64(extended_bar.open),
+                                        high: encode_fixed_point_i64(extended_bar.high),
+                                        low: encode_fixed_point_i64(extended_bar.low),
+                                        close: encode_fixed_point_i64(extended_bar.close),
+                                        volume: encode_fixed_point_i64(extended_bar.volume),
+                                        quote_volume: encode_fixed_point_i64(
+                                            extended_bar.quote_volume,
+                                        ),
+                                        trade_count: extended_bar.trade_count,
+                                        buy_volume: encode_fixed_point_i64(extended_bar.buy_volume),
+                                        sell_volume: encode_fixed_point_i64(
+                                            extended_bar.sell_volume,
+                                        ),
+                                        delta: encode_fixed_point_i64(extended_bar.delta),
+                                        cvd: encode_fixed_point_i64(extended_bar.cvd),
+                                        open_interest: encode_fixed_point_i64(
+                                            extended_bar.open_interest,
+                                        ),
+                                        oi_change: encode_fixed_point_i64(extended_bar.oi_change),
+                                        funding_rate: extended_bar.funding_rate,
+                                        bid_price: encode_fixed_point_i64(extended_bar.bid_price),
+                                        bid_size: encode_fixed_point_i64(extended_bar.bid_size),
+                                        ask_price: encode_fixed_point_i64(extended_bar.ask_price),
+                                        ask_size: encode_fixed_point_i64(extended_bar.ask_size),
+                                        spread_bps: extended_bar.spread_bps,
+                                        book_imbalance: extended_bar.book_imbalance,
+                                        liq_buy_usd: encode_fixed_point_i64(
+                                            extended_bar.liq_buy_usd,
+                                        ),
+                                        liq_sell_usd: encode_fixed_point_i64(
+                                            extended_bar.liq_sell_usd,
+                                        ),
+                                        liq_total_usd: encode_fixed_point_i64(
+                                            extended_bar.liq_total_usd,
+                                        ),
+                                        liq_count: extended_bar.liq_count,
+                                        bid_depth_10bps_base: encode_fixed_point_i64(
+                                            extended_bar.bid_depth_10bps_base,
+                                        ),
+                                        ask_depth_10bps_base: encode_fixed_point_i64(
+                                            extended_bar.ask_depth_10bps_base,
+                                        ),
+                                        bid_depth_10bps_usd: encode_fixed_point_i64(
+                                            extended_bar.bid_depth_10bps_usd,
+                                        ),
+                                        ask_depth_10bps_usd: encode_fixed_point_i64(
+                                            extended_bar.ask_depth_10bps_usd,
+                                        ),
+                                        depth_imb_10bps: extended_bar.depth_imb_10bps,
+                                        bid_depth_50bps_base: encode_fixed_point_i64(
+                                            extended_bar.bid_depth_50bps_base,
+                                        ),
+                                        ask_depth_50bps_base: encode_fixed_point_i64(
+                                            extended_bar.ask_depth_50bps_base,
+                                        ),
+                                        bid_depth_50bps_usd: encode_fixed_point_i64(
+                                            extended_bar.bid_depth_50bps_usd,
+                                        ),
+                                        ask_depth_50bps_usd: encode_fixed_point_i64(
+                                            extended_bar.ask_depth_50bps_usd,
+                                        ),
+                                        depth_imb_50bps: extended_bar.depth_imb_50bps,
+                                        bid_depth_100bps_base: encode_fixed_point_i64(
+                                            extended_bar.bid_depth_100bps_base,
+                                        ),
+                                        ask_depth_100bps_base: encode_fixed_point_i64(
+                                            extended_bar.ask_depth_100bps_base,
+                                        ),
+                                        bid_depth_100bps_usd: encode_fixed_point_i64(
+                                            extended_bar.bid_depth_100bps_usd,
+                                        ),
+                                        ask_depth_100bps_usd: encode_fixed_point_i64(
+                                            extended_bar.ask_depth_100bps_usd,
+                                        ),
+                                        depth_imb_100bps: extended_bar.depth_imb_100bps,
+                                    };
+
+                                    let ext_time_exchange = chrono::DateTime::from_timestamp_nanos(
+                                        extended_bar.ts_close_ns as i64,
+                                    );
+                                    let ext_time_received = chrono::DateTime::from_timestamp_nanos(
+                                        extended_bar.ts_init_ns as i64,
+                                    );
+                                    let ext_msg = MarketEventMessage {
+                                        time_exchange: ext_time_exchange,
+                                        time_received: ext_time_received,
+                                        exchange: format!("{:?}", market_event.exchange),
+                                        instrument: InstrumentInfo {
+                                            base: market_event.instrument.base.to_string(),
+                                            quote: market_event.instrument.quote.to_string(),
+                                            kind: match market_event.instrument.kind {
+                                                MarketDataInstrumentKind::Spot => {
+                                                    "Spot".to_string()
+                                                }
+                                                MarketDataInstrumentKind::Perpetual => {
+                                                    "Perpetual".to_string()
+                                                }
+                                                _ => format!("{:?}", market_event.instrument.kind),
+                                            },
+                                        },
+                                        kind: "extended_bar_1m".to_string(),
+                                        data: serde_json::to_value(&ext_live).unwrap_or_default(),
+                                    };
+                                    if let Some(bytes) =
+                                        serialize_for_broadcast(&broadcast_config, ext_msg.clone())
+                                    {
+                                        let _ = tx_trades.send(bytes);
+                                    }
+                                    if let Some(frame) = serialize_for_uds(&ext_msg) {
+                                        let _ = tx_uds.send(frame);
                                     }
                                 }
                             }
@@ -1963,14 +2826,13 @@ async fn main() {
                         if exchange_name.contains("Binance") {
                             let key = format!(
                                 "{}:{}:{}",
-                                exchange_name,
-                                message.instrument.base,
-                                message.instrument.quote
+                                exchange_name, message.instrument.base, message.instrument.quote
                             );
                             // Use cached throttle value (no env var parsing in hot path)
                             let now = Instant::now();
                             let should_skip = if let Some(prev) = l1_last_broadcast.get(&key) {
-                                now.duration_since(*prev) < Duration::from_millis(broadcast_config.l1_throttle_ms)
+                                now.duration_since(*prev)
+                                    < Duration::from_millis(broadcast_config.l1_throttle_ms)
                             } else {
                                 false
                             };
@@ -1986,7 +2848,8 @@ async fn main() {
                     if is_trade {
                         // Track metrics: trade count and timestamp skew
                         TRADE_COUNT.fetch_add(1, Ordering::Relaxed);
-                        let skew_ms = (message.time_received - message.time_exchange).num_milliseconds();
+                        let skew_ms =
+                            (message.time_received - message.time_exchange).num_milliseconds();
                         // Only count positive skew for avg (negative = exchange clock ahead)
                         if skew_ms >= 0 {
                             SKEW_SUM_MS.fetch_add(skew_ms, Ordering::Relaxed);
@@ -1996,7 +2859,10 @@ async fn main() {
                         let mut current_max = SKEW_MAX_MS.load(Ordering::Relaxed);
                         while skew_ms > current_max {
                             match SKEW_MAX_MS.compare_exchange_weak(
-                                current_max, skew_ms, Ordering::Relaxed, Ordering::Relaxed
+                                current_max,
+                                skew_ms,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
                             ) {
                                 Ok(_) => break,
                                 Err(x) => current_max = x,
@@ -2006,7 +2872,10 @@ async fn main() {
                         let mut current_min = SKEW_MIN_MS.load(Ordering::Relaxed);
                         while skew_ms < current_min {
                             match SKEW_MIN_MS.compare_exchange_weak(
-                                current_min, skew_ms, Ordering::Relaxed, Ordering::Relaxed
+                                current_min,
+                                skew_ms,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
                             ) {
                                 Ok(_) => break,
                                 Err(x) => current_min = x,
@@ -2096,9 +2965,44 @@ async fn start_websocket_server(
     kline_cache: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Candle1m>>>>,
     broadcast_config: Arc<BroadcastConfig>,
 ) {
-    let listener = TcpListener::bind(&addr)
-        .await
-        .expect("Failed to bind WebSocket server");
+    let strict = parse_bool_env("WS_BIND_STRICT", false);
+    let retry_ms = parse_u64_env("WS_BIND_RETRY_MS", 2000);
+    let max_retries = parse_u64_env("WS_BIND_MAX_RETRIES", 0);
+    let ws_config = websocket_config_from_env();
+    let auth_token = std::env::var("WS_AUTH_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let log_max_chars = parse_usize_env("WS_LOG_MAX_CHARS", 256);
+    let mut attempts = 0u64;
+
+    let listener = loop {
+        match TcpListener::bind(&addr).await {
+            Ok(listener) => break listener,
+            Err(e) => {
+                attempts += 1;
+                if strict {
+                    panic!("Failed to bind WebSocket server: {}", e);
+                }
+                error!("Failed to bind WebSocket server {}: {}", addr, e);
+                if retry_ms == 0 || (max_retries > 0 && attempts >= max_retries) {
+                    error!("WebSocket server disabled (bind failed).");
+                    return;
+                }
+                if max_retries == 0 {
+                    warn!(
+                        "Retrying WebSocket bind in {}ms (attempt {})",
+                        retry_ms, attempts
+                    );
+                } else {
+                    warn!(
+                        "Retrying WebSocket bind in {}ms (attempt {}/{})",
+                        retry_ms, attempts, max_retries
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(retry_ms)).await;
+            }
+        }
+    };
 
     info!("WebSocket server bound to {}", addr);
 
@@ -2115,16 +3019,19 @@ async fn start_websocket_server(
             tx_l2,
             kline_cache,
             broadcast_config,
+            ws_config,
+            auth_token.clone(),
+            log_max_chars,
         ));
     }
 }
 
 #[cfg(unix)]
 async fn start_uds_server(path: String, tx_uds: Arc<broadcast::Sender<Bytes>>) {
-    if Path::new(&path).exists() {
-        if let Err(e) = std::fs::remove_file(&path) {
-            warn!("Failed to remove existing UDS socket {}: {}", path, e);
-        }
+    if Path::new(&path).exists()
+        && let Err(e) = std::fs::remove_file(&path)
+    {
+        warn!("Failed to remove existing UDS socket {}: {}", path, e);
     }
 
     let listener = match UnixListener::bind(&path) {
@@ -2161,7 +3068,7 @@ async fn handle_uds_client(mut stream: UnixStream, tx_uds: Arc<broadcast::Sender
                 }
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                IPC_LAGGED_FRAMES.fetch_add(skipped as u64, Ordering::Relaxed);
+                IPC_LAGGED_FRAMES.fetch_add(skipped, Ordering::Relaxed);
                 debug!("UDS client lagged, skipped {} frames", skipped);
             }
             Err(broadcast::error::RecvError::Closed) => break,
@@ -2203,7 +3110,7 @@ async fn handle_tcp_client(mut stream: TcpStream, tx_uds: Arc<broadcast::Sender<
                 }
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                IPC_LAGGED_FRAMES.fetch_add(skipped as u64, Ordering::Relaxed);
+                IPC_LAGGED_FRAMES.fetch_add(skipped, Ordering::Relaxed);
                 debug!("TCP IPC client lagged, skipped {} frames", skipped);
             }
             Err(broadcast::error::RecvError::Closed) => break,
@@ -2386,15 +3293,13 @@ async fn start_deribit_options_feed(
                         let _ = tx_uds.send(frame);
                     }
 
-                    let spot = spot_cache
-                        .lock()
-                        .await
-                        .get(ticker)
-                        .copied()
-                        .unwrap_or(0.0);
+                    let spot = spot_cache.lock().await.get(ticker).copied().unwrap_or(0.0);
                     if spot > 0.0 {
                         let ctx = options_builder.build(&chain, spot);
-                        options_cache.lock().await.insert(ticker.clone(), ctx.clone());
+                        options_cache
+                            .lock()
+                            .await
+                            .insert(ticker.clone(), ctx.clone());
                         let ctx_event = MarketEventMessage {
                             time_exchange: Utc::now(),
                             time_received: Utc::now(),
@@ -2407,7 +3312,9 @@ async fn start_deribit_options_feed(
                             kind: "options_context".to_string(),
                             data: serde_json::to_value(&ctx).unwrap_or_default(),
                         };
-                        if let Some(bytes) = serialize_for_broadcast(&broadcast_config, ctx_event.clone()) {
+                        if let Some(bytes) =
+                            serialize_for_broadcast(&broadcast_config, ctx_event.clone())
+                        {
                             let _ = tx_trades.send(bytes);
                         }
                         if let Some(frame) = serialize_for_uds(&ctx_event) {
@@ -2598,10 +3505,7 @@ async fn seed_vol_regime(
                     state.engine.push_rv(rv);
                 }
                 let sample_count = state.engine.rv_sample_count();
-                info!(
-                    "vol-regime seed: {} samples for {}",
-                    sample_count, ticker
-                );
+                info!("vol-regime seed: {} samples for {}", sample_count, ticker);
                 vol_states.lock().await.insert(ticker.clone(), state);
             }
             Err(e) => {
@@ -2638,65 +3542,78 @@ async fn run_binance_kline_stream(
                 while let Some(msg) = read.next().await {
                     match msg {
                         Ok(Message::Text(text)) => {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                if let Some(k) = v.get("k") {
-                                    let is_final = k.get("x").and_then(|b| b.as_bool()).unwrap_or(false);
-                                    if !is_final {
-                                        continue;
-                                    }
-                                    if let (Some(start_ms), Some(open), Some(high), Some(low), Some(close), Some(vol)) = (
-                                        k.get("t").and_then(|v| v.as_i64()),
-                                        k.get("o").and_then(|v| v.as_str()),
-                                        k.get("h").and_then(|v| v.as_str()),
-                                        k.get("l").and_then(|v| v.as_str()),
-                                        k.get("c").and_then(|v| v.as_str()),
-                                        k.get("v").and_then(|v| v.as_str()),
-                                    ) {
-                                        if let Some(start_time) = chrono::DateTime::from_timestamp_millis(start_ms) {
-                                            if let (Ok(o), Ok(h), Ok(l), Ok(c), Ok(volume)) =
-                                                (open.parse::<f64>(), high.parse::<f64>(), low.parse::<f64>(), close.parse::<f64>(), vol.parse::<f64>())
-                                            {
-                                                let candle = Candle1m {
-                                                    open: o,
-                                                    high: h,
-                                                    low: l,
-                                                    close: c,
-                                                    volume,
-                                                    start_time,
-                                                    is_complete: true,
-                                                };
-                                                {
-                                                    let mut cache = kline_cache.lock().await;
-                                                    let entry = cache.entry(ticker.clone()).or_insert_with(VecDeque::new);
-                                                    entry.push_back(candle.clone());
-                                                    while entry.len() > 300 {
-                                                        entry.pop_front();
-                                                    }
-                                                }
-
-                                                let event = MarketEventMessage {
-                                                    time_exchange: Utc::now(),
-                                                    time_received: Utc::now(),
-                                                    exchange: "BinanceFuturesUsd".to_string(),
-                                                    instrument: InstrumentInfo {
-                                                        base: ticker.clone(),
-                                                        quote: "USDT".to_string(),
-                                                        kind: "Perpetual".to_string(),
-                                                    },
-                                                    kind: "candle_1m".to_string(),
-                                                    data: serde_json::to_value(&candle).unwrap_or_default(),
-                                                };
-                                                if let Some(bytes) = serialize_for_broadcast(&broadcast_config, event.clone()) {
-                                                    let _ = tx_trades.send(bytes);
-                                                }
-                                                if let Some(frame) = serialize_for_uds(&event) {
-                                                    let _ = tx_uds.send(frame);
-                                                }
-                                                // Send to aggregator via channel (no mutex!)
-                                                let _ = agg_tx.try_send(event);
-                                            }
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+                                && let Some(k) = v.get("k")
+                            {
+                                let is_final =
+                                    k.get("x").and_then(|b| b.as_bool()).unwrap_or(false);
+                                if !is_final {
+                                    continue;
+                                }
+                                if let (
+                                    Some(start_ms),
+                                    Some(open),
+                                    Some(high),
+                                    Some(low),
+                                    Some(close),
+                                    Some(vol),
+                                ) = (
+                                    k.get("t").and_then(|v| v.as_i64()),
+                                    k.get("o").and_then(|v| v.as_str()),
+                                    k.get("h").and_then(|v| v.as_str()),
+                                    k.get("l").and_then(|v| v.as_str()),
+                                    k.get("c").and_then(|v| v.as_str()),
+                                    k.get("v").and_then(|v| v.as_str()),
+                                ) && let Some(start_time) =
+                                    chrono::DateTime::from_timestamp_millis(start_ms)
+                                    && let (Ok(o), Ok(h), Ok(l), Ok(c), Ok(volume)) = (
+                                        open.parse::<f64>(),
+                                        high.parse::<f64>(),
+                                        low.parse::<f64>(),
+                                        close.parse::<f64>(),
+                                        vol.parse::<f64>(),
+                                    )
+                                {
+                                    let candle = Candle1m {
+                                        open: o,
+                                        high: h,
+                                        low: l,
+                                        close: c,
+                                        volume,
+                                        start_time,
+                                        is_complete: true,
+                                    };
+                                    {
+                                        let mut cache = kline_cache.lock().await;
+                                        let entry = cache.entry(ticker.clone()).or_default();
+                                        entry.push_back(candle.clone());
+                                        while entry.len() > 300 {
+                                            entry.pop_front();
                                         }
                                     }
+
+                                    let event = MarketEventMessage {
+                                        time_exchange: Utc::now(),
+                                        time_received: Utc::now(),
+                                        exchange: "BinanceFuturesUsd".to_string(),
+                                        instrument: InstrumentInfo {
+                                            base: ticker.clone(),
+                                            quote: "USDT".to_string(),
+                                            kind: "Perpetual".to_string(),
+                                        },
+                                        kind: "candle_1m".to_string(),
+                                        data: serde_json::to_value(&candle).unwrap_or_default(),
+                                    };
+                                    if let Some(bytes) =
+                                        serialize_for_broadcast(&broadcast_config, event.clone())
+                                    {
+                                        let _ = tx_trades.send(bytes);
+                                    }
+                                    if let Some(frame) = serialize_for_uds(&event) {
+                                        let _ = tx_uds.send(frame);
+                                    }
+                                    // Send to aggregator via channel (no mutex!)
+                                    let _ = agg_tx.try_send(event);
                                 }
                             }
                         }
@@ -2755,7 +3672,11 @@ async fn fetch_deribit_options_chain(
         });
     }
 
-    contracts.sort_by(|a, b| b.open_interest.partial_cmp(&a.open_interest).unwrap_or(std::cmp::Ordering::Equal));
+    contracts.sort_by(|a, b| {
+        b.open_interest
+            .partial_cmp(&a.open_interest)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let top_instruments: Vec<String> = contracts
         .iter()
         .take(top_n)
@@ -2768,11 +3689,12 @@ async fn fetch_deribit_options_chain(
         futures.push(fetch_deribit_ticker(client, base_url, instrument_name));
     }
 
-    for result in futures::future::join_all(futures).await {
-        if let Ok(ticker) = result {
-            if let Some(greeks) = ticker.greeks {
-                greeks_map.insert(ticker.instrument_name, greeks);
-            }
+    for ticker in (futures::future::join_all(futures).await)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(greeks) = ticker.greeks {
+            greeks_map.insert(ticker.instrument_name, greeks);
         }
     }
 
@@ -2835,10 +3757,7 @@ async fn fetch_deribit_ticker(
     base_url: &str,
     instrument_name: String,
 ) -> Result<DeribitTicker, String> {
-    let url = format!(
-        "{}/ticker?instrument_name={}",
-        base_url, instrument_name
-    );
+    let url = format!("{}/ticker?instrument_name={}", base_url, instrument_name);
     let resp = client
         .get(&url)
         .send()
@@ -2851,6 +3770,7 @@ async fn fetch_deribit_ticker(
 }
 
 /// Handle individual WebSocket client connection
+#[allow(clippy::too_many_arguments)]
 async fn handle_client(
     stream: TcpStream,
     peer_addr: SocketAddr,
@@ -2858,11 +3778,45 @@ async fn handle_client(
     tx_l2: Arc<broadcast::Sender<Bytes>>,
     kline_cache: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Candle1m>>>>,
     broadcast_config: Arc<BroadcastConfig>,
+    ws_config: WebSocketConfig,
+    auth_token: Option<String>,
+    log_max_chars: usize,
 ) {
-    let ws_stream = match accept_async(stream).await {
+    let ws_stream = match accept_hdr_async_with_config(
+        stream,
+        move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+            if let Some(expected) = auth_token.as_deref() {
+                let header_token = req
+                    .headers()
+                    .get("x-auth-token")
+                    .and_then(|v| v.to_str().ok());
+                let bearer_token = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| {
+                        v.strip_prefix("Bearer ")
+                            .or_else(|| v.strip_prefix("bearer "))
+                    });
+                let provided = header_token.or(bearer_token);
+
+                if provided != Some(expected) {
+                    let response = HttpResponse::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body(Some("Unauthorized".to_string()))
+                        .unwrap();
+                    return Err(response);
+                }
+            }
+            Ok(resp)
+        },
+        Some(ws_config),
+    )
+    .await
+    {
         Ok(ws) => ws,
         Err(e) => {
-            error!("WebSocket handshake failed for {}: {}", peer_addr, e);
+            warn!("WebSocket handshake failed for {}: {}", peer_addr, e);
             return;
         }
     };
@@ -2891,34 +3845,38 @@ async fn handle_client(
 
     // Send kline backfill from cache (refresh is done by background task)
     // Uses whatever is in cache - no blocking network calls during handshake
-    {
+    let backfills: Vec<(String, Vec<Candle1m>)> = {
         let cache = kline_cache.lock().await;
-        for (ticker, candles) in cache.iter() {
-            let payload = CandleBackfill {
-                ticker: ticker.clone(),
-                candles: candles.iter().cloned().collect(),
+        cache
+            .iter()
+            .map(|(ticker, candles)| (ticker.clone(), candles.iter().cloned().collect()))
+            .collect()
+    };
+    for (ticker, candles) in backfills {
+        let payload = CandleBackfill {
+            ticker: ticker.clone(),
+            candles,
+        };
+        let event = MarketEventMessage {
+            time_exchange: Utc::now(),
+            time_received: Utc::now(),
+            exchange: "barter-data-server".to_string(),
+            instrument: InstrumentInfo {
+                base: ticker.clone(),
+                quote: "USD".to_string(),
+                kind: "Kline".to_string(),
+            },
+            kind: "candle_backfill".to_string(),
+            data: serde_json::to_value(&payload).unwrap_or_default(),
+        };
+        if let Some(bytes) = serialize_for_broadcast(&broadcast_config, event) {
+            let backfill_msg = if broadcast_config.use_binary_frames {
+                Message::Binary(bytes)
+            } else {
+                // Safe: serialize_for_broadcast produces valid UTF-8
+                Message::Text(String::from_utf8_lossy(&bytes).into_owned().into())
             };
-            let event = MarketEventMessage {
-                time_exchange: Utc::now(),
-                time_received: Utc::now(),
-                exchange: "barter-data-server".to_string(),
-                instrument: InstrumentInfo {
-                    base: ticker.clone(),
-                    quote: "USD".to_string(),
-                    kind: "Kline".to_string(),
-                },
-                kind: "candle_backfill".to_string(),
-                data: serde_json::to_value(&payload).unwrap_or_default(),
-            };
-            if let Some(bytes) = serialize_for_broadcast(&broadcast_config, event) {
-                let backfill_msg = if broadcast_config.use_binary_frames {
-                    Message::Binary(bytes)
-                } else {
-                    // Safe: serialize_for_broadcast produces valid UTF-8
-                    Message::Text(String::from_utf8_lossy(&bytes).into_owned().into())
-                };
-                let _ = ws_sender.send(backfill_msg).await;
-            }
+            let _ = ws_sender.send(backfill_msg).await;
         }
     }
 
@@ -2998,7 +3956,8 @@ async fn handle_client(
                     debug!("Received ping from {}", peer_addr);
                 }
                 Ok(Message::Text(text)) => {
-                    debug!("Received text from {}: {}", peer_addr, text);
+                    let display_text = truncate_for_log(&text, log_max_chars);
+                    debug!("Received text from {}: {}", peer_addr, display_text);
                 }
                 Err(e) => {
                     error!("WebSocket error for {}: {}", peer_addr, e);
@@ -3028,6 +3987,18 @@ async fn init_market_streams(filter: &StreamFilter) -> DynamicStreams<MarketData
     use MarketDataInstrumentKind::*;
     use SubKind::*;
     use barter_data::subscription::SubKind;
+    use vecmap::VecMap;
+
+    fn empty_streams() -> DynamicStreams<MarketDataInstrument> {
+        DynamicStreams {
+            trades: VecMap::default(),
+            l1s: VecMap::default(),
+            l2s: VecMap::default(),
+            liquidations: VecMap::default(),
+            open_interests: VecMap::default(),
+            cvds: VecMap::default(),
+        }
+    }
 
     let specs = [
         // === SPOT SUBSCRIPTIONS (for basis calculation) ===
@@ -3152,7 +4123,7 @@ async fn init_market_streams(filter: &StreamFilter) -> DynamicStreams<MarketData
         vec![(Okx, "sol", "usdt", Perpetual, PublicTrades)],
     ];
 
-    let filtered = specs.map(|specs| {
+    let filtered = specs.clone().map(|specs| {
         specs
             .into_iter()
             .filter(|(ex, base, _quote, kind, subkind)| {
@@ -3161,13 +4132,66 @@ async fn init_market_streams(filter: &StreamFilter) -> DynamicStreams<MarketData
             .collect::<Vec<_>>()
     });
 
-    DynamicStreams::init(filtered)
-    .await
-    .expect("Failed to initialize market streams")
+    let strict = parse_bool_env("STREAM_STRICT", false);
+    match DynamicStreams::init(filtered).await {
+        Ok(streams) => streams,
+        Err(err) => {
+            if strict {
+                panic!("Failed to initialize market streams: {}", err);
+            }
+            error!(
+                "Market stream init failed: {}. Falling back to BINANCE-only.",
+                err
+            );
+            let binance_filter = filter.binance_only();
+            let filtered_binance = specs.clone().map(|specs| {
+                specs
+                    .into_iter()
+                    .filter(|(ex, base, _quote, kind, subkind)| {
+                        binance_filter.allows(*ex, base, kind.clone(), *subkind)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            match DynamicStreams::init(filtered_binance).await {
+                Ok(streams) => {
+                    warn!("Market stream init recovered with BINANCE-only streams.");
+                    streams
+                }
+                Err(err) => {
+                    error!(
+                        "BINANCE-only stream init failed: {}. Falling back to BINANCE trades-only.",
+                        err
+                    );
+                    let trades_filter = binance_filter.trades_only();
+                    let filtered_trades = specs.clone().map(|specs| {
+                        specs
+                            .into_iter()
+                            .filter(|(ex, base, _quote, kind, subkind)| {
+                                trades_filter.allows(*ex, base, kind.clone(), *subkind)
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    match DynamicStreams::init(filtered_trades).await {
+                        Ok(streams) => {
+                            warn!("Market stream init recovered with BINANCE trades-only.");
+                            streams
+                        }
+                        Err(err) => {
+                            error!(
+                                "All market stream init attempts failed: {}. Continuing without exchange streams.",
+                                err
+                            );
+                            empty_streams()
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
-/// (unused) dedicated liquidation stream builder -- kept for reference
-/// NOTE: not used in the main pipeline; DynamicStreams already carries liquidations.
+// (unused) dedicated liquidation stream builder -- kept for reference
+// NOTE: not used in the main pipeline; DynamicStreams already carries liquidations.
 // async fn init_liquidation_streams()
 // -> Streams<MarketEvent<MarketDataInstrument, barter_data::subscription::liquidation::Liquidation>> {
 //     use ExchangeId::*;
@@ -3313,9 +4337,15 @@ fn parse_i64(value: &str) -> Result<i64, DataError> {
 }
 
 /// Build a combined Stream of Binance open-interest polling events (REST fallback)
-fn binance_open_interest_stream(filter: StreamFilter)
--> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> {
-    let specs = vec![("BTCUSDT", "btc"), ("ETHUSDT", "eth"), ("SOLUSDT", "sol"), ("XRPUSDT", "xrp")];
+fn binance_open_interest_stream(
+    filter: StreamFilter,
+) -> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> {
+    let specs = vec![
+        ("BTCUSDT", "btc"),
+        ("ETHUSDT", "eth"),
+        ("SOLUSDT", "sol"),
+        ("XRPUSDT", "xrp"),
+    ];
 
     stream::select_all(
         specs
@@ -3329,7 +4359,8 @@ fn binance_open_interest_stream(filter: StreamFilter)
                 )
             })
             .map(|(symbol, base)| {
-                let instrument = MarketDataInstrument::from((base, "usdt", MarketDataInstrumentKind::Perpetual));
+                let instrument =
+                    MarketDataInstrument::from((base, "usdt", MarketDataInstrumentKind::Perpetual));
                 binance_open_interest_poller(symbol, instrument).boxed()
             })
             .collect::<Vec<_>>(),
@@ -3337,15 +4368,13 @@ fn binance_open_interest_stream(filter: StreamFilter)
 }
 
 /// Build a combined Stream of funding-rate polling events (REST)
-fn funding_rate_stream(filter: StreamFilter)
--> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> {
+fn funding_rate_stream(
+    filter: StreamFilter,
+) -> impl futures::Stream<Item = MarketStreamResult<MarketDataInstrument, DataKind>> {
     let specs = vec![("BTCUSDT", "btc"), ("ETHUSDT", "eth"), ("SOLUSDT", "sol")];
 
     let mut streams: Vec<
-        futures::stream::BoxStream<
-            'static,
-            MarketStreamResult<MarketDataInstrument, DataKind>,
-        >,
+        futures::stream::BoxStream<'static, MarketStreamResult<MarketDataInstrument, DataKind>>,
     > = Vec::new();
 
     for (symbol, base) in &specs {
@@ -3400,32 +4429,30 @@ fn binance_funding_rate_poller(
                             )))
                         } else {
                             match response.json::<BinanceFundingRateResponse>().await {
-                                Ok(data) => {
-                                    match parse_f64(&data.last_funding_rate) {
-                                        Ok(rate) => {
-                                            let time_exchange =
-                                                DateTime::from_timestamp_millis(data.time)
-                                                    .unwrap_or_else(Utc::now);
-                                            let next_time =
-                                                DateTime::from_timestamp_millis(data.next_funding_time);
-                                            debug!("Binance funding {symbol}: rate={rate}");
-                                            Ok(MarketEvent {
-                                                time_exchange,
-                                                time_received: Utc::now(),
-                                                exchange: ExchangeId::BinanceFuturesUsd,
-                                                instrument: instrument_clone,
-                                                kind: DataKind::FundingRate(FundingRate {
-                                                    rate,
-                                                    time: Some(time_exchange),
-                                                    next_time,
-                                                }),
-                                            })
-                                        }
-                                        Err(e) => Err(DataError::Socket(format!(
-                                            "Binance funding rate parse error ({symbol}): {e:?}"
-                                        ))),
+                                Ok(data) => match parse_f64(&data.last_funding_rate) {
+                                    Ok(rate) => {
+                                        let time_exchange =
+                                            DateTime::from_timestamp_millis(data.time)
+                                                .unwrap_or_else(Utc::now);
+                                        let next_time =
+                                            DateTime::from_timestamp_millis(data.next_funding_time);
+                                        debug!("Binance funding {symbol}: rate={rate}");
+                                        Ok(MarketEvent {
+                                            time_exchange,
+                                            time_received: Utc::now(),
+                                            exchange: ExchangeId::BinanceFuturesUsd,
+                                            instrument: instrument_clone,
+                                            kind: DataKind::FundingRate(FundingRate {
+                                                rate,
+                                                time: Some(time_exchange),
+                                                next_time,
+                                            }),
+                                        })
                                     }
-                                }
+                                    Err(e) => Err(DataError::Socket(format!(
+                                        "Binance funding rate parse error ({symbol}): {e:?}"
+                                    ))),
+                                },
                                 Err(parse_err) => Err(DataError::Socket(format!(
                                     "Binance funding parse failed ({symbol}): {parse_err}"
                                 ))),
@@ -3484,7 +4511,10 @@ fn bybit_funding_rate_poller(
                                         .find(|item| item.symbol == symbol)
                                         .or_else(|| data.result.list.first());
                                     if let Some(entry) = entry {
-                                        match (parse_f64(&entry.funding_rate), parse_i64(&entry.next_funding_time)) {
+                                        match (
+                                            parse_f64(&entry.funding_rate),
+                                            parse_i64(&entry.next_funding_time),
+                                        ) {
                                             (Ok(rate), Ok(next_time_ms)) => {
                                                 let time_exchange =
                                                     DateTime::from_timestamp_millis(data.time)
@@ -3557,11 +4587,17 @@ fn okx_funding_rate_poller(
                             match response.json::<OkxFundingRateResponse>().await {
                                 Ok(data) => {
                                     if let Some(entry) = data.data.first() {
-                                        match (parse_f64(&entry.funding_rate), parse_i64(&entry.funding_time), parse_i64(&entry.next_funding_time)) {
+                                        match (
+                                            parse_f64(&entry.funding_rate),
+                                            parse_i64(&entry.funding_time),
+                                            parse_i64(&entry.next_funding_time),
+                                        ) {
                                             (Ok(rate), Ok(funding_time_ms), Ok(next_time_ms)) => {
                                                 let time_exchange =
-                                                    DateTime::from_timestamp_millis(funding_time_ms)
-                                                        .unwrap_or_else(Utc::now);
+                                                    DateTime::from_timestamp_millis(
+                                                        funding_time_ms,
+                                                    )
+                                                    .unwrap_or_else(Utc::now);
                                                 let next_time =
                                                     DateTime::from_timestamp_millis(next_time_ms);
                                                 debug!("OKX funding {symbol}: rate={rate}");
@@ -3709,6 +4745,9 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_event() -> MarketEventMessage {
         MarketEventMessage {
@@ -3746,7 +4785,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed["exchange"], "TestExchange");
         assert_eq!(parsed["kind"], "trade");
-        assert!(parsed.get("schema_version").is_none(), "Should not have envelope fields");
+        assert!(
+            parsed.get("schema_version").is_none(),
+            "Should not have envelope fields"
+        );
     }
 
     #[test]
@@ -3790,7 +4832,10 @@ mod tests {
         let bytes = result.unwrap();
 
         // Verify the bytes are valid UTF-8
-        assert!(String::from_utf8(bytes.to_vec()).is_ok(), "Should produce valid UTF-8");
+        assert!(
+            String::from_utf8(bytes.to_vec()).is_ok(),
+            "Should produce valid UTF-8"
+        );
     }
 
     #[test]
@@ -3808,11 +4853,15 @@ mod tests {
         let mut len_buf = [0_u8; 4];
         len_buf.copy_from_slice(&bytes[..4]);
         let payload_len = u32::from_be_bytes(len_buf) as usize;
-        assert_eq!(payload_len, bytes.len() - 4, "Length prefix should match payload");
+        assert_eq!(
+            payload_len,
+            bytes.len() - 4,
+            "Length prefix should match payload"
+        );
 
         let payload = &bytes[4..];
-        let decoded = rmp_serde::from_slice::<UdsMessage>(payload)
-            .expect("UDS payload should decode");
+        let decoded =
+            rmp_serde::from_slice::<UdsMessage>(payload).expect("UDS payload should decode");
         match decoded {
             UdsMessage::Event(decoded_event) => {
                 assert_eq!(decoded_event.exchange, "TestExchange");
@@ -3823,8 +4872,11 @@ mod tests {
 
     #[test]
     fn test_broadcast_config_from_env_defaults() {
-        // Clear env vars to test defaults
-        // SAFETY: Only modifying test-specific env vars in single-threaded test
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_envelope = std::env::var("WS_ENVELOPE").ok();
+        let prev_source = std::env::var("WS_SOURCE").ok();
+
+        // SAFETY: Env mutation guarded by global test lock
         unsafe {
             std::env::remove_var("WS_ENVELOPE");
             std::env::remove_var("WS_SOURCE");
@@ -3833,6 +4885,18 @@ mod tests {
         let config = BroadcastConfig::from_env();
         assert!(!config.use_envelope, "Default should be no envelope");
         assert_eq!(config.source, "barter-data-server", "Default source");
+
+        // SAFETY: Env mutation guarded by global test lock
+        unsafe {
+            match prev_envelope {
+                Some(v) => std::env::set_var("WS_ENVELOPE", v),
+                None => std::env::remove_var("WS_ENVELOPE"),
+            }
+            match prev_source {
+                Some(v) => std::env::set_var("WS_SOURCE", v),
+                None => std::env::remove_var("WS_SOURCE"),
+            }
+        }
     }
 
     #[test]
@@ -3871,7 +4935,9 @@ mod tests {
 
         // Create a snapshot with some data
         let mut snapshot = AggregatedSnapshot::default();
-        snapshot.tickers.insert("BTC".to_string(), Default::default());
+        snapshot
+            .tickers
+            .insert("BTC".to_string(), Default::default());
 
         // Send new snapshot
         tx.send(snapshot).unwrap();
@@ -3965,17 +5031,29 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<MarketEventMessage>(2);
 
         // Fill it
-        assert!(tx.try_send(test_event()).is_ok(), "First send should succeed");
-        assert!(tx.try_send(test_event()).is_ok(), "Second send should succeed");
+        assert!(
+            tx.try_send(test_event()).is_ok(),
+            "First send should succeed"
+        );
+        assert!(
+            tx.try_send(test_event()).is_ok(),
+            "Second send should succeed"
+        );
 
         // This should fail (channel full)
-        assert!(tx.try_send(test_event()).is_err(), "Third send should fail (channel full)");
+        assert!(
+            tx.try_send(test_event()).is_err(),
+            "Third send should fail (channel full)"
+        );
 
         // Drain one message
         let _ = rx.try_recv();
 
         // Now send should succeed (channel has space again)
-        assert!(tx.try_send(test_event()).is_ok(), "Should succeed after drain");
+        assert!(
+            tx.try_send(test_event()).is_ok(),
+            "Should succeed after drain"
+        );
     }
 
     #[test]
@@ -4009,32 +5087,44 @@ mod tests {
 
         // These should be the defaults (no env vars set in test)
         assert_eq!(config.l1_throttle_ms, 50, "L1 throttle should be cached");
-        assert_eq!(config.spot_log_threshold, 50_000.0, "Spot log threshold should be cached");
+        assert_eq!(
+            config.spot_log_threshold, 50_000.0,
+            "Spot log threshold should be cached"
+        );
     }
 
     // ========== CRITICAL: Feed staleness detection tests ==========
 
     #[test]
     fn test_feed_staleness_detection_logic() {
-        use std::sync::atomic::Ordering;
-
         // Simulate the staleness check logic from the metrics task
         let now_ms = chrono::Utc::now().timestamp_millis();
 
         // Recent event (5 seconds ago) - should NOT be stale
         let recent_event_ms = now_ms - 5_000;
-        let is_recent_stale = recent_event_ms > 0 && (now_ms - recent_event_ms) > FEED_STALE_THRESHOLD_MS;
-        assert!(!is_recent_stale, "5s old event should NOT be stale (threshold is 30s)");
+        let is_recent_stale =
+            recent_event_ms > 0 && (now_ms - recent_event_ms) > FEED_STALE_THRESHOLD_MS;
+        assert!(
+            !is_recent_stale,
+            "5s old event should NOT be stale (threshold is 30s)"
+        );
 
         // Old event (45 seconds ago) - should BE stale
         let old_event_ms = now_ms - 45_000;
         let is_old_stale = old_event_ms > 0 && (now_ms - old_event_ms) > FEED_STALE_THRESHOLD_MS;
-        assert!(is_old_stale, "45s old event should BE stale (threshold is 30s)");
+        assert!(
+            is_old_stale,
+            "45s old event should BE stale (threshold is 30s)"
+        );
 
         // Never received event (0) - should NOT trigger stale (special case)
         let never_received_ms = 0_i64;
-        let is_never_stale = never_received_ms > 0 && (now_ms - never_received_ms) > FEED_STALE_THRESHOLD_MS;
-        assert!(!is_never_stale, "Never-received event should NOT trigger stale alert");
+        let is_never_stale =
+            never_received_ms > 0 && (now_ms - never_received_ms) > FEED_STALE_THRESHOLD_MS;
+        assert!(
+            !is_never_stale,
+            "Never-received event should NOT trigger stale alert"
+        );
     }
 
     #[test]
@@ -4099,7 +5189,10 @@ mod tests {
             let mut current_max = SKEW_MAX_MS.load(Ordering::Relaxed);
             while skew > current_max {
                 match SKEW_MAX_MS.compare_exchange_weak(
-                    current_max, skew, Ordering::Relaxed, Ordering::Relaxed
+                    current_max,
+                    skew,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
                 ) {
                     Ok(_) => break,
                     Err(x) => current_max = x,
@@ -4110,7 +5203,10 @@ mod tests {
             let mut current_min = SKEW_MIN_MS.load(Ordering::Relaxed);
             while skew < current_min {
                 match SKEW_MIN_MS.compare_exchange_weak(
-                    current_min, skew, Ordering::Relaxed, Ordering::Relaxed
+                    current_min,
+                    skew,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
                 ) {
                     Ok(_) => break,
                     Err(x) => current_min = x,
@@ -4132,7 +5228,11 @@ mod tests {
         assert_eq!(skew_min, 5, "Min skew should be 5ms");
 
         // Calculate average like the metrics task does
-        let skew_avg = if skew_count > 0 { skew_sum / skew_count as i64 } else { 0 };
+        let skew_avg = if skew_count > 0 {
+            skew_sum / skew_count as i64
+        } else {
+            0
+        };
         assert_eq!(skew_avg, 27, "Average skew should be 27ms (275/10)");
     }
 
@@ -4158,8 +5258,8 @@ mod tests {
         let event = test_event();
 
         // Serialize (simulates hot path)
-        let bytes = serialize_for_broadcast(&config, event.clone())
-            .expect("Serialization should succeed");
+        let bytes =
+            serialize_for_broadcast(&config, event.clone()).expect("Serialization should succeed");
 
         // Broadcast
         tx.send(bytes.clone()).expect("Broadcast should succeed");
@@ -4171,8 +5271,8 @@ mod tests {
         assert_eq!(received, bytes, "Received bytes should match sent bytes");
 
         // Parse received data (simulates client parsing)
-        let parsed: MarketEventMessage = serde_json::from_slice(&received)
-            .expect("Should parse as MarketEventMessage");
+        let parsed: MarketEventMessage =
+            serde_json::from_slice(&received).expect("Should parse as MarketEventMessage");
 
         assert_eq!(parsed.exchange, "TestExchange");
         assert_eq!(parsed.kind, "trade");
@@ -4232,8 +5332,8 @@ mod tests {
         let received = rx.recv().await.unwrap();
 
         // Parse as JSON value to verify envelope structure
-        let envelope: serde_json::Value = serde_json::from_slice(&received)
-            .expect("Should parse as JSON");
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&received).expect("Should parse as JSON");
 
         assert_eq!(envelope["schema_version"], 1);
         assert_eq!(envelope["source"], "test-server");

@@ -1,0 +1,61 @@
+# Containerfile.nautilus
+# Debian-slim based Python 3.12 container for Nautilus Trader
+# Uses UV for fast, reliable package management
+# Multi-stage: builder installs deps → runtime is slim
+#
+# Usage (from repo root):
+#   podman build --platform linux/amd64 \
+#     -f deploy/Containerfile.nautilus -t nautilus-trader:latest .
+
+# ── Builder stage ──────────────────────────────────────────────
+FROM python:3.12-slim AS builder
+
+# Install UV
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Create virtualenv with UV
+RUN uv venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install packages with UV (faster than pip, lockfile-aware)
+RUN uv pip install \
+    nautilus_trader \
+    pyarrow \
+    pandas \
+    jupyter \
+    msgpack
+
+# ── Runtime stage ──────────────────────────────────────────────
+FROM python:3.12-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install UV in runtime too (for uv run / uv pip in container)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Create non-root user
+RUN useradd -m -d /app -s /bin/bash nautilus
+USER nautilus
+WORKDIR /app
+
+# Copy virtualenv from builder
+COPY --from=builder --chown=nautilus:nautilus /opt/venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy scripts
+COPY --chown=nautilus:nautilus scripts/validation/setup_nautilus_catalog.py /app/scripts/
+COPY --chown=nautilus:nautilus scripts/validation/run_nautilus_backtest.py /app/scripts/
+COPY --chown=nautilus:nautilus scripts/validation/run_nautilus_backtest_strategies.py /app/scripts/
+
+# Data directories created at runtime via volume mounts:
+#   /data/parquet  - parquet input (read-only)
+#   /data/ipc      - UDS socket + heartbeat (shared with barter-server)
+#   /data/catalog  - Nautilus catalog output
+
+# Default: sleep forever (on-demand container, exec into it)
+# Jupyter only runs via explicit compose profile
+CMD ["sleep", "infinity"]

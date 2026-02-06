@@ -778,29 +778,23 @@ impl
 {
     type OnTradingDisabled = OnTradingDisabledOutput;
 
-    fn on_trading_disabled(
-        _: &mut Engine<
-            HistoricalClock,
-            EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
-            MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
-            Self,
-            DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
-        >,
-    ) -> Self::OnTradingDisabled {
+    fn on_trading_disabled(_: &mut TestEngine) -> Self::OnTradingDisabled {
         OnTradingDisabledOutput
     }
 }
 
-fn build_engine(
-    trading_state: TradingState,
-    execution_tx: UnboundedTx<ExecutionRequest>,
-) -> Engine<
+type TestEngine = Engine<
     HistoricalClock,
     EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
     MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
     TestBuyAndHoldStrategy,
     DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
-> {
+>;
+
+fn build_engine(
+    trading_state: TradingState,
+    execution_tx: UnboundedTx<ExecutionRequest>,
+) -> TestEngine {
     let instruments = IndexedInstruments::builder()
         .add_instrument(Instrument::spot(
             ExchangeId::BinanceSpot,
@@ -832,7 +826,7 @@ fn build_engine(
 
     let clock = HistoricalClock::new(STARTING_TIMESTAMP);
 
-    let state = EngineState::builder(&instruments, DefaultGlobalData::default(), |_| {
+    let state = EngineState::builder(&instruments, DefaultGlobalData, |_| {
         DefaultInstrumentMarketData::default()
     })
     .time_engine_start(STARTING_TIMESTAMP)

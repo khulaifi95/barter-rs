@@ -1,0 +1,63 @@
+# barter-features configuration
+# v1.2.0
+
+[general]
+schema_version = "1.2.0"
+input_dir = "/data/raw"
+output_dir = "/data/features"
+checkpoint_dir = "/data/_checkpoints"
+mode = "watch"
+
+[filter]
+# Empty = allow all. Use safe IDs (e.g., BTCUSDT_PERP_BINANCE).
+instruments = []
+
+[precision]
+# Auto-detect from NAUTILUS_PRECISION (matches collector)
+# Default: high (i128 × 1e16)
+mode = "auto"
+
+[session]
+start_hour = 0
+duration_hours = 24
+timezone = "UTC"
+
+[tpo]
+bracket_minutes = 30
+price_bucket_usd = 50.0
+initial_balance_brackets = 2
+value_area_pct = 0.70
+value_area_algorithm = "expanding"
+
+[large_trades]
+# BTC defaults (validated against 11.5M trades/day)
+threshold_mode = "absolute"
+large_threshold_usd = 2_000_000.0
+whale_threshold_usd = 5_000_000.0
+mega_threshold_usd = 10_000_000.0
+
+[profile]
+poc_shift_threshold_usd = 100.0
+va_shift_threshold_usd = 150.0
+poc_divergence_threshold_usd = 200.0
+
+[gaps]
+handling = "emit_event"
+max_gap_minutes = 60
+tolerance_secs = 2
+
+[watcher]
+# Ignore files with mtime < this (seconds)
+stable_mtime_secs = 2
+
+[checkpoint]
+enabled = true
+save_interval_secs = 30
+verify_hashes = true
+file = "features_state.json"
+
+[writer]
+compression = "zstd"
+flush_interval_secs = 60
+partition_by_date = true
+include_metadata = true

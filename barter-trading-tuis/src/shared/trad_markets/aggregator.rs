@@ -69,7 +69,14 @@ impl MicroBarAggregator {
 
     /// Returns Some(bar) when a 5-second bar completes
     /// Uses tick timestamp (ts) for bar boundaries, not wall clock
-    pub fn update(&mut self, price: f64, size: f64, ts: i64, bid: Option<f64>, ask: Option<f64>) -> Option<MicroBar> {
+    pub fn update(
+        &mut self,
+        price: f64,
+        size: f64,
+        ts: i64,
+        bid: Option<f64>,
+        ask: Option<f64>,
+    ) -> Option<MicroBar> {
         // Guard: ignore invalid prices or timestamps
         if price <= 0.0 || ts <= 0 {
             return None;
@@ -77,11 +84,7 @@ impl MicroBarAggregator {
 
         let tick_bar_start = Self::align_to_bar(ts);
         let is_buy = Self::classify_side(price, bid, ask);
-        let (buy_inc, sell_inc) = if is_buy {
-            (size, 0.0)
-        } else {
-            (0.0, size)
-        };
+        let (buy_inc, sell_inc) = if is_buy { (size, 0.0) } else { (0.0, size) };
 
         match self.current_bar_start_ts {
             None => {
@@ -222,9 +225,36 @@ mod tests {
         let mut buffer = BarBuffer::new(10);
 
         // Add bars with known closes: 100, 101, 102
-        buffer.push(MicroBar { ts: 1, open: 100.0, high: 100.0, low: 100.0, close: 100.0, volume: 1.0, buy_volume: 0.0, sell_volume: 0.0 });
-        buffer.push(MicroBar { ts: 2, open: 101.0, high: 101.0, low: 101.0, close: 101.0, volume: 1.0, buy_volume: 0.0, sell_volume: 0.0 });
-        buffer.push(MicroBar { ts: 3, open: 102.0, high: 102.0, low: 102.0, close: 102.0, volume: 1.0, buy_volume: 0.0, sell_volume: 0.0 });
+        buffer.push(MicroBar {
+            ts: 1,
+            open: 100.0,
+            high: 100.0,
+            low: 100.0,
+            close: 100.0,
+            volume: 1.0,
+            buy_volume: 0.0,
+            sell_volume: 0.0,
+        });
+        buffer.push(MicroBar {
+            ts: 2,
+            open: 101.0,
+            high: 101.0,
+            low: 101.0,
+            close: 101.0,
+            volume: 1.0,
+            buy_volume: 0.0,
+            sell_volume: 0.0,
+        });
+        buffer.push(MicroBar {
+            ts: 3,
+            open: 102.0,
+            high: 102.0,
+            low: 102.0,
+            close: 102.0,
+            volume: 1.0,
+            buy_volume: 0.0,
+            sell_volume: 0.0,
+        });
 
         let returns = buffer.returns(3);
         assert_eq!(returns.len(), 2);
@@ -274,7 +304,11 @@ mod tests {
 
         // With 500 ticks over 360 seconds, we should get ~72 bars (360/5)
         // Minus 1 because last bar is incomplete
-        assert!(bars_produced >= 70, "Expected ~70+ bars from backfill, got {}", bars_produced);
+        assert!(
+            bars_produced >= 70,
+            "Expected ~70+ bars from backfill, got {}",
+            bars_produced
+        );
     }
 
     #[test]

@@ -1,0 +1,43 @@
+[package]
+name = "barter-features"
+version = "0.1.0"
+edition = "2024"
+description = "Feature computation layer for barter-data-server"
+license = "MIT"
+
+[dependencies]
+# Arrow/Parquet
+arrow = { version = "54", default-features = false, features = ["ipc"] }
+parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd"] }
+
+# Async runtime
+tokio = { workspace = true, features = ["fs", "sync", "signal"] }
+tokio-stream = { workspace = true }
+
+# File watching
+notify = "7"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+
+# Cryptographic hashing
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Date/Time
+chrono = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

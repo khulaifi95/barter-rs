@@ -37,6 +37,11 @@
 //! ## Getting Started Via Engine Examples
 //! [See Engine Examples](https://github.com/barter-rs/barter-rs/tree/feat/docs_tests_readmes_examples/barter/examples)
 
+#[cfg(test)]
+use criterion as _;
+#[cfg(test)]
+use serde_json as _;
+
 use crate::{
     engine::{command::Command, state::trading::TradingState},
     execution::AccountStreamEvent,

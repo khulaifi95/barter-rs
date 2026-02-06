@@ -1,10 +1,6 @@
 use self::{
-    book::l2::OkxOrderBooksL2Transformer,
-    channel::OkxChannel,
-    liquidation::OkxLiquidations,
-    market::OkxMarket,
-    open_interest::OkxOpenInterests,
-    subscription::OkxSubResponse,
+    book::l2::OkxOrderBooksL2Transformer, channel::OkxChannel, liquidation::OkxLiquidations,
+    market::OkxMarket, open_interest::OkxOpenInterests, subscription::OkxSubResponse,
     trade::OkxTrades,
 };
 use crate::{
@@ -13,11 +9,8 @@ use crate::{
     instrument::InstrumentData,
     subscriber::{WebSocketSubscriber, validator::WebSocketSubValidator},
     subscription::{
-        book::OrderBooksL2,
-        cvd::CumulativeVolumeDeltas,
-        liquidation::Liquidations,
-        open_interest::OpenInterests,
-        trade::PublicTrades,
+        book::OrderBooksL2, cvd::CumulativeVolumeDeltas, liquidation::Liquidations,
+        open_interest::OpenInterests, trade::PublicTrades,
     },
     transformer::{cvd::CumulativeVolumeDeltaTransformer, stateless::StatelessTransformer},
 };
@@ -142,10 +135,8 @@ impl Connector for Okx {
                         "instId": market,
                     });
 
-                    if let Some(uly) = uly {
-                        if let serde_json::Value::Object(ref mut map) = arg {
-                            map.insert("uly".into(), serde_json::Value::String(uly));
-                        }
+                    if let (Some(uly), serde_json::Value::Object(map)) = (uly, &mut arg) {
+                        map.insert("uly".into(), serde_json::Value::String(uly));
                     }
 
                     arg

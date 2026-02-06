@@ -50,6 +50,7 @@ aws-sdk-s3 = "1.65"
 # Additional utilities
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+vecmap-rs = { workspace = true }
 
 [[bin]]
 name = "load-test"

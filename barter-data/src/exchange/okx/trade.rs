@@ -1,10 +1,10 @@
+use super::ctval;
 use crate::{
     Identifier,
     event::{MarketEvent, MarketIter},
     exchange::ExchangeSub,
     subscription::trade::PublicTrade,
 };
-use super::ctval;
 use barter_instrument::{Side, exchange::ExchangeId};
 use barter_integration::subscription::SubscriptionId;
 use chrono::{DateTime, Utc};
@@ -131,7 +131,6 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, OkxTrades)>
             .collect()
     }
 }
-
 
 #[cfg(test)]
 mod tests {

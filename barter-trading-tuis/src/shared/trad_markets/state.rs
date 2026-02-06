@@ -20,8 +20,8 @@ pub struct CorrelationSignals {
     pub btc_return: f64,
 
     // Spreads
-    pub nq_es_spread: f64,    // NQ% - ES%
-    pub btc_es_spread: f64,   // BTC% - ES% (main signal)
+    pub nq_es_spread: f64,  // NQ% - ES%
+    pub btc_es_spread: f64, // BTC% - ES% (main signal)
 
     // Correlations (None = insufficient data)
     pub es_nq_corr: Option<f64>,
@@ -31,12 +31,12 @@ pub struct CorrelationSignals {
     pub divergence_z: Option<f64>,
 
     // Lead/Lag
-    pub lead_lag_bars: i32,   // Positive = ES leads
-    pub lead_lag_secs: i32,   // In seconds for display
+    pub lead_lag_bars: i32, // Positive = ES leads
+    pub lead_lag_secs: i32, // In seconds for display
     pub lead_lag_corr: Option<f64>,
 
     // Derived
-    pub eq_sync: bool,        // ES/NQ corr > 0.85
+    pub eq_sync: bool, // ES/NQ corr > 0.85
 
     // TradFi flow (contracts)
     pub es_delta: f64,
@@ -52,7 +52,7 @@ pub struct CorrelationSignals {
     pub es_bars_count: usize,
     pub nq_bars_count: usize,
     pub btc_bars_count: usize,
-    pub es_stale: bool,       // No data for >30s
+    pub es_stale: bool, // No data for >30s
     pub nq_stale: bool,
 }
 
@@ -64,12 +64,12 @@ pub struct TradMarketState {
     btc_aggregator: MicroBarAggregator,
 
     // Bar buffers (store last N bars)
-    es_bars: BarBuffer,      // 60 bars = 5 minutes
+    es_bars: BarBuffer, // 60 bars = 5 minutes
     nq_bars: BarBuffer,
     btc_bars: BarBuffer,
 
     // Spread history for z-score
-    spread_history: VecDeque<f64>,  // 60 samples = 5 minutes
+    spread_history: VecDeque<f64>, // 60 samples = 5 minutes
 
     // Latest prices for display
     es_price: f64,
@@ -176,7 +176,7 @@ impl TradMarketState {
 
     /// Recompute all signals (called when ES bar completes)
     fn recompute_signals(&mut self) {
-        let window = 12;  // 12 bars = 60 seconds
+        let window = 12; // 12 bars = 60 seconds
 
         let es_returns = self.es_bars.returns(window);
         let nq_returns = self.nq_bars.returns(window);
@@ -236,7 +236,7 @@ impl TradMarketState {
         } else {
             (0, None)
         };
-        let lead_lag_secs = lead_lag_bars * 5;  // Convert to seconds
+        let lead_lag_secs = lead_lag_bars * 5; // Convert to seconds
 
         // EQ sync check
         let eq_sync = es_nq_corr.map(|c| c > 0.85).unwrap_or(false);
@@ -244,10 +244,12 @@ impl TradMarketState {
         // Staleness check
         let now = Instant::now();
         let stale_threshold = std::time::Duration::from_secs(30);
-        let es_stale = self.es_last_update
+        let es_stale = self
+            .es_last_update
             .map(|t| now.duration_since(t) > stale_threshold)
             .unwrap_or(true);
-        let nq_stale = self.nq_last_update
+        let nq_stale = self
+            .nq_last_update
             .map(|t| now.duration_since(t) > stale_threshold)
             .unwrap_or(true);
 

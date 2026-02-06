@@ -2,6 +2,7 @@
 //!
 //! Maintains rolling windows for trades, liquidations, OI, CVD, and orderbook data
 //! so each TUI can render consistent metrics without duplicating calculations.
+#![allow(clippy::items_after_test_module)]
 
 use crate::shared::types::{
     CvdData, FundingRateData, LiquidationData, MarketEventMessage, MarketSnapshotMessage,
@@ -91,8 +92,8 @@ struct Candle5m {
 /// VWAP accumulator state
 #[derive(Clone, Debug, Default)]
 struct VwapState {
-    sum_pv: f64,      // Σ(price × volume)
-    sum_v: f64,       // Σ(volume)
+    sum_pv: f64, // Σ(price × volume)
+    sum_v: f64,  // Σ(volume)
     last_reset: Option<DateTime<Utc>>,
 }
 
@@ -142,11 +143,7 @@ impl AtrState {
         }
 
         // Anchor for % checks uses the largest of close/open/high to reduce false positives
-        let anchor = candle
-            .close
-            .max(candle.open)
-            .max(high)
-            .max(1.0);
+        let anchor = candle.close.max(candle.open).max(high).max(1.0);
 
         let tr = if let Some(prev_close) = self.prev_close {
             // True Range = max(H-L, |H-PrevClose|, |L-PrevClose|)
@@ -191,10 +188,10 @@ impl AtrState {
 /// Trading session identifier
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum TradingSession {
-    Asia,    // 00:00 - 08:00 UTC
-    Europe,  // 08:00 - 14:00 UTC
-    US,      // 14:00 - 22:00 UTC
-    USLate,  // 22:00 - 00:00 UTC
+    Asia,   // 00:00 - 08:00 UTC
+    Europe, // 08:00 - 14:00 UTC
+    US,     // 14:00 - 22:00 UTC
+    USLate, // 22:00 - 00:00 UTC
 }
 
 impl TradingSession {
@@ -223,7 +220,7 @@ pub enum VolTrend {
     Expanding,   // Vol increasing
     Contracting, // Vol decreasing
     #[default]
-    Stable,      // Vol relatively unchanged
+    Stable, // Vol relatively unchanged
 }
 
 impl VolTrend {
@@ -480,18 +477,13 @@ pub struct AggregatedSnapshot {
     pub server_snapshot: Option<MarketSnapshotMessage>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum WallTier {
     Small,
+    #[default]
     Normal,
     Large,
     Huge,
-}
-
-impl Default for WallTier {
-    fn default() -> Self {
-        WallTier::Normal
-    }
 }
 impl WallTier {
     fn rank(&self) -> u8 {
@@ -514,25 +506,13 @@ impl WallTier {
 }
 
 /// Aggregated L2 wall near spot (size in USD notional)
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct BookWall {
     pub price: f64,
     pub notional_usd: f64,
     pub distance_pct: f64,
     pub size_base: f64,
     pub tier: WallTier,
-}
-
-impl Default for BookWall {
-    fn default() -> Self {
-        Self {
-            price: 0.0,
-            notional_usd: 0.0,
-            distance_pct: 0.0,
-            size_base: 0.0,
-            tier: WallTier::Normal,
-        }
-    }
 }
 
 /// Per-ticker snapshot with pre-computed metrics.
@@ -622,35 +602,35 @@ pub struct TickerSnapshot {
     // P1: Basis momentum
     pub basis_momentum: Option<BasisMomentum>,
     // VWAP metrics (tick-based)
-    pub vwap_daily: Option<f64>,           // Since 00:00 UTC (tick-based)
-    pub vwap_session: Option<f64>,         // Since session start (tick-based)
+    pub vwap_daily: Option<f64>,   // Since 00:00 UTC (tick-based)
+    pub vwap_session: Option<f64>, // Since session start (tick-based)
     pub current_session: Option<TradingSession>,
     pub vwap_daily_deviation: Option<f64>, // (price - vwap) / vwap * 100
     // tvVWAP (TradingView style - HLC3 on 5m candles since 00:00 UTC)
     pub tv_vwap: Option<f64>,
-    pub tv_vwap_deviation: Option<f64>,    // (price - tvVWAP) / tvVWAP * 100
-    pub candles_5m_len: usize,             // For guarding tvVWAP / RV display
+    pub tv_vwap_deviation: Option<f64>, // (price - tvVWAP) / tvVWAP * 100
+    pub candles_5m_len: usize,          // For guarding tvVWAP / RV display
     // ATR-14 (5m candles, EMA)
-    pub atr_14: Option<f64>,               // ATR in price units
-    pub atr_14_pct: Option<f64>,           // ATR as % of price
+    pub atr_14: Option<f64>,     // ATR in price units
+    pub atr_14_pct: Option<f64>, // ATR as % of price
     // Realized Volatility (from 5m candles)
-    pub realized_vol_30m: Option<f64>,     // RV % over last 30 min (6 candles)
-    pub realized_vol_1h: Option<f64>,      // RV % over last hour (12 candles)
-    pub realized_vol_trend: VolTrend,      // EXPANDING, CONTRACTING, STABLE
+    pub realized_vol_30m: Option<f64>, // RV % over last 30 min (6 candles)
+    pub realized_vol_1h: Option<f64>,  // RV % over last hour (12 candles)
+    pub realized_vol_trend: VolTrend,  // EXPANDING, CONTRACTING, STABLE
     /// 1-minute return Z-score for shock detection (per spec: Dual-Vol L1 filter)
     /// Calculated from rolling 60 1-minute returns. |σ| >= 3.5 = shock.
     pub zscore_1m: f64,
     // L2 Orderbook imbalance (per exchange and aggregated)
     pub per_exchange_book_imbalance: HashMap<String, f64>, // Book imbalance by exchange (0-100%, 50% = balanced)
-    pub aggregated_book_imbalance: f64,                    // Combined book imbalance across all exchanges
+    pub aggregated_book_imbalance: f64, // Combined book imbalance across all exchanges
     /// Smoothed aggregate book imbalance (EMA ~3s)
     pub aggregated_book_imbalance_smoothed: f64,
     /// Nearest aggregated bid wall within the L2 band
     pub bid_walls: Vec<BookWall>,
     /// Nearest aggregated ask wall within the L2 band
     pub ask_walls: Vec<BookWall>,
-    pub book_flip_count: usize,                             // Number of imbalance flips in last 30s
-    pub book_freshness: HashMap<String, f64>,              // Seconds since last book update per exchange
+    pub book_flip_count: usize, // Number of imbalance flips in last 30s
+    pub book_freshness: HashMap<String, f64>, // Seconds since last book update per exchange
 }
 
 #[derive(Clone, Debug, Default)]
@@ -716,23 +696,18 @@ pub struct TickDirection {
     pub uptick_pct: f64,
 }
 
-#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Default)]
 pub enum DivergenceSignal {
     Bullish,
     Bearish,
     Aligned,
     Neutral,
+    #[default]
     Unknown,
 }
 
-impl Default for DivergenceSignal {
-    fn default() -> Self {
-        DivergenceSignal::Unknown
-    }
-}
-
 /// P1: Flow signal for CVD momentum panel
-#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Default)]
 pub enum FlowSignal {
     /// Price flat, CVD rising - accumulation
     Accumulation,
@@ -743,13 +718,8 @@ pub enum FlowSignal {
     /// Price and CVD aligned - confirmation (trend supported by flow)
     Confirmation,
     /// No clear signal
+    #[default]
     Neutral,
-}
-
-impl Default for FlowSignal {
-    fn default() -> Self {
-        FlowSignal::Neutral
-    }
 }
 
 /// P1: Basis momentum for tracking basis velocity
@@ -779,17 +749,12 @@ impl From<&SnapshotPerExchangeShort> for PerExchangeShortStats {
 }
 
 /// P1: Basis trend direction
-#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Default)]
 pub enum BasisTrend {
     Widening,
     Narrowing,
+    #[default]
     Stable,
-}
-
-impl Default for BasisTrend {
-    fn default() -> Self {
-        BasisTrend::Stable
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -866,7 +831,10 @@ impl Aggregator {
 
     /// Backfill tvVWAP, ATR, and RV from authoritative Binance 1m klines
     /// This is the preferred backfill method - use this for accurate metrics
-    pub async fn backfill_1m_klines(&mut self, tickers: &[&str]) -> HashMap<String, BackfillResult> {
+    pub async fn backfill_1m_klines(
+        &mut self,
+        tickers: &[&str],
+    ) -> HashMap<String, BackfillResult> {
         let mut results = HashMap::new();
 
         for ticker in tickers {
@@ -938,7 +906,10 @@ impl Aggregator {
 
         // Hardened spot/perp classifier
         let mut is_spot = kind.contains("spot");
-        let mut is_perp = kind.contains("perp") || kind.contains("perpetual") || kind.contains("swap") || kind.contains("futures");
+        let mut is_perp = kind.contains("perp")
+            || kind.contains("perpetual")
+            || kind.contains("swap")
+            || kind.contains("futures");
 
         // Fallback: use exchange name if kind is ambiguous
         if !is_spot && !is_perp {
@@ -1008,10 +979,9 @@ impl Aggregator {
                     .ok()
                     .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
                     .unwrap_or(false)
+                    && self.unknown_event_kinds.insert(other.to_string())
                 {
-                    if self.unknown_event_kinds.insert(other.to_string()) {
-                        warn!("Unknown event kind received: {}", other);
-                    }
+                    warn!("Unknown event kind received: {}", other);
                 }
             }
         }
@@ -1023,10 +993,7 @@ impl Aggregator {
         // Debug: track whales per exchange when a whale was added
         if let Some(ticker_state) = self.tickers.get(&ticker) {
             if let Some(kind) = ticker_state.last_whale(&event.exchange) {
-                let counters = self
-                    .whale_counts
-                    .entry(event.exchange.clone())
-                    .or_insert_with(WhaleCounters::default);
+                let counters = self.whale_counts.entry(event.exchange.clone()).or_default();
                 counters.total += 1;
                 match kind {
                     "SPOT" => counters.spot += 1,
@@ -1057,7 +1024,11 @@ impl Aggregator {
                 .open("whale_debug.log")
             {
                 use std::io::Write;
-                let _ = writeln!(file, "[whale-debug] last 30s whales: {}", summary.join(", "));
+                let _ = writeln!(
+                    file,
+                    "[whale-debug] last 30s whales: {}",
+                    summary.join(", ")
+                );
             }
             self.whale_counts.clear();
             self.last_whale_log = now;
@@ -1228,10 +1199,10 @@ struct TickerState {
     // Flag to indicate kline data is available and should be used
     use_kline_metrics: bool,
     // L2 Orderbook state per exchange
-    book_imbalance_by_exchange: HashMap<String, f64>,  // Current imbalance (0-100%, 50% = balanced)
-    smoothed_book_imbalance: f64,                      // Smoothed aggregate imbalance
-    book_imbalance_last_ts: Option<DateTime<Utc>>,     // Last timestamp used for smoothing
-    book_last_update: HashMap<String, DateTime<Utc>>,  // Last update time per exchange
+    book_imbalance_by_exchange: HashMap<String, f64>, // Current imbalance (0-100%, 50% = balanced)
+    smoothed_book_imbalance: f64,                     // Smoothed aggregate imbalance
+    book_imbalance_last_ts: Option<DateTime<Utc>>,    // Last timestamp used for smoothing
+    book_last_update: HashMap<String, DateTime<Utc>>, // Last update time per exchange
     book_flip_history: VecDeque<(DateTime<Utc>, bool)>, // (time, was_bid_heavy) for flip detection
     bid_wall_by_exchange: HashMap<String, Vec<BookWall>>,
     ask_wall_by_exchange: HashMap<String, Vec<BookWall>>,
@@ -1517,7 +1488,8 @@ impl TickerState {
 
         // Calculate standard deviation
         let mean: f64 = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance: f64 = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+        let variance: f64 =
+            returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
         let std_dev = variance.sqrt();
 
         // Return as percentage
@@ -1564,11 +1536,8 @@ impl TickerState {
         }
 
         let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns
-            .iter()
-            .map(|r| (r - mean).powi(2))
-            .sum::<f64>()
-            / returns.len() as f64;
+        let variance =
+            returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
         let std_dev = variance.sqrt();
         if std_dev <= f64::EPSILON {
             return 0.0;
@@ -1651,7 +1620,7 @@ impl TickerState {
             let deque = self
                 .whales_by_exchange
                 .entry(exchange.to_string())
-                .or_insert_with(VecDeque::new);
+                .or_default();
             deque.push_front(record.clone());
 
             // Time-based retention: remove whales older than 5 minutes
@@ -1842,7 +1811,7 @@ impl TickerState {
         let deque = self
             .oi_history_by_exchange
             .entry(exchange.to_string())
-            .or_insert_with(VecDeque::new);
+            .or_default();
         deque.push_back(OiRecord {
             time: now,
             total: contracts,
@@ -1949,7 +1918,8 @@ impl TickerState {
         if let (Some(spot), Some(perp)) = (self.spot_mid, self.perp_mid) {
             if spot > 0.0 {
                 let basis_usd = perp - spot;
-                self.basis_history.push_back(BasisRecord { time, basis_usd });
+                self.basis_history
+                    .push_back(BasisRecord { time, basis_usd });
 
                 // Prune old basis records
                 let cutoff = time - ChronoDuration::seconds(BASIS_RETENTION_SECS);
@@ -2011,7 +1981,8 @@ impl TickerState {
         };
         self.book_imbalance_by_exchange
             .insert(exchange_short.to_string(), imbalance_pct);
-        self.book_last_update.insert(exchange_short.to_string(), time);
+        self.book_last_update
+            .insert(exchange_short.to_string(), time);
 
         if let Some(mid) = book.mid_price() {
             let (bid_walls, ask_walls) = self.nearest_book_walls(book, mid, L2_IMBALANCE_BAND_PCT);
@@ -2115,7 +2086,7 @@ impl TickerState {
         let cvd_velocity_1m = cvd_1m_total; // 1m total IS the velocity
         let cvd_velocity_5m = cvd_5m_total / 5.0; // per minute
         let cvd_velocity_15m = cvd_15m_total / 15.0; // per minute
-        // P1: OI with velocity - enhanced with per-exchange
+                                                     // P1: OI with velocity - enhanced with per-exchange
         let oi_total: f64 = self.oi_by_exchange.values().copied().sum();
         let (oi_delta_5m, oi_velocity) = self.oi_velocity(300);
         let (oi_delta_15m, _) = self.oi_velocity(900);
@@ -2355,7 +2326,7 @@ impl TickerState {
         walls
     }
 
-    fn sort_walls(walls: &mut Vec<BookWall>) {
+    fn sort_walls(walls: &mut [BookWall]) {
         walls.sort_by(|a, b| {
             let rank = b.tier.rank().cmp(&a.tier.rank());
             if rank == std::cmp::Ordering::Equal {
@@ -2570,9 +2541,8 @@ impl TickerState {
 
         // Calculate standard deviation of returns
         let mean: f64 = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance: f64 = returns.iter()
-            .map(|r| (r - mean).powi(2))
-            .sum::<f64>() / returns.len() as f64;
+        let variance: f64 =
+            returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
         let std_dev = variance.sqrt();
 
         Some(std_dev * 100.0)
@@ -2581,8 +2551,8 @@ impl TickerState {
     /// Calculate 30m and 1h realized volatility, plus trend
     /// Returns (rv_30m, rv_1h, trend)
     fn calculate_realized_volatility(&self) -> (Option<f64>, Option<f64>, VolTrend) {
-        let rv_30m = self.calculate_rv_for_window(6);   // 6 × 5m = 30 min
-        let rv_1h = self.calculate_rv_for_window(12);   // 12 × 5m = 60 min
+        let rv_30m = self.calculate_rv_for_window(6); // 6 × 5m = 30 min
+        let rv_1h = self.calculate_rv_for_window(12); // 12 × 5m = 60 min
 
         // Determine trend by comparing 30m vs 1h
         // If 30m > 1h → volatility expanding (recent is hotter)
@@ -2615,15 +2585,11 @@ impl TickerState {
     /// Calculate fair value as 30s volume-weighted mid across all perp exchanges
     fn fair_value_30s(&self) -> Option<f64> {
         // Use last trade's exchange time as reference to avoid clock skew
-        let now = self
-            .trades
-            .back()
-            .map(|t| t.time)
-            .unwrap_or_else(Utc::now);
+        let now = self.trades.back().map(|t| t.time).unwrap_or_else(Utc::now);
         let cutoff = now - ChronoDuration::seconds(30);
 
-        let mut sum_pv = 0.0;  // sum of price * volume
-        let mut sum_v = 0.0;   // sum of volume
+        let mut sum_pv = 0.0; // sum of price * volume
+        let mut sum_v = 0.0; // sum of volume
 
         for t in self.trades.iter().rev() {
             // Do not break early here: exchange timestamps can arrive slightly out of order,
@@ -2888,7 +2854,9 @@ impl TickerState {
     fn cvd_summary(&self) -> CvdSummary {
         let total = self.cvd_total(CVD_RETENTION_SECS);
 
-        let velocity = if let (Some(first), Some(last)) = (self.cvd_history.front(), self.cvd_history.back()) {
+        let velocity = if let (Some(first), Some(last)) =
+            (self.cvd_history.front(), self.cvd_history.back())
+        {
             if last.time > first.time {
                 (last.total_quote - first.total_quote)
                     / (last.time - first.time).num_seconds().max(1) as f64
@@ -2981,7 +2949,11 @@ impl TickerState {
             count += 1;
             vol_usd += t.usd;
         }
-        let avg = if count > 0 { vol_usd / count as f64 } else { 0.0 };
+        let avg = if count > 0 {
+            vol_usd / count as f64
+        } else {
+            0.0
+        };
         (count, vol_usd, avg)
     }
 
@@ -3055,7 +3027,8 @@ impl TickerState {
         let mut result = Vec::with_capacity(limit);
         for deque in self.whales_by_exchange.values() {
             result.extend(
-                deque.iter()
+                deque
+                    .iter()
                     .filter(|w| w.time >= cutoff)
                     .take(slots_per_exchange)
                     .cloned(),
@@ -3498,9 +3471,15 @@ impl TickerState {
         let signal = if strong_move && consistent {
             match (&basis_state, &trend) {
                 (BasisState::Contango, BasisTrend::Widening) => Some("Long risk".to_string()),
-                (BasisState::Backwardation, BasisTrend::Narrowing) => Some("Squeeze setup".to_string()),
-                (BasisState::Contango, BasisTrend::Narrowing) => Some("Longs unwinding".to_string()),
-                (BasisState::Backwardation, BasisTrend::Widening) => Some("Shorts pressing".to_string()),
+                (BasisState::Backwardation, BasisTrend::Narrowing) => {
+                    Some("Squeeze setup".to_string())
+                }
+                (BasisState::Contango, BasisTrend::Narrowing) => {
+                    Some("Longs unwinding".to_string())
+                }
+                (BasisState::Backwardation, BasisTrend::Widening) => {
+                    Some("Shorts pressing".to_string())
+                }
                 _ => None,
             }
         } else {
@@ -3528,9 +3507,24 @@ mod tests {
 
         // Three liquidations totaling $30,000
         let liqs = vec![
-            LiquidationData { side: Side::Buy, price: 100.0, quantity: 100.0, time: now },
-            LiquidationData { side: Side::Sell, price: 200.0, quantity: 50.0, time: now },
-            LiquidationData { side: Side::Buy, price: 50.0, quantity: 200.0, time: now },
+            LiquidationData {
+                side: Side::Buy,
+                price: 100.0,
+                quantity: 100.0,
+                time: now,
+            },
+            LiquidationData {
+                side: Side::Sell,
+                price: 200.0,
+                quantity: 50.0,
+                time: now,
+            },
+            LiquidationData {
+                side: Side::Buy,
+                price: 50.0,
+                quantity: 200.0,
+                time: now,
+            },
         ];
 
         for liq in liqs {

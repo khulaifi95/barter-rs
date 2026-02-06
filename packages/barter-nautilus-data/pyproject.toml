@@ -1,0 +1,19 @@
+ [project]
+ name = "barter-nautilus-data"
+ version = "0.1.0"
+ description = "Custom NautilusTrader data classes for Barter Parquet datasets"
+ readme = "README.md"
+ requires-python = ">=3.12,<3.15"
+ dependencies = [
+     "nautilus_trader>=1.222.0",
+ ]
+ 
+ [project.urls]
+ Repository = "https://example.invalid/barter-nautilus-data"
+ 
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["barter_nautilus_data"]

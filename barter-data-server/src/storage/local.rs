@@ -2,7 +2,7 @@
 
 use super::{StorageBackend, StorageError};
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tokio::fs;
 use tracing::debug;
 
@@ -23,20 +23,62 @@ impl LocalStorage {
 
     /// Get the full path for a relative path.
     #[allow(dead_code)]
-    fn full_path(&self, path: &str) -> PathBuf {
-        self.base_dir.join(path)
+    fn full_path(&self, path: &str) -> Result<PathBuf, StorageError> {
+        let rel = Path::new(path);
+        if rel.is_absolute() {
+            return Err(StorageError::InvalidPath(path.to_string()));
+        }
+        for component in rel.components() {
+            if matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            ) {
+                return Err(StorageError::InvalidPath(path.to_string()));
+            }
+        }
+        Ok(self.base_dir.join(rel))
+    }
+
+    fn base_dir_canonical(&self) -> Result<PathBuf, StorageError> {
+        if !self.base_dir.exists() {
+            std::fs::create_dir_all(&self.base_dir)?;
+        }
+        Ok(self.base_dir.canonicalize()?)
+    }
+
+    #[allow(dead_code)]
+    fn ensure_within_base(&self, path: &Path) -> Result<(), StorageError> {
+        let base = self.base_dir_canonical()?;
+        let candidate = path.canonicalize()?;
+        if !candidate.starts_with(&base) {
+            return Err(StorageError::InvalidPath(path.display().to_string()));
+        }
+        Ok(())
+    }
+
+    fn ensure_parent_within_base(&self, path: &Path) -> Result<(), StorageError> {
+        let base = self.base_dir_canonical()?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| StorageError::InvalidPath(path.display().to_string()))?;
+        let parent_canon = parent.canonicalize()?;
+        if !parent_canon.starts_with(&base) {
+            return Err(StorageError::InvalidPath(path.display().to_string()));
+        }
+        Ok(())
     }
 }
 
 #[async_trait]
 impl StorageBackend for LocalStorage {
     async fn write(&self, path: &str, data: &[u8]) -> Result<(), StorageError> {
-        let full_path = self.full_path(path);
+        let full_path = self.full_path(path)?;
 
         // Ensure parent directory exists
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).await?;
         }
+        self.ensure_parent_within_base(&full_path)?;
 
         fs::write(&full_path, data).await?;
         debug!("Wrote {} bytes to {:?}", data.len(), full_path);
@@ -44,23 +86,30 @@ impl StorageBackend for LocalStorage {
     }
 
     async fn exists(&self, path: &str) -> Result<bool, StorageError> {
-        let full_path = self.full_path(path);
-        Ok(full_path.exists())
+        let full_path = self.full_path(path)?;
+        if full_path.exists() {
+            self.ensure_within_base(&full_path)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     async fn read(&self, path: &str) -> Result<Vec<u8>, StorageError> {
-        let full_path = self.full_path(path);
+        let full_path = self.full_path(path)?;
         if !full_path.exists() {
             return Err(StorageError::NotFound(path.to_string()));
         }
+        self.ensure_within_base(&full_path)?;
         Ok(fs::read(&full_path).await?)
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
-        let full_path = self.full_path(prefix);
+        let full_path = self.full_path(prefix)?;
         if !full_path.exists() {
             return Ok(Vec::new());
         }
+        self.ensure_within_base(&full_path)?;
 
         let mut entries = Vec::new();
         let mut read_dir = fs::read_dir(&full_path).await?;
@@ -75,8 +124,9 @@ impl StorageBackend for LocalStorage {
     }
 
     async fn delete(&self, path: &str) -> Result<(), StorageError> {
-        let full_path = self.full_path(path);
+        let full_path = self.full_path(path)?;
         if full_path.exists() {
+            self.ensure_within_base(&full_path)?;
             fs::remove_file(&full_path).await?;
         }
         Ok(())

@@ -13,24 +13,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-use barter_trading_tuis::{
-    Aggregator, ConnectionStatus, OrchestratorResult, WebSocketClient, WebSocketConfig,
-    TradMarketState, TradeData,
-};
 use barter_trading_tuis::shared::types::TradTickData;
 use barter_trading_tuis::views::{ActiveView, ViewContext};
+use barter_trading_tuis::{
+    Aggregator, ConnectionStatus, OrchestratorResult, TradMarketState, TradeData, WebSocketClient,
+    WebSocketConfig,
+};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    Terminal,
-};
-use serde::Deserialize;
+use ratatui::{backend::CrosstermBackend, Terminal};
 use rustls::crypto::ring::default_provider;
-use tokio::sync::{Mutex, watch};
+use serde::Deserialize;
+use tokio::sync::{watch, Mutex};
 
 static TICKERS: OnceLock<Vec<String>> = OnceLock::new();
 
@@ -83,11 +80,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let connected = Arc::new(AtomicBool::new(false));
 
     // Watch channel for sharing MarketState from orchestrator to UI
-    let (state_tx, state_rx) = watch::channel::<HashMap<String, OrchestratorResult>>(HashMap::new());
+    let (state_tx, state_rx) =
+        watch::channel::<HashMap<String, OrchestratorResult>>(HashMap::new());
 
     let ws_url = get_ws_url();
-    let client =
-        WebSocketClient::with_config(WebSocketConfig::new(ws_url).with_channel_buffer_size(200_000));
+    let client = WebSocketClient::with_config(
+        WebSocketConfig::new(ws_url).with_channel_buffer_size(200_000),
+    );
     let (mut event_rx, mut status_rx) = client.start();
 
     let trad_state = Arc::new(Mutex::new(TradMarketState::new()));
@@ -101,7 +100,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut state_map: HashMap<String, OrchestratorResult> = HashMap::new();
             while let Some(event) = event_rx.recv().await {
                 if event.kind == "orchestrator_result" {
-                    if let Ok(msg) = serde_json::from_value::<OrchestratorMessage>(event.data.clone()) {
+                    if let Ok(msg) =
+                        serde_json::from_value::<OrchestratorMessage>(event.data.clone())
+                    {
                         state_map.insert(msg.ticker, msg.result);
                         let _ = state_tx.send(state_map.clone());
                     }
@@ -114,11 +115,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         let size = if tick.sz > 0.0 { tick.sz } else { 1.0 };
                         let mut trad_guard = trad_state.lock().await;
-                            match tick.symbol.as_str() {
-                                "ES" => trad_guard.update_es_tick(tick.px, size, tick.ts, tick.bid, tick.ask, tick.vwap),
-                                "NQ" => trad_guard.update_nq_tick(tick.px, size, tick.ts, tick.bid, tick.ask, tick.vwap),
-                                _ => {}
-                            }
+                        match tick.symbol.as_str() {
+                            "ES" => trad_guard.update_es_tick(
+                                tick.px, size, tick.ts, tick.bid, tick.ask, tick.vwap,
+                            ),
+                            "NQ" => trad_guard.update_nq_tick(
+                                tick.px, size, tick.ts, tick.bid, tick.ask, tick.vwap,
+                            ),
+                            _ => {}
+                        }
                     }
                     continue;
                 }
@@ -204,9 +209,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     KeyCode::Char('2') => active_view = ActiveView::Execution,
                     KeyCode::Char('3') => active_view = ActiveView::Debug,
                     KeyCode::Left => {
-                        if focused_index > 0 {
-                            focused_index -= 1;
-                        }
+                        focused_index = focused_index.saturating_sub(1);
                     }
                     KeyCode::Right => {
                         if focused_index + 1 < tickers().len() {

@@ -481,7 +481,8 @@ mod tests {
             0.0001, 0.0001, 0.00012, 0.00011, 0.0001, // Minutes 0-4: stable
             0.00015, 0.00018, 0.0002, 0.00025, 0.0003, // Minutes 5-9: rising
             0.00035, 0.0004, 0.00045, 0.0005, 0.00055, // Minutes 10-14: spiking
-            0.0006, 0.00058, 0.00056, 0.00054, 0.00052, // Minutes 15-19: extreme then stabilizing
+            0.0006, 0.00058, 0.00056, 0.00054,
+            0.00052, // Minutes 15-19: extreme then stabilizing
         ];
 
         for (i, rate) in rates.iter().enumerate() {
@@ -502,7 +503,7 @@ mod tests {
         let oldest = tracker.rate_15m_ago().unwrap();
         // Minute 4 = 0.0001, Minute 5 = 0.00015
         assert!(
-            oldest >= 0.0001 && oldest <= 0.00015,
+            (0.0001..=0.00015).contains(&oldest),
             "oldest rate was {}",
             oldest
         );

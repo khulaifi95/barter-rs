@@ -13,9 +13,9 @@ Usage:
     python scripts/validation/test_nautilus_load.py
 
 Prerequisites:
-    pip install pyarrow pandas
+    uv pip install pyarrow pandas
     # Optional for full Nautilus validation:
-    pip install nautilus_trader
+    uv pip install nautilus_trader
 """
 
 import sys
@@ -26,7 +26,7 @@ try:
     import pyarrow.parquet as pq
     import pyarrow as pa
 except ImportError:
-    print("ERROR: pyarrow not installed. Run: pip install pyarrow")
+    print("ERROR: pyarrow not installed. Run: uv pip install pyarrow")
     sys.exit(1)
 
 # Expected schemas
@@ -226,7 +226,7 @@ def try_nautilus_load():
         return True
     except ImportError:
         print("  nautilus_trader not installed (optional)")
-        print("  To enable: pip install nautilus_trader")
+        print("  To enable: uv pip install nautilus_trader")
         return True  # Not a failure
 
 

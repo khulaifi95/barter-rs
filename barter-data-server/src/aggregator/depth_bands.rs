@@ -56,7 +56,11 @@ pub fn compute_depth_bands(book: &OrderBook) -> Option<DepthBands> {
         }
 
         let denom = bid_usd + ask_usd;
-        let imb = if denom > 0.0 { (bid_usd - ask_usd) / denom } else { 0.0 };
+        let imb = if denom > 0.0 {
+            (bid_usd - ask_usd) / denom
+        } else {
+            0.0
+        };
         (bid_base, ask_base, bid_usd, ask_usd, imb)
     }
 

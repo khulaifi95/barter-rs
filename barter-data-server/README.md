@@ -130,10 +130,10 @@ DynamicStreams::init([
 ])
 ```
 
-To change the server address, modify the `server_addr` in `main()`:
+To change the server address, set `WS_ADDR`:
 
-```rust
-let server_addr = "127.0.0.1:9001".parse::<SocketAddr>().unwrap();
+```bash
+WS_ADDR=127.0.0.1:9001
 ```
 
 ## Environment Variables
@@ -150,6 +150,87 @@ RUST_LOG=debug cargo run -p barter-data-server
 # Trace level (very verbose)
 RUST_LOG=trace cargo run -p barter-data-server
 ```
+
+Common configuration knobs (defaults shown):
+
+```bash
+# WebSocket server
+WS_ADDR=127.0.0.1:9001
+WS_BIND_STRICT=0           # 1 = panic on bind failure
+WS_BIND_RETRY_MS=2000
+WS_BIND_MAX_RETRIES=0      # 0 = infinite retries
+WS_ENVELOPE=0
+WS_BINARY_FRAMES=1
+WS_SOURCE=barter-data-server
+WS_AUTH_TOKEN=             # optional shared secret (x-auth-token or Authorization: Bearer)
+WS_MAX_MESSAGE_BYTES=4194304
+WS_MAX_FRAME_BYTES=1048576
+WS_LOG_MAX_CHARS=256
+
+# Stream filtering / robustness
+STREAM_STRICT=0            # 1 = panic on stream init failure
+OKX_CTVAL_STRICT=0         # 1 = disable OKX streams if ctVal fetch/coverage fails at startup
+STREAM_ASSETS=BTC
+STREAM_VENUES=BINANCE
+STREAM_SPOT=0
+STREAM_PERP=1
+STREAM_TRADES=1
+STREAM_L1=1
+STREAM_L2=1
+STREAM_OI=1
+STREAM_LIQ=1
+STREAM_CVD=1
+STREAM_FUNDING=1
+
+# Parquet output
+PARQUET_ENABLED=0
+PARQUET_OUTPUT_DIR=/data/parquet
+PARQUET_FLUSH_INTERVAL_SECS=60
+PARQUET_BUFFER=50000
+PARQUET_WRITE_TRADES=1
+PARQUET_WRITE_BARS=1
+PARQUET_WRITE_EXTENDED=1
+PARQUET_WRITE_L2=0
+PARQUET_L2_MAX_DEPTH=50
+PARQUET_L2_SAMPLE_MS=0    # 0 = no sampling (write every L2 update)
+PARQUET_ASSETS=BTC
+PARQUET_VENUES=BINANCE
+PARQUET_INSTRUMENTS=
+NAUTILUS_PRECISION=high    # high|standard
+
+# Parquet durability / backpressure
+PARQUET_TRADE_SEND_MODE=block      # block|drop
+PARQUET_TRADE_SEND_TIMEOUT_MS=0    # 0 = wait forever
+PARQUET_EVENT_RETRY_MAX=3
+PARQUET_FSYNC=0                    # 1 = fsync each file write
+
+# Bar timestamp mode
+BAR_TS_EVENT_MODE=close     # close|open
+
+# Throttling / buffers
+L1_THROTTLE_MS=50
+AGG_EVENT_BUFFER=300000
+```
+
+Notes:
+- Defaults for `STREAM_ASSETS`, `STREAM_VENUES`, `PARQUET_ASSETS`, and `PARQUET_VENUES` only apply when the env vars are unset.
+- Set an env var to an empty string (e.g. `STREAM_ASSETS=`) to disable that filter.
+- Parquet files are written on the flush interval (`PARQUET_FLUSH_INTERVAL_SECS`) or when buffers fill, not per trade.
+- Bar directories are keyed by bar type (e.g. `bars_1m/BTCUSDT_PERP_BINANCE_1_MINUTE_LAST_EXTERNAL/`).
+
+## L2 Parquet Tradeoffs (OrderBookDeltas)
+
+- **Accuracy vs storage**: L2 volume scales with update rate × depth × instruments.
+  - Higher depth or no sampling = more rows and larger files.
+- **Sampling controls**:
+  - `PARQUET_L2_MAX_DEPTH` caps per-update levels written.
+  - `PARQUET_L2_SAMPLE_MS` skips updates faster than this interval.
+- **Latency measurement**:
+  - Use `ts_init - ts_event` from the deltas to measure end-to-end latency.
+  - Sampling adds up to the sample interval of extra delay for Parquet visibility.
+- **Recommended defaults**:
+  - Keep `PARQUET_WRITE_L2=0` for normal capture.
+  - Enable L2 only for specific windows or order‑flow backtests.
 
 ## Architecture
 

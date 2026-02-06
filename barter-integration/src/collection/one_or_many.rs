@@ -130,7 +130,7 @@ impl<T> From<T> for OneOrMany<T> {
 impl<T> From<Vec<T>> for OneOrMany<T> {
     fn from(mut items: Vec<T>) -> Self {
         match items.len() {
-            0 => panic!("Cannot create OneOrMany from empty Vec"),
+            0 => OneOrMany::Many(items),
             1 => OneOrMany::One(items.remove(0)),
             _ => OneOrMany::Many(items),
         }

@@ -1,12 +1,12 @@
 //! OKX OrderBook types and transformers.
 
+use super::ctval;
 use crate::{
     Identifier,
     books::{Level, OrderBook},
     event::{MarketEvent, MarketIter},
     subscription::book::OrderBookEvent,
 };
-use super::ctval;
 use barter_instrument::exchange::ExchangeId;
 use barter_integration::subscription::SubscriptionId;
 use chrono::{DateTime, TimeZone, Utc};
@@ -35,14 +35,13 @@ impl<'de> Deserialize<'de> for OkxOrderBookMessage {
         let value = Value::deserialize(deserializer)?;
 
         // Check if this is an orderbook message (has "arg" with "channel": "books")
-        if let Some(arg) = value.get("arg") {
-            if let Some(channel) = arg.get("channel") {
-                if channel.as_str() == Some("books") {
-                    return serde_json::from_value(value)
-                        .map(OkxOrderBookMessage::Payload)
-                        .map_err(serde::de::Error::custom);
-                }
-            }
+        if let Some(arg) = value.get("arg")
+            && let Some(channel) = arg.get("channel")
+            && channel.as_str() == Some("books")
+        {
+            return serde_json::from_value(value)
+                .map(OkxOrderBookMessage::Payload)
+                .map_err(serde::de::Error::custom);
         }
 
         Ok(OkxOrderBookMessage::Ignore)
@@ -82,10 +81,7 @@ pub struct OkxOrderBookPayload {
 
 impl Identifier<Option<SubscriptionId>> for OkxOrderBookPayload {
     fn id(&self) -> Option<SubscriptionId> {
-        Some(SubscriptionId::from(format!(
-            "books|{}",
-            self.arg.inst_id
-        )))
+        Some(SubscriptionId::from(format!("books|{}", self.arg.inst_id)))
     }
 }
 
@@ -145,7 +141,9 @@ impl<'de> Deserialize<'de> for OkxLevel {
     {
         let arr: Vec<String> = Deserialize::deserialize(deserializer)?;
         if arr.len() < 4 {
-            return Err(serde::de::Error::custom("expected 4 elements in level array"));
+            return Err(serde::de::Error::custom(
+                "expected 4 elements in level array",
+            ));
         }
 
         Ok(OkxLevel {
@@ -220,7 +218,6 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, OkxOrderBookMessage)>
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

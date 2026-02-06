@@ -1,0 +1,6 @@
+# Built artifacts (cross-compiled binary, container images)
+barter-data-server
+*.tar.gz
+
+# Active env file (use .env.production as template)
+.env

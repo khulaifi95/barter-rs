@@ -1,0 +1,35 @@
+# deploy/compose.prod.yaml
+# Production override — bind mounts to /data/*, CPU pinning
+#
+# Usage:
+#   podman-compose -f compose.yaml -f compose.prod.yaml up -d
+
+services:
+  barter-server:
+    cpuset_cpus: "0-1"
+
+  nautilus:
+    cpuset_cpus: "2-3"
+
+  jupyter:
+    cpuset_cpus: "2-3"
+
+volumes:
+  parquet-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/parquet
+  ipc-socket:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/ipc
+  catalog:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/catalog

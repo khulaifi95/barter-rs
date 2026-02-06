@@ -226,59 +226,39 @@ pub struct FuelInput {
     pub liq_rate_usd_per_min: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum FuelQuality {
     High,
+    #[default]
     Medium,
     Low,
     Fail,
 }
 
-impl Default for FuelQuality {
-    fn default() -> Self {
-        FuelQuality::Medium
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RvolStatus {
     Strong,
+    #[default]
     Normal,
     Thin,
     Fail,
 }
 
-impl Default for RvolStatus {
-    fn default() -> Self {
-        RvolStatus::Normal
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum OiTrend {
     NewMoney,
     Squeeze,
+    #[default]
     Flat,
 }
 
-impl Default for OiTrend {
-    fn default() -> Self {
-        OiTrend::Flat
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LiqState {
+    #[default]
     Low,
     Moderate,
     High,
     Exhaustion,
-}
-
-impl Default for LiqState {
-    fn default() -> Self {
-        LiqState::Low
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -760,7 +740,8 @@ impl MarketState {
         // L3: TRIGGER (Execution Gate)
         // CVD consensus + funding velocity check
         // ====================================================================
-        let l3_trigger = Self::evaluate_l3_trigger(flow_score, &funding_score, thresholds, &mut warnings);
+        let l3_trigger =
+            Self::evaluate_l3_trigger(flow_score, &funding_score, thresholds, &mut warnings);
         let fuel_score = Self::evaluate_fuel(&bias, fuel_input, thresholds, &mut warnings);
         let l3_result = Self::combine_l3(l3_trigger, Self::fuel_state(&fuel_score));
 
@@ -768,11 +749,30 @@ impl MarketState {
         // COMBINE RESULTS
         // ====================================================================
         let state = Self::combine_results(l1_result, l3_result);
-        let confidence = Self::calculate_confidence(&state, vol_score, flow_score, &funding_score, &fuel_score, thresholds);
-        let reason = Self::build_reason(&state, &bias, vol_score, flow_score, &funding_score, &fuel_score, thresholds);
+        let confidence = Self::calculate_confidence(
+            &state,
+            vol_score,
+            flow_score,
+            &funding_score,
+            &fuel_score,
+            thresholds,
+        );
+        let reason = Self::build_reason(
+            &state,
+            &bias,
+            vol_score,
+            flow_score,
+            &funding_score,
+            &fuel_score,
+            thresholds,
+        );
 
         // Per spec: bias is only present when state != WAIT
-        let final_bias = if state == State::Wait { None } else { Some(bias) };
+        let final_bias = if state == State::Wait {
+            None
+        } else {
+            Some(bias)
+        };
 
         Self {
             state,
@@ -1143,7 +1143,10 @@ impl MarketState {
         };
 
         // Cap at 100
-        std::cmp::min(100, base + vol_factor + cvd_factor + funding_factor + fuel_factor)
+        std::cmp::min(
+            100,
+            base + vol_factor + cvd_factor + funding_factor + fuel_factor,
+        )
     }
 
     /// Build human-readable reason string for L1 failure.
@@ -1584,7 +1587,10 @@ mod tests {
 
         // With consensus fail + funding spike, only no_absorption passes = 1/3 = WAIT
         assert_eq!(state.state, State::Wait);
-        assert!(state.bias.is_none(), "bias must be None when state is WAIT due to L3 fail");
+        assert!(
+            state.bias.is_none(),
+            "bias must be None when state is WAIT due to L3 fail"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@
 use crate::shared::gamma::GammaCalculator;
 use crate::shared::market_state::{
     DeribitClient, DeribitError, GammaEngine, GammaPosition, GammaScore, GammaStatus,
-    OptionsChain, OptionContract, TradingBias, Wall,
+    OptionContract, OptionsChain, TradingBias, Wall,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -40,9 +40,9 @@ impl ExpiryBucket {
     /// Get the hour range for this bucket (min_hours, max_hours)
     pub fn hour_range(&self) -> (f64, f64) {
         match self {
-            ExpiryBucket::Short => (0.0, 168.0),      // 0-7 days
-            ExpiryBucket::Medium => (168.0, 720.0),   // 7-30 days
-            ExpiryBucket::Long => (720.0, f64::MAX),  // 30+ days
+            ExpiryBucket::Short => (0.0, 168.0),     // 0-7 days
+            ExpiryBucket::Medium => (168.0, 720.0),  // 7-30 days
+            ExpiryBucket::Long => (720.0, f64::MAX), // 30+ days
         }
     }
 
@@ -57,7 +57,11 @@ impl ExpiryBucket {
 
     /// All buckets in order
     pub fn all() -> [ExpiryBucket; 3] {
-        [ExpiryBucket::Short, ExpiryBucket::Medium, ExpiryBucket::Long]
+        [
+            ExpiryBucket::Short,
+            ExpiryBucket::Medium,
+            ExpiryBucket::Long,
+        ]
     }
 }
 
@@ -191,9 +195,18 @@ impl Default for OptionsContext {
             hours_to_expiry: f64::MAX,
             last_update: 0,
             buckets: [
-                BucketMetrics { bucket: ExpiryBucket::Short, ..Default::default() },
-                BucketMetrics { bucket: ExpiryBucket::Medium, ..Default::default() },
-                BucketMetrics { bucket: ExpiryBucket::Long, ..Default::default() },
+                BucketMetrics {
+                    bucket: ExpiryBucket::Short,
+                    ..Default::default()
+                },
+                BucketMetrics {
+                    bucket: ExpiryBucket::Medium,
+                    ..Default::default()
+                },
+                BucketMetrics {
+                    bucket: ExpiryBucket::Long,
+                    ..Default::default()
+                },
             ],
             front_bucket: ExpiryBucket::Short,
         }
@@ -439,9 +452,7 @@ impl OptionsContextBuilder {
         // Negative for puts (dealers short gamma when selling puts)
 
         // Debug: count contracts with non-zero gamma
-        let contracts_with_gamma = chain.contracts.iter()
-            .filter(|c| c.gamma > 0.0)
-            .count();
+        let contracts_with_gamma = chain.contracts.iter().filter(|c| c.gamma > 0.0).count();
 
         let gexp: f64 = chain
             .contracts
@@ -573,10 +584,7 @@ impl OptionsContextBuilder {
             .sum();
 
         // Calculate VEX for this bucket
-        let vex: f64 = filtered
-            .iter()
-            .map(|c| c.vega * c.open_interest)
-            .sum();
+        let vex: f64 = filtered.iter().map(|c| c.vega * c.open_interest).sum();
 
         // Calculate put/call ratio for this bucket
         let mut put_oi = 0.0;
@@ -588,11 +596,7 @@ impl OptionsContextBuilder {
                 put_oi += c.open_interest;
             }
         }
-        let put_call_ratio = if call_oi > 0.0 {
-            put_oi / call_oi
-        } else {
-            0.0
-        };
+        let put_call_ratio = if call_oi > 0.0 { put_oi / call_oi } else { 0.0 };
 
         // Calculate hours to nearest expiry in this bucket
         let hours_to_expiry = filtered
@@ -619,12 +623,15 @@ impl OptionsContextBuilder {
 }
 
 /// Default GammaScore when in NO-GAMMA mode (flow-based bias)
-pub fn no_gamma_score(spot: f64, flow_direction: crate::shared::market_state::Direction) -> GammaScore {
+pub fn no_gamma_score(
+    spot: f64,
+    flow_direction: crate::shared::market_state::Direction,
+) -> GammaScore {
     use crate::shared::market_state::Direction;
 
     // In NO-GAMMA mode, derive bias from flow direction
     let bias = match flow_direction {
-        Direction::Long => TradingBias::Momentum,  // Follow the flow up
+        Direction::Long => TradingBias::Momentum, // Follow the flow up
         Direction::Short => TradingBias::Momentum, // Follow the flow down
         Direction::Neutral => TradingBias::MeanReversion, // Default to mean reversion
     };
@@ -696,8 +703,10 @@ mod tests {
 
     #[test]
     fn test_options_context_freshness() {
-        let mut ctx = OptionsContext::default();
-        ctx.last_update = Utc::now().timestamp_millis();
+        let ctx = OptionsContext {
+            last_update: Utc::now().timestamp_millis(),
+            ..Default::default()
+        };
 
         assert!(ctx.is_fresh(Duration::from_secs(60)));
         assert!(ctx.age_ms() < 1000);
@@ -705,17 +714,21 @@ mod tests {
 
     #[test]
     fn test_options_context_stale() {
-        let mut ctx = OptionsContext::default();
-        ctx.last_update = Utc::now().timestamp_millis() - 600_000; // 10 minutes ago
+        let ctx = OptionsContext {
+            last_update: Utc::now().timestamp_millis() - 600_000, // 10 minutes ago
+            ..Default::default()
+        };
 
         assert!(!ctx.is_fresh(Duration::from_secs(300))); // 5 min max
     }
 
     #[test]
     fn test_gamma_status_live() {
-        let mut ctx = OptionsContext::default();
-        ctx.last_update = Utc::now().timestamp_millis();
-        ctx.gamma_flip_price = 92000.0;
+        let ctx = OptionsContext {
+            last_update: Utc::now().timestamp_millis(),
+            gamma_flip_price: 92000.0,
+            ..Default::default()
+        };
 
         let status = ctx.to_gamma_status(Duration::from_secs(600));
         assert!(matches!(status, GammaStatus::Live { flip_price } if flip_price == 92000.0));
@@ -723,12 +736,16 @@ mod tests {
 
     #[test]
     fn test_gamma_status_stale() {
-        let mut ctx = OptionsContext::default();
-        ctx.last_update = Utc::now().timestamp_millis() - 700_000; // 11+ minutes ago
-        ctx.gamma_flip_price = 92000.0;
+        let ctx = OptionsContext {
+            last_update: Utc::now().timestamp_millis() - 700_000, // 11+ minutes ago
+            gamma_flip_price: 92000.0,
+            ..Default::default()
+        };
 
         let status = ctx.to_gamma_status(Duration::from_secs(600)); // 10 min max
-        assert!(matches!(status, GammaStatus::Stale { last_flip_price } if last_flip_price == 92000.0));
+        assert!(
+            matches!(status, GammaStatus::Stale { last_flip_price } if last_flip_price == 92000.0)
+        );
     }
 
     #[test]
@@ -740,9 +757,11 @@ mod tests {
 
     #[test]
     fn test_to_gamma_score_above_flip() {
-        let mut ctx = OptionsContext::default();
-        ctx.gamma_flip_price = 90000.0;
-        ctx.last_update = Utc::now().timestamp_millis();
+        let ctx = OptionsContext {
+            gamma_flip_price: 90000.0,
+            last_update: Utc::now().timestamp_millis(),
+            ..Default::default()
+        };
 
         let score = ctx.to_gamma_score(92000.0, 0.5);
         assert_eq!(score.position, GammaPosition::AboveFlip);
@@ -752,9 +771,11 @@ mod tests {
 
     #[test]
     fn test_to_gamma_score_below_flip() {
-        let mut ctx = OptionsContext::default();
-        ctx.gamma_flip_price = 95000.0;
-        ctx.last_update = Utc::now().timestamp_millis();
+        let ctx = OptionsContext {
+            gamma_flip_price: 95000.0,
+            last_update: Utc::now().timestamp_millis(),
+            ..Default::default()
+        };
 
         let score = ctx.to_gamma_score(92000.0, 0.5);
         assert_eq!(score.position, GammaPosition::BelowFlip);
@@ -764,9 +785,11 @@ mod tests {
 
     #[test]
     fn test_to_gamma_score_at_flip() {
-        let mut ctx = OptionsContext::default();
-        ctx.gamma_flip_price = 92000.0;
-        ctx.last_update = Utc::now().timestamp_millis();
+        let ctx = OptionsContext {
+            gamma_flip_price: 92000.0,
+            last_update: Utc::now().timestamp_millis(),
+            ..Default::default()
+        };
 
         let score = ctx.to_gamma_score(92100.0, 0.5); // Within 0.5%
         assert_eq!(score.position, GammaPosition::AtFlip);

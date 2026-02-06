@@ -5,7 +5,9 @@
 //! - Gradient gamma bar with neutral indicator
 //! - Flow + L2 Depth integration
 
-use crate::shared::market_state::{Direction, GammaPosition, State, TradingBias, VolRegime, Warning};
+use crate::shared::market_state::{
+    Direction, GammaPosition, State, TradingBias, VolRegime, Warning,
+};
 use crate::views::{format_compact, render_header, resolve_display_price, ActiveView, ViewContext};
 use ratatui::{
     layout::{Constraint, Direction as LayoutDir, Layout, Rect},
@@ -19,13 +21,13 @@ pub fn render(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
     let chunks = Layout::default()
         .direction(LayoutDir::Vertical)
         .constraints([
-            Constraint::Length(4),   // Header
-            Constraint::Length(5),   // State banner
-            Constraint::Length(9),   // L1/L2/L3 cards
-            Constraint::Length(12),  // Flow + Liquidity (room for L2 + walls)
-            Constraint::Length(13),  // GAMMA CONTEXT (with spacing)
-            Constraint::Min(0),      // Spare
-            Constraint::Length(2),   // Footer
+            Constraint::Length(4),  // Header
+            Constraint::Length(5),  // State banner
+            Constraint::Length(9),  // L1/L2/L3 cards
+            Constraint::Length(12), // Flow + Liquidity (room for L2 + walls)
+            Constraint::Length(13), // GAMMA CONTEXT (with spacing)
+            Constraint::Min(0),     // Spare
+            Constraint::Length(2),  // Footer
         ])
         .split(area);
 
@@ -48,10 +50,13 @@ fn render_state_banner(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
             State::Wait => ("W A I T", Color::White, Color::Red),
         };
 
-        let bias_str = state.bias.map(|b| match b {
-            TradingBias::MeanReversion => "MEAN REV",
-            TradingBias::Momentum => "MOMENTUM",
-        }).unwrap_or("--");
+        let bias_str = state
+            .bias
+            .map(|b| match b {
+                TradingBias::MeanReversion => "MEAN REV",
+                TradingBias::Momentum => "MOMENTUM",
+            })
+            .unwrap_or("--");
 
         let direction_str = match state.components.flow_consensus.consensus_direction {
             Direction::Long => "LONG",
@@ -63,13 +68,21 @@ fn render_state_banner(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
             Span::raw("                              "),
             Span::styled(
                 format!(" {} ", state_str),
-                Style::default().fg(state_color).bg(bg_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(state_color)
+                    .bg(bg_color)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]);
 
         let line2 = Line::from(vec![
             Span::raw("  Bias: "),
-            Span::styled(bias_str, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                bias_str,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  |  Flow: "),
             Span::styled(
                 direction_str,
@@ -80,7 +93,10 @@ fn render_state_banner(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
                 }),
             ),
             Span::raw("  |  Confidence: "),
-            Span::styled(format!("{}%", state.confidence), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{}%", state.confidence),
+                Style::default().fg(Color::White),
+            ),
         ]);
 
         let reason = state.reason.trim();
@@ -108,7 +124,10 @@ fn render_state_banner(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray));
-        f.render_widget(Paragraph::new("  Waiting for state engine...").block(block), area);
+        f.render_widget(
+            Paragraph::new("  Waiting for state engine...").block(block),
+            area,
+        );
     }
 }
 
@@ -172,10 +191,16 @@ fn render_filter_cards(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
             ]),
             Line::from(vec![
                 Span::raw("  σ: "),
-                Span::styled(format!("{:.1}", vol.zscore_1m), Style::default().fg(zscore_color)),
+                Span::styled(
+                    format!("{:.1}", vol.zscore_1m),
+                    Style::default().fg(zscore_color),
+                ),
                 Span::raw("  "),
                 if vol.is_shock {
-                    Span::styled("SHOCK!", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                    Span::styled(
+                        "SHOCK!",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )
                 } else {
                     Span::styled("OK", Style::default().fg(Color::Green))
                 },
@@ -193,7 +218,11 @@ fn render_filter_cards(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
 
         // L2: GAMMA
         let flip_dist = gamma.distance_pct.abs();
-        let l2_color = if flip_dist > 8.0 { Color::Yellow } else { Color::Cyan };
+        let l2_color = if flip_dist > 8.0 {
+            Color::Yellow
+        } else {
+            Color::Cyan
+        };
         let position_str = match gamma.position {
             GammaPosition::AboveFlip => "ABOVE FLIP",
             GammaPosition::BelowFlip => "BELOW FLIP",
@@ -217,7 +246,12 @@ fn render_filter_cards(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
             Line::from(format!("  {:+.1}% from flip", gamma.distance_pct)),
             Line::from(vec![
                 Span::raw("  Bias: "),
-                Span::styled(bias_str, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    bias_str,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(if flip_dist > 8.0 {
                 Span::styled("  Status: LOW VALUE", Style::default().fg(Color::Yellow))
@@ -265,26 +299,52 @@ fn render_filter_cards(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
             Line::from(vec![
                 Span::styled(
                     if flow.passed { "✓" } else { "✗" },
-                    Style::default().fg(if flow.passed { Color::Green } else { Color::Red }),
+                    Style::default().fg(if flow.passed {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
                 ),
-                Span::raw(format!(" CVD: {}/{} {}", flow.venues_agreeing, flow.venues_total, direction_str)),
+                Span::raw(format!(
+                    " CVD: {}/{} {}",
+                    flow.venues_agreeing, flow.venues_total, direction_str
+                )),
             ]),
             Line::from(vec![
                 Span::styled(
                     if funding.passed { "✓" } else { "✗" },
-                    Style::default().fg(if funding.passed { Color::Green } else { Color::Red }),
+                    Style::default().fg(if funding.passed {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
                 ),
                 Span::raw(format!(" Fund: {}", funding_str)),
                 Span::raw("  "),
-                Span::styled(vel_icon, Style::default().fg(vel_color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    vel_icon,
+                    Style::default().fg(vel_color).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(format!(" {:+.2}%/15m", vel_pct)),
             ]),
             Line::from(vec![
                 Span::styled(
-                    if !flow.absorption_detected { "✓" } else { "✗" },
-                    Style::default().fg(if !flow.absorption_detected { Color::Green } else { Color::Red }),
+                    if !flow.absorption_detected {
+                        "✓"
+                    } else {
+                        "✗"
+                    },
+                    Style::default().fg(if !flow.absorption_detected {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
                 ),
-                Span::raw(if flow.absorption_detected { " Absorb: YES" } else { " Absorb: NO" }),
+                Span::raw(if flow.absorption_detected {
+                    " Absorb: YES"
+                } else {
+                    " Absorb: NO"
+                }),
             ]),
             Line::from(Span::styled(
                 format!("  Status: {}", if l3_passed { "PASS" } else { "CAUTION" }),
@@ -358,7 +418,10 @@ fn render_filter_cards(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
                 Line::from(vec![
                     Span::styled(oi_icon, Style::default().fg(oi_color)),
                     Span::raw(" OI Δ: $"),
-                    Span::styled(format_compact(fuel.oi_delta_usd_5m), Style::default().fg(oi_color)),
+                    Span::styled(
+                        format_compact(fuel.oi_delta_usd_5m),
+                        Style::default().fg(oi_color),
+                    ),
                     Span::raw(" "),
                     Span::styled(oi_label, Style::default().fg(oi_color)),
                 ]),
@@ -367,12 +430,17 @@ fn render_filter_cards(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
                     Span::raw(" LIQ: "),
                     Span::styled(liq_label, Style::default().fg(liq_color)),
                     Span::raw(" "),
-                    Span::styled(format_compact(fuel.liq_rate_usd_per_min), Style::default().fg(liq_color)),
+                    Span::styled(
+                        format_compact(fuel.liq_rate_usd_per_min),
+                        Style::default().fg(liq_color),
+                    ),
                     Span::raw("/m"),
                 ]),
                 Line::from(Span::styled(
                     format!("  Quality: {}", quality_label),
-                    Style::default().fg(quality_color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(quality_color)
+                        .add_modifier(Modifier::BOLD),
                 )),
             ]
         };
@@ -410,10 +478,22 @@ fn render_flow_and_depth(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
 
     // Left: Flow table
     let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{:^8}", "VENUE"), Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:^12}", "CVD 5m"), Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:^10}", "FLOW 30s"), Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:^8}", "VERDICT"), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:^8}", "VENUE"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:^12}", "CVD 5m"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:^10}", "FLOW 30s"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:^8}", "VERDICT"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
     ])];
 
     if let Some(snap) = snapshot {
@@ -445,11 +525,23 @@ fn render_flow_and_depth(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
         };
 
         // Binance (key: BNC)
-        lines.push(format_venue_row_clean("Binance", cvd_lookup("binance"), flow_pct_lookup("binance")));
+        lines.push(format_venue_row_clean(
+            "Binance",
+            cvd_lookup("binance"),
+            flow_pct_lookup("binance"),
+        ));
         // Bybit (key: BBT)
-        lines.push(format_venue_row_clean("Bybit", cvd_lookup("bybit"), flow_pct_lookup("bybit")));
+        lines.push(format_venue_row_clean(
+            "Bybit",
+            cvd_lookup("bybit"),
+            flow_pct_lookup("bybit"),
+        ));
         // OKX (key: OKX)
-        lines.push(format_venue_row_clean("OKX", cvd_lookup("okx"), flow_pct_lookup("okx")));
+        lines.push(format_venue_row_clean(
+            "OKX",
+            cvd_lookup("okx"),
+            flow_pct_lookup("okx"),
+        ));
 
         lines.push(Line::from("")); // Separator
 
@@ -458,14 +550,33 @@ fn render_flow_and_depth(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
             let flow = &result.state.components.flow_consensus;
 
             lines.push(Line::from(vec![
-                Span::styled(format!("{:^8}", "TOTAL"), Style::default().add_modifier(Modifier::BOLD)),
                 Span::styled(
-                    format!("{:^12}", format_compact(flow.cvd_net)),
-                    Style::default().fg(if flow.cvd_net >= 0.0 { Color::Green } else { Color::Red }).add_modifier(Modifier::BOLD),
+                    format!("{:^8}", "TOTAL"),
+                    Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("{:^10}", format!("{}/{} {:?}", flow.venues_agreeing, flow.venues_total, flow.consensus_direction)),
-                    Style::default().fg(if flow.passed { Color::Green } else { Color::Yellow }),
+                    format!("{:^12}", format_compact(flow.cvd_net)),
+                    Style::default()
+                        .fg(if flow.cvd_net >= 0.0 {
+                            Color::Green
+                        } else {
+                            Color::Red
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "{:^10}",
+                        format!(
+                            "{}/{} {:?}",
+                            flow.venues_agreeing, flow.venues_total, flow.consensus_direction
+                        )
+                    ),
+                    Style::default().fg(if flow.passed {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    }),
                 ),
                 Span::raw(format!("{:^8}", "")),
             ]));
@@ -478,12 +589,18 @@ fn render_flow_and_depth(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
         let mut right_lines = Vec::new();
         right_lines.push(Line::from(Span::styled(
             "L2 IMBALANCE",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )));
 
         let smoothed = snap.aggregated_book_imbalance_smoothed;
         let ask_pct = (100.0 - smoothed).max(0.0);
-        let ratio = if ask_pct > 0.0 { smoothed / ask_pct } else { 0.0 };
+        let ratio = if ask_pct > 0.0 {
+            smoothed / ask_pct
+        } else {
+            0.0
+        };
         let ratio_color = if smoothed > 55.0 {
             Color::Green
         } else if smoothed < 45.0 {
@@ -495,7 +612,9 @@ fn render_flow_and_depth(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
             Span::styled("BID/ASK ", Style::default().fg(Color::Gray)),
             Span::styled(
                 format!("{:>4.2} ", ratio),
-                Style::default().fg(ratio_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(ratio_color)
+                    .add_modifier(Modifier::BOLD),
             ),
             render_depth_bar_clean(smoothed),
             Span::raw(" "),
@@ -529,13 +648,26 @@ fn format_venue_row_clean(name: &str, cvd: f64, flow_pct: Option<f64>) -> Line<'
     let cvd_color = if cvd >= 0.0 { Color::Green } else { Color::Red };
     let verdict = if cvd >= 0.0 { "BUY" } else { "SELL" };
     let verdict_color = if cvd >= 0.0 { Color::Green } else { Color::Red };
-    let flow_str = flow_pct.map(|p| format!("{:.0}%", p)).unwrap_or_else(|| "--".to_string());
+    let flow_str = flow_pct
+        .map(|p| format!("{:.0}%", p))
+        .unwrap_or_else(|| "--".to_string());
 
     Line::from(vec![
         Span::styled(format!("{:^8}", name), Style::default().fg(Color::White)),
-        Span::styled(format!("{:^12}", format_compact(cvd)), Style::default().fg(cvd_color)),
-        Span::styled(format!("{:^10}", flow_str), Style::default().fg(Color::Gray)),
-        Span::styled(format!("{:^8}", verdict), Style::default().fg(verdict_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:^12}", format_compact(cvd)),
+            Style::default().fg(cvd_color),
+        ),
+        Span::styled(
+            format!("{:^10}", flow_str),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled(
+            format!("{:^8}", verdict),
+            Style::default()
+                .fg(verdict_color)
+                .add_modifier(Modifier::BOLD),
+        ),
     ])
 }
 
@@ -545,7 +677,12 @@ fn render_depth_bar_clean(imbalance: f64) -> Span<'static> {
     let filled = ((bid_pct / 100.0) * 8.0).round() as usize;
     let empty = 8 - filled;
 
-    let bar = format!("{}{} {:>3.0}%", "█".repeat(filled), "░".repeat(empty), bid_pct);
+    let bar = format!(
+        "{}{} {:>3.0}%",
+        "█".repeat(filled),
+        "░".repeat(empty),
+        bid_pct
+    );
     let color = if bid_pct > 55.0 {
         Color::Green
     } else if bid_pct < 45.0 {
@@ -572,7 +709,10 @@ fn render_wall_lines(
                     format!("{label}{suffix}: "),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("${:.0}", wall.price), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("${:.0}", wall.price),
+                    Style::default().fg(Color::White),
+                ),
                 Span::raw("  "),
                 Span::styled(
                     format!("{:+.2}%", wall.distance_pct),
@@ -590,7 +730,9 @@ fn render_wall_lines(
                 Span::raw(" "),
                 Span::styled(
                     wall.tier.label(),
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]));
         } else {
@@ -623,18 +765,27 @@ fn render_gamma_context(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
         let spot = gamma.current_price;
 
         // Get front bucket data
-        let (front_flip, front_label, put_wall, call_wall) = if let Some(opt) = &result.state.components.options_context {
-            let front = opt.buckets.iter().find(|b| b.is_front);
-            let flip = front.map(|b| b.gamma_flip).unwrap_or(gamma.gamma_flip_price);
-            let label = front.map(|b| b.label.clone()).unwrap_or_else(|| "all".to_string());
-            let pw = opt.put_wall.as_ref().map(|w| w.strike).unwrap_or(0.0);
-            let cw = opt.call_wall.as_ref().map(|w| w.strike).unwrap_or(0.0);
-            (flip, label, pw, cw)
-        } else {
-            (gamma.gamma_flip_price, "all".to_string(), 0.0, 0.0)
-        };
+        let (front_flip, front_label, put_wall, call_wall) =
+            if let Some(opt) = &result.state.components.options_context {
+                let front = opt.buckets.iter().find(|b| b.is_front);
+                let flip = front
+                    .map(|b| b.gamma_flip)
+                    .unwrap_or(gamma.gamma_flip_price);
+                let label = front
+                    .map(|b| b.label.clone())
+                    .unwrap_or_else(|| "all".to_string());
+                let pw = opt.put_wall.as_ref().map(|w| w.strike).unwrap_or(0.0);
+                let cw = opt.call_wall.as_ref().map(|w| w.strike).unwrap_or(0.0);
+                (flip, label, pw, cw)
+            } else {
+                (gamma.gamma_flip_price, "all".to_string(), 0.0, 0.0)
+            };
 
-        let flip = if front_flip > 0.0 { front_flip } else { gamma.gamma_flip_price };
+        let flip = if front_flip > 0.0 {
+            front_flip
+        } else {
+            gamma.gamma_flip_price
+        };
 
         let (regime_str, regime_color) = match gamma.position {
             GammaPosition::AboveFlip => ("+γ MEAN REV", Color::Green),
@@ -645,12 +796,30 @@ fn render_gamma_context(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
         // Line 1: Header with spot/flip/regime
         lines.push(Line::from(vec![
             Span::raw(" SPOT "),
-            Span::styled(format!("${:.0}", spot), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("${:.0}", spot),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("    FLIP "),
-            Span::styled(format!("${:.0}", flip), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" ({})", front_label), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("${:.0}", flip),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({})", front_label),
+                Style::default().fg(Color::Gray),
+            ),
             Span::raw("    "),
-            Span::styled(regime_str, Style::default().fg(regime_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                regime_str,
+                Style::default()
+                    .fg(regime_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]));
 
         // Line 2: Empty for spacing
@@ -664,23 +833,50 @@ fn render_gamma_context(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
 
         // Line 5: Bucket table header
         lines.push(Line::from(vec![
-            Span::styled(format!("{:^8}", "BUCKET"), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:^8}", "BUCKET"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
-            Span::styled(format!("{:^9}", "FLIP"), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:^9}", "FLIP"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
-            Span::styled(format!("{:^7}", "DIST"), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:^7}", "DIST"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
-            Span::styled(format!("{:^7}", "MAX"), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:^7}", "MAX"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
-            Span::styled(format!("{:^8}", "GEX"), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:^8}", "GEX"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
-            Span::styled(format!("{:^8}", "DEX"), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:^8}", "DEX"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
-            Span::styled(format!("{:^7}", "WALL"), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:^7}", "WALL"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
-            Span::styled(format!("{:^5}", "P/C"), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:^5}", "P/C"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
-            Span::styled(format!("{:^5}", "EXP"), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:^5}", "EXP"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
         ]));
 
         // Bucket rows
@@ -716,17 +912,31 @@ fn render_gamma_context(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
                 };
                 let dist_str = format!("{:+.1}%", dist_pct);
                 let dist_color = if dist_pct.abs() > 8.0 {
-                    Color::Yellow  // FAR - low tactical value
+                    Color::Yellow // FAR - low tactical value
                 } else if dist_pct > 0.0 {
-                    Color::Green   // Above flip (mean rev zone)
+                    Color::Green // Above flip (mean rev zone)
                 } else {
-                    Color::Red     // Below flip (momentum zone)
+                    Color::Red // Below flip (momentum zone)
                 };
 
-                let gex_color = if bucket.gex >= 0.0 { Color::Green } else { Color::Red };
-                let dex_color = if bucket.dex >= 0.0 { Color::Green } else { Color::Red };
+                let gex_color = if bucket.gex >= 0.0 {
+                    Color::Green
+                } else {
+                    Color::Red
+                };
+                let dex_color = if bucket.dex >= 0.0 {
+                    Color::Green
+                } else {
+                    Color::Red
+                };
                 let ratio_pct = bucket.put_call_ratio * 100.0;
-                let ratio_color = if ratio_pct >= 110.0 { Color::Red } else if ratio_pct <= 90.0 { Color::Green } else { Color::Gray };
+                let ratio_color = if ratio_pct >= 110.0 {
+                    Color::Red
+                } else if ratio_pct <= 90.0 {
+                    Color::Green
+                } else {
+                    Color::Gray
+                };
 
                 let (wall_str, wall_color) = if let Some(wall) = bucket.call_wall.as_ref() {
                     (format!("${:.0}", wall.strike), Color::Red)
@@ -755,21 +965,39 @@ fn render_gamma_context(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
                 lines.push(Line::from(vec![
                     Span::styled(format!("{:^8}", label), row_style),
                     Span::raw("  "),
-                    Span::styled(format!("{:^9}", flip_str), Style::default().fg(Color::Magenta)),
+                    Span::styled(
+                        format!("{:^9}", flip_str),
+                        Style::default().fg(Color::Magenta),
+                    ),
                     Span::raw("  "),
                     Span::styled(format!("{:^7}", dist_str), Style::default().fg(dist_color)),
                     Span::raw("  "),
-                    Span::styled(format!("{:^7}", max_pain_str), Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{:^7}", max_pain_str),
+                        Style::default().fg(Color::Yellow),
+                    ),
                     Span::raw("  "),
-                    Span::styled(format!("{:^8}", format_compact(bucket.gex)), Style::default().fg(gex_color)),
+                    Span::styled(
+                        format!("{:^8}", format_compact(bucket.gex)),
+                        Style::default().fg(gex_color),
+                    ),
                     Span::raw("  "),
-                    Span::styled(format!("{:^8}", format_compact(bucket.dex)), Style::default().fg(dex_color)),
+                    Span::styled(
+                        format!("{:^8}", format_compact(bucket.dex)),
+                        Style::default().fg(dex_color),
+                    ),
                     Span::raw("  "),
                     Span::styled(format!("{:^7}", wall_str), Style::default().fg(wall_color)),
                     Span::raw("  "),
-                    Span::styled(format!("{:^5}", format!("{:.0}%", ratio_pct)), Style::default().fg(ratio_color)),
+                    Span::styled(
+                        format!("{:^5}", format!("{:.0}%", ratio_pct)),
+                        Style::default().fg(ratio_color),
+                    ),
                     Span::raw("  "),
-                    Span::styled(format!("{:^5}", expiry_str), Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{:^5}", expiry_str),
+                        Style::default().fg(Color::Gray),
+                    ),
                 ]));
             }
 
@@ -779,12 +1007,20 @@ fn render_gamma_context(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
                 Span::styled("GEX ", Style::default().fg(Color::Gray)),
                 Span::styled(
                     format_compact(opt.gexp),
-                    Style::default().fg(if opt.gexp >= 0.0 { Color::Green } else { Color::Red }),
+                    Style::default().fg(if opt.gexp >= 0.0 {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
                 ),
                 Span::raw("  DEX "),
                 Span::styled(
                     format_compact(opt.dexp),
-                    Style::default().fg(if opt.dexp >= 0.0 { Color::Green } else { Color::Red }),
+                    Style::default().fg(if opt.dexp >= 0.0 {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
                 ),
                 Span::raw("  VEX "),
                 Span::styled(format_compact(opt.vexp), Style::default().fg(Color::Cyan)),
@@ -795,7 +1031,10 @@ fn render_gamma_context(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
                 ),
             ]));
         } else {
-            lines.push(Line::from(Span::styled("  No Deribit data", Style::default().fg(Color::Gray))));
+            lines.push(Line::from(Span::styled(
+                "  No Deribit data",
+                Style::default().fg(Color::Gray),
+            )));
         }
     } else {
         lines.push(Line::from("  Waiting for data..."));
@@ -813,28 +1052,48 @@ fn render_gamma_gradient_bar(spot: f64, flip: f64, put_wall: f64, call_wall: f64
     let bar_width = 50;
 
     // Determine price range
-    let min_price = if put_wall > 0.0 { put_wall.min(flip * 0.85) } else { flip * 0.85 };
-    let max_price = if call_wall > 0.0 { call_wall.max(flip * 1.15) } else { flip * 1.15 };
+    let min_price = if put_wall > 0.0 {
+        put_wall.min(flip * 0.85)
+    } else {
+        flip * 0.85
+    };
+    let max_price = if call_wall > 0.0 {
+        call_wall.max(flip * 1.15)
+    } else {
+        flip * 1.15
+    };
     let range = max_price - min_price;
 
     if range <= 0.0 || spot <= 0.0 || flip <= 0.0 {
-        return Line::from(Span::styled("  [No price data]", Style::default().fg(Color::Gray)));
+        return Line::from(Span::styled(
+            "  [No price data]",
+            Style::default().fg(Color::Gray),
+        ));
     }
 
     // Calculate positions (0 to bar_width)
     let flip_pos = ((flip - min_price) / range * bar_width as f64).round() as i32;
-    let spot_pos = ((spot - min_price) / range * bar_width as f64).round().clamp(0.0, bar_width as f64) as i32;
+    let spot_pos = ((spot - min_price) / range * bar_width as f64)
+        .round()
+        .clamp(0.0, bar_width as f64) as i32;
 
     // Build bar with gradient: red on left of flip, green on right
     let mut spans: Vec<Span> = Vec::new();
 
     // Left label
-    let put_str = if put_wall > 0.0 { format!("${:.0}K", put_wall / 1000.0) } else { format!("${:.0}K", min_price / 1000.0) };
-    spans.push(Span::styled(format!(" {:>6} ", put_str), Style::default().fg(Color::Red)));
+    let put_str = if put_wall > 0.0 {
+        format!("${:.0}K", put_wall / 1000.0)
+    } else {
+        format!("${:.0}K", min_price / 1000.0)
+    };
+    spans.push(Span::styled(
+        format!(" {:>6} ", put_str),
+        Style::default().fg(Color::Red),
+    ));
 
     // Build the bar character by character
     let mut bar_str = String::new();
-    for i in 0..bar_width as i32 {
+    for i in 0..bar_width {
         if i == spot_pos {
             bar_str.push('●');
         } else if i == flip_pos {
@@ -845,7 +1104,7 @@ fn render_gamma_gradient_bar(spot: f64, flip: f64, put_wall: f64, call_wall: f64
     }
 
     // Split bar at flip position for coloring
-    let flip_idx = flip_pos.clamp(0, bar_width as i32) as usize;
+    let flip_idx = flip_pos.clamp(0, bar_width) as usize;
     let left_part: String = bar_str.chars().take(flip_idx).collect();
     let right_part: String = bar_str.chars().skip(flip_idx).collect();
 
@@ -857,19 +1116,29 @@ fn render_gamma_gradient_bar(spot: f64, flip: f64, put_wall: f64, call_wall: f64
     }
 
     // Right label
-    let call_str = if call_wall > 0.0 { format!("${:.0}K", call_wall / 1000.0) } else { format!("${:.0}K", max_price / 1000.0) };
-    spans.push(Span::styled(format!(" {:<6}", call_str), Style::default().fg(Color::Green)));
+    let call_str = if call_wall > 0.0 {
+        format!("${:.0}K", call_wall / 1000.0)
+    } else {
+        format!("${:.0}K", max_price / 1000.0)
+    };
+    spans.push(Span::styled(
+        format!(" {:<6}", call_str),
+        Style::default().fg(Color::Green),
+    ));
 
     Line::from(spans)
 }
 
 /// Warnings strip
 fn render_warnings_strip(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
-    let mut warn_spans: Vec<Span> = vec![Span::styled(" WARNINGS: ", Style::default().add_modifier(Modifier::BOLD))];
+    let mut warn_spans: Vec<Span> = vec![Span::styled(
+        " WARNINGS: ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
 
     if let Some(result) = ctx.state {
-        let has_warnings = !result.state.components.warnings.is_empty()
-            || !result.freshness_warnings.is_empty();
+        let has_warnings =
+            !result.state.components.warnings.is_empty() || !result.freshness_warnings.is_empty();
 
         if !has_warnings {
             warn_spans.push(Span::styled("None", Style::default().fg(Color::Green)));
@@ -901,13 +1170,18 @@ fn render_warnings_strip(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
     }
 
     let trad_line = build_trad_line(ctx);
-    f.render_widget(Paragraph::new(vec![Line::from(warn_spans), trad_line]), area);
+    f.render_widget(
+        Paragraph::new(vec![Line::from(warn_spans), trad_line]),
+        area,
+    );
 }
 
 fn build_trad_line(ctx: &ViewContext<'_>) -> Line<'static> {
     let mut spans: Vec<Span> = vec![Span::styled(
         " TRAD: ",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )];
 
     let no_trad = ctx.state.map(|s| s.no_trad_mode).unwrap_or(true);
@@ -938,7 +1212,11 @@ fn build_trad_line(ctx: &ViewContext<'_>) -> Line<'static> {
         spans.push(Span::raw(" | "));
         spans.push(Span::styled(
             format!("ΔBTC-ES {:+.2}%", btc_es_pct),
-            Style::default().fg(if btc_es_pct >= 0.0 { Color::Green } else { Color::Red }),
+            Style::default().fg(if btc_es_pct >= 0.0 {
+                Color::Green
+            } else {
+                Color::Red
+            }),
         ));
 
         let lead_corr_ok = s.lead_lag_corr.map(|c| c.abs() >= 0.50).unwrap_or(false);
@@ -987,21 +1265,41 @@ fn render_footer(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
         Line::from(vec![
             Span::styled(
                 format!(" {} {} ", ticker, price_str),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("| #"),
-            Span::styled(format!("{}", result.state.audit_id), Style::default().fg(Color::Cyan)),
-            Span::raw(" | "),
-            Span::styled(format!("{:?}", result.state.state), Style::default().fg(state_color)),
+            Span::styled(
+                format!("{}", result.state.audit_id),
+                Style::default().fg(Color::Cyan),
+            ),
             Span::raw(" | "),
             Span::styled(
-                if result.no_gamma_mode { "NO-OPTS" } else { "OPTS-OK" },
-                Style::default().fg(if result.no_gamma_mode { Color::Yellow } else { Color::Green }),
+                format!("{:?}", result.state.state),
+                Style::default().fg(state_color),
+            ),
+            Span::raw(" | "),
+            Span::styled(
+                if result.no_gamma_mode {
+                    "NO-OPTS"
+                } else {
+                    "OPTS-OK"
+                },
+                Style::default().fg(if result.no_gamma_mode {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                }),
             ),
             Span::raw(" | "),
             Span::styled(
                 if result.no_trad_mode { "NO-T" } else { "T-OK" },
-                Style::default().fg(if result.no_trad_mode { Color::Yellow } else { Color::Green }),
+                Style::default().fg(if result.no_trad_mode {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                }),
             ),
         ])
     } else {
@@ -1016,7 +1314,11 @@ fn warning_label(warn: &Warning) -> String {
         Warning::ApproachingGammaFlip { distance_pct } => format!("Flip {:+.1}%", distance_pct),
         Warning::FundingElevated { rate } => format!("Fund {:.3}%", rate * 100.0),
         Warning::LiquidationClusterNearby { price, size_usd } => {
-            format!("Liq ${:.0}K ({})", price / 1000.0, format_compact(*size_usd))
+            format!(
+                "Liq ${:.0}K ({})",
+                price / 1000.0,
+                format_compact(*size_usd)
+            )
         }
         Warning::SingleVenueDisagreeing { venue } => format!("{} ✗", venue),
         Warning::LowLiquiditySession => "Low Liq".to_string(),

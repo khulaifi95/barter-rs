@@ -102,10 +102,7 @@ where
                         };
                         let signed_quote = signed_base * trade.price;
 
-                        let totals = self
-                            .totals
-                            .entry(instrument.clone())
-                            .or_insert_with(CvdTotals::default);
+                        let totals = self.totals.entry(instrument.clone()).or_default();
                         totals.delta_base += signed_base;
                         totals.delta_quote += signed_quote;
 

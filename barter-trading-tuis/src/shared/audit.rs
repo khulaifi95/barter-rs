@@ -120,7 +120,7 @@ impl AuditLogger {
                 .unwrap_or_else(|| Utc::now().date_naive());
 
             // Check if we need to rotate: date changed OR size exceeded
-            let date_changed = current_date.map_or(true, |d| d != entry_date);
+            let date_changed = current_date != Some(entry_date);
             let size_exceeded = current_file_size >= rotation_bytes;
             let needs_rotation = date_changed || size_exceeded;
 
@@ -252,10 +252,7 @@ impl AuditLogger {
         };
         let path = log_dir.join(filename);
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         // Get current file size for rotation tracking
         let metadata = file.metadata()?;
@@ -411,7 +408,10 @@ mod tests {
             .filter_map(|e| e.ok())
             .collect();
 
-        assert!(!entries.is_empty(), "Should have created at least one log file");
+        assert!(
+            !entries.is_empty(),
+            "Should have created at least one log file"
+        );
 
         // Verify file contains JSONL
         let file_path = entries[0].path();

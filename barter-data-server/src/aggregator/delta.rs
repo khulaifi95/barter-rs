@@ -25,6 +25,7 @@ impl DeltaTracker {
     }
 
     /// Add a trade to the tracker.
+    #[inline(always)]
     pub fn add_trade(&mut self, side: Option<Side>, volume: f64) {
         match side {
             Some(Side::Buy) => {

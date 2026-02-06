@@ -139,6 +139,7 @@ impl DepthBands {
 
 impl ExtendedBar {
     /// Create an extended bar from a minute bar and additional metrics.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_minute_bar(
         bar: MinuteBar,
         open_interest: f64,
@@ -363,8 +364,7 @@ impl ExtendedBarBuilder {
             liq_total_usd,
             liq_count,
             depth_bands,
-        )
-        ;
+        );
 
         // Advance bar-to-bar OI snapshot
         if let Some(curr) = self.latest_oi {
@@ -405,9 +405,9 @@ mod tests {
             close: 100_050.0,
             volume: 100.0,
             quote_volume: 10_000_000.0,
-            ts_open_ns: 1706540400_000_000_000,
-            ts_close_ns: 1706540460_000_000_000,
-            ts_init_ns: 1706540460_000_100_000,
+            ts_open_ns: 1_706_540_400_000_000_000,
+            ts_close_ns: 1_706_540_460_000_000_000,
+            ts_init_ns: 1_706_540_460_000_100_000,
             trade_count: 50,
             delta,
             price_precision: 2,

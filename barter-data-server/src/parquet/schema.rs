@@ -5,8 +5,8 @@
 //! - Column types must be exact
 //! - Metadata keys must match
 
-use arrow::datatypes::{DataType, Field, Schema};
 use crate::parquet::encoder::PrecisionMode;
+use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -43,8 +43,14 @@ impl BarMetadata {
         let mut meta = HashMap::new();
         meta.insert("bar_type".to_string(), self.bar_type.clone());
         meta.insert("instrument_id".to_string(), self.instrument_id.clone());
-        meta.insert("price_precision".to_string(), self.price_precision.to_string());
-        meta.insert("size_precision".to_string(), self.size_precision.to_string());
+        meta.insert(
+            "price_precision".to_string(),
+            self.price_precision.to_string(),
+        );
+        meta.insert(
+            "size_precision".to_string(),
+            self.size_precision.to_string(),
+        );
         meta
     }
 }
@@ -76,10 +82,96 @@ impl TradeMetadata {
     pub fn to_schema_metadata(&self) -> HashMap<String, String> {
         let mut meta = HashMap::new();
         meta.insert("instrument_id".to_string(), self.instrument_id.clone());
-        meta.insert("price_precision".to_string(), self.price_precision.to_string());
-        meta.insert("size_precision".to_string(), self.size_precision.to_string());
+        meta.insert(
+            "price_precision".to_string(),
+            self.price_precision.to_string(),
+        );
+        meta.insert(
+            "size_precision".to_string(),
+            self.size_precision.to_string(),
+        );
         meta
     }
+}
+
+/// Metadata for order book delta parquet files (required by Nautilus).
+#[derive(Debug, Clone)]
+pub struct OrderBookDeltaMetadata {
+    /// Instrument ID in Nautilus format: `{symbol}.{venue}`
+    /// Example: `BTCUSDT-PERP.BINANCE`
+    pub instrument_id: String,
+    /// Price precision (decimal places)
+    pub price_precision: u8,
+    /// Size precision (decimal places)
+    pub size_precision: u8,
+}
+
+impl OrderBookDeltaMetadata {
+    /// Create metadata for a Binance perpetual instrument.
+    #[allow(dead_code)]
+    pub fn binance_perp(symbol: &str, price_precision: u8, size_precision: u8) -> Self {
+        Self {
+            instrument_id: format!("{}-PERP.BINANCE", symbol),
+            price_precision,
+            size_precision,
+        }
+    }
+
+    /// Convert to Arrow schema metadata map.
+    pub fn to_schema_metadata(&self) -> HashMap<String, String> {
+        let mut meta = HashMap::new();
+        meta.insert("instrument_id".to_string(), self.instrument_id.clone());
+        meta.insert(
+            "price_precision".to_string(),
+            self.price_precision.to_string(),
+        );
+        meta.insert(
+            "size_precision".to_string(),
+            self.size_precision.to_string(),
+        );
+        meta
+    }
+}
+
+/// Create the Nautilus-compatible Arrow schema for order book deltas.
+///
+/// **CRITICAL: Column order and types must match exactly!**
+///
+/// Precision mode determines FixedSizeBinary width:
+/// - Standard: FixedSizeBinary(8) (i64 × 1e9)
+/// - High: FixedSizeBinary(16) (i128 × 1e16)
+///
+/// | Column | Type | Description |
+/// |--------|------|-------------|
+/// | action | UInt8 | 1=ADD,2=UPDATE,3=DELETE,4=CLEAR |
+/// | side | UInt8 | 0=NO_SIDE,1=BUY,2=SELL |
+/// | price | FixedSizeBinary(PRECISION_BYTES) | fixed-point |
+/// | size | FixedSizeBinary(PRECISION_BYTES) | fixed-point |
+/// | order_id | UInt64 | 0 for L2 aggregated |
+/// | flags | UInt8 | Record flags (snapshot/mbp/etc) |
+/// | sequence | UInt64 | Exchange sequence |
+/// | ts_event | UInt64 | Exchange timestamp (nanos) |
+/// | ts_init | UInt64 | Ingest time (nanos) |
+pub fn order_book_delta_schema(
+    metadata: &OrderBookDeltaMetadata,
+    precision_mode: PrecisionMode,
+) -> Arc<Schema> {
+    let bytes = precision_mode.bytes_len();
+    let fields = vec![
+        Field::new("action", DataType::UInt8, false),
+        Field::new("side", DataType::UInt8, false),
+        Field::new("price", DataType::FixedSizeBinary(bytes), false),
+        Field::new("size", DataType::FixedSizeBinary(bytes), false),
+        Field::new("order_id", DataType::UInt64, false),
+        Field::new("flags", DataType::UInt8, false),
+        Field::new("sequence", DataType::UInt64, false),
+        Field::new("ts_event", DataType::UInt64, false),
+        Field::new("ts_init", DataType::UInt64, false),
+    ];
+    Arc::new(Schema::new_with_metadata(
+        fields,
+        metadata.to_schema_metadata(),
+    ))
 }
 
 /// Create the Nautilus-compatible Arrow schema for bars.
@@ -110,7 +202,10 @@ pub fn bar_schema(metadata: &BarMetadata, precision_mode: PrecisionMode) -> Arc<
         Field::new("ts_event", DataType::UInt64, false),
         Field::new("ts_init", DataType::UInt64, false),
     ];
-    Arc::new(Schema::new_with_metadata(fields, metadata.to_schema_metadata()))
+    Arc::new(Schema::new_with_metadata(
+        fields,
+        metadata.to_schema_metadata(),
+    ))
 }
 
 /// Create the Nautilus-compatible Arrow schema for trades.
@@ -139,7 +234,10 @@ pub fn trade_schema(metadata: &TradeMetadata, precision_mode: PrecisionMode) -> 
         Field::new("ts_event", DataType::UInt64, false),
         Field::new("ts_init", DataType::UInt64, false),
     ];
-    Arc::new(Schema::new_with_metadata(fields, metadata.to_schema_metadata()))
+    Arc::new(Schema::new_with_metadata(
+        fields,
+        metadata.to_schema_metadata(),
+    ))
 }
 
 /// Aggressor side values matching Nautilus enum.
@@ -178,7 +276,12 @@ mod tests {
         let meta = BarMetadata::binance_perp("BTCUSDT", 2, 3);
         let schema = bar_schema(&meta, PrecisionMode::High);
         let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, vec!["open", "high", "low", "close", "volume", "ts_event", "ts_init"]);
+        assert_eq!(
+            names,
+            vec![
+                "open", "high", "low", "close", "volume", "ts_event", "ts_init"
+            ]
+        );
     }
 
     #[test]
@@ -189,8 +292,14 @@ mod tests {
             schema.metadata().get("bar_type"),
             Some(&"BTCUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL".to_string())
         );
-        assert_eq!(schema.metadata().get("price_precision"), Some(&"2".to_string()));
-        assert_eq!(schema.metadata().get("size_precision"), Some(&"3".to_string()));
+        assert_eq!(
+            schema.metadata().get("price_precision"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            schema.metadata().get("size_precision"),
+            Some(&"3".to_string())
+        );
     }
 
     #[test]
@@ -205,7 +314,17 @@ mod tests {
         let meta = TradeMetadata::binance_perp("BTCUSDT", 2, 3);
         let schema = trade_schema(&meta, PrecisionMode::High);
         let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, vec!["price", "size", "aggressor_side", "trade_id", "ts_event", "ts_init"]);
+        assert_eq!(
+            names,
+            vec![
+                "price",
+                "size",
+                "aggressor_side",
+                "trade_id",
+                "ts_event",
+                "ts_init"
+            ]
+        );
     }
 
     #[test]
@@ -215,6 +334,45 @@ mod tests {
         assert_eq!(
             schema.metadata().get("instrument_id"),
             Some(&"BTCUSDT-PERP.BINANCE".to_string())
+        );
+    }
+
+    #[test]
+    fn test_order_book_delta_schema_column_count() {
+        let meta = OrderBookDeltaMetadata::binance_perp("BTCUSDT", 2, 3);
+        let schema = order_book_delta_schema(&meta, PrecisionMode::High);
+        assert_eq!(schema.fields().len(), 9);
+    }
+
+    #[test]
+    fn test_order_book_delta_schema_column_order() {
+        let meta = OrderBookDeltaMetadata::binance_perp("BTCUSDT", 2, 3);
+        let schema = order_book_delta_schema(&meta, PrecisionMode::High);
+        let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "action", "side", "price", "size", "order_id", "flags", "sequence", "ts_event",
+                "ts_init"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_order_book_delta_schema_metadata() {
+        let meta = OrderBookDeltaMetadata::binance_perp("BTCUSDT", 2, 3);
+        let schema = order_book_delta_schema(&meta, PrecisionMode::High);
+        assert_eq!(
+            schema.metadata().get("instrument_id"),
+            Some(&"BTCUSDT-PERP.BINANCE".to_string())
+        );
+        assert_eq!(
+            schema.metadata().get("price_precision"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            schema.metadata().get("size_precision"),
+            Some(&"3".to_string())
         );
     }
 
@@ -257,8 +415,14 @@ impl ExtendedBarMetadata {
     pub fn to_schema_metadata(&self) -> HashMap<String, String> {
         let mut meta = HashMap::new();
         meta.insert("instrument_id".to_string(), self.instrument_id.clone());
-        meta.insert("price_precision".to_string(), self.price_precision.to_string());
-        meta.insert("size_precision".to_string(), self.size_precision.to_string());
+        meta.insert(
+            "price_precision".to_string(),
+            self.price_precision.to_string(),
+        );
+        meta.insert(
+            "size_precision".to_string(),
+            self.size_precision.to_string(),
+        );
         meta.insert("schema_version".to_string(), "2".to_string());
         meta
     }
@@ -270,9 +434,9 @@ impl ExtendedBarMetadata {
 pub fn extended_bar_schema(metadata: &ExtendedBarMetadata) -> Arc<Schema> {
     let fields = vec![
         // Timestamps (UInt64 nanos - same as Nautilus for joins)
-        Field::new("ts_event", DataType::UInt64, false),  // Bar CLOSE time
-        Field::new("ts_init", DataType::UInt64, false),   // Ingest time
-        Field::new("ts_open", DataType::UInt64, false),   // Bar OPEN time (for TradingView)
+        Field::new("ts_event", DataType::UInt64, false), // Bar CLOSE time
+        Field::new("ts_init", DataType::UInt64, false),  // Ingest time
+        Field::new("ts_open", DataType::UInt64, false),  // Bar OPEN time (for TradingView)
         // Identity
         Field::new("instrument_id", DataType::Utf8, false),
         // OHLCV (fixed-point i64, Barter-only)
@@ -320,5 +484,8 @@ pub fn extended_bar_schema(metadata: &ExtendedBarMetadata) -> Arc<Schema> {
         Field::new("ask_depth_100bps_usd", DataType::Int64, false),
         Field::new("depth_imb_100bps", DataType::Float64, false),
     ];
-    Arc::new(Schema::new_with_metadata(fields, metadata.to_schema_metadata()))
+    Arc::new(Schema::new_with_metadata(
+        fields,
+        metadata.to_schema_metadata(),
+    ))
 }

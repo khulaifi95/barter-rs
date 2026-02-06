@@ -8,8 +8,8 @@ use crate::{
     subscription::trade::PublicTrade,
 };
 use barter_instrument::{Side, exchange::ExchangeId};
-use barter_integration::subscription::SubscriptionId;
 use barter_integration::de::datetime_utc_from_epoch_duration;
+use barter_integration::subscription::SubscriptionId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -47,9 +47,8 @@ impl<'de> Deserialize<'de> for BybitTradeMessage {
                     None => return Ok(BybitTradeMessage::Ignore),
                 };
 
-                let trades =
-                    serde_json::from_value::<Vec<BybitTradeInner>>(data_value)
-                        .map_err(serde::de::Error::custom)?;
+                let trades = serde_json::from_value::<Vec<BybitTradeInner>>(data_value)
+                    .map_err(serde::de::Error::custom)?;
                 if trades.is_empty() {
                     return Ok(BybitTradeMessage::Ignore);
                 }
@@ -125,28 +124,26 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, BybitTradeMessage)>
     ) -> Self {
         match message {
             BybitTradeMessage::Ignore => Self(vec![]),
-            BybitTradeMessage::Payload(trades) => {
-                Self(
-                    trades
-                        .data
-                        .into_iter()
-                        .map(|trade| {
-                            Ok(MarketEvent {
-                                time_exchange: trade.time,
-                                time_received: Utc::now(),
-                                exchange,
-                                instrument: instrument.clone(),
-                                kind: PublicTrade {
-                                    id: trade.id,
-                                    price: trade.price,
-                                    amount: trade.amount,
-                                    side: trade.side,
-                                },
-                            })
+            BybitTradeMessage::Payload(trades) => Self(
+                trades
+                    .data
+                    .into_iter()
+                    .map(|trade| {
+                        Ok(MarketEvent {
+                            time_exchange: trade.time,
+                            time_received: Utc::now(),
+                            exchange,
+                            instrument: instrument.clone(),
+                            kind: PublicTrade {
+                                id: trade.id,
+                                price: trade.price,
+                                amount: trade.amount,
+                                side: trade.side,
+                            },
                         })
-                        .collect(),
-                )
-            }
+                    })
+                    .collect(),
+            ),
         }
     }
 }

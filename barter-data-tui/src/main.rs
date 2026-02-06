@@ -17,6 +17,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
+    fmt::{Display, Formatter},
     io,
     sync::Arc,
     time::Duration,
@@ -49,11 +50,11 @@ pub enum Side {
     Sell,
 }
 
-impl Side {
-    fn to_string(&self) -> String {
+impl Display for Side {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Side::Buy => "Buy".to_string(),
-            Side::Sell => "Sell".to_string(),
+            Side::Buy => write!(f, "Buy"),
+            Side::Sell => write!(f, "Sell"),
         }
     }
 }
@@ -423,13 +424,13 @@ async fn websocket_client(state: Arc<Mutex<AppState>>) -> Result<(), Box<dyn std
                     match msg {
                         Ok(Message::Text(text)) => {
                             // First check if it's a welcome message
-                            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&text) {
-                                if json_val.get("type").and_then(|v| v.as_str()) == Some("welcome") {
-                                    // It's a welcome message, skip it
-                                    eprintln!("Received welcome message");
-                                    continue;
-                                }
-                            }
+                        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&text)
+                            && json_val.get("type").and_then(|v| v.as_str()) == Some("welcome")
+                        {
+                            // It's a welcome message, skip it
+                            eprintln!("Received welcome message");
+                            continue;
+                        }
 
                             // Try to parse as market event
                             match serde_json::from_str::<MarketEventMessage>(&text) {
@@ -601,12 +602,11 @@ async fn run_app<B: ratatui::backend::Backend>(
         terminal.draw(|f| ui(f, &state_snapshot))?;
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-        if crossterm::event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
-                    return Ok(());
-                }
-            }
+        if crossterm::event::poll(timeout)?
+            && let Event::Key(key) = event::read()?
+            && (key.code == KeyCode::Char('q') || key.code == KeyCode::Esc)
+        {
+            return Ok(());
         }
 
         if last_tick.elapsed() >= tick_rate {

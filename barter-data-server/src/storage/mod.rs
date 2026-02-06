@@ -21,6 +21,9 @@ pub enum StorageError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[error("Invalid path: {0}")]
+    InvalidPath(String),
+
     #[error("Not found: {0}")]
     NotFound(String),
 }
@@ -70,8 +73,8 @@ impl StorageConfig {
         let s3_bucket = std::env::var("S3_BUCKET").ok();
         let s3_region = std::env::var("S3_REGION").ok();
 
-        let local_dir = std::env::var("PARQUET_OUTPUT_DIR")
-            .unwrap_or_else(|_| "/data/parquet".to_string());
+        let local_dir =
+            std::env::var("PARQUET_OUTPUT_DIR").unwrap_or_else(|_| "/data/parquet".to_string());
 
         Self {
             s3_enabled,

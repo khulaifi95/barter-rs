@@ -6,8 +6,8 @@ pub mod execution;
 pub mod global_radar;
 
 use crate::shared::orchestrator::OrchestratorResult;
-use crate::shared::trad_markets::CorrelationSignals;
 use crate::shared::state::{AggregatedSnapshot, TickerSnapshot};
+use crate::shared::trad_markets::CorrelationSignals;
 use chrono::Utc;
 use ratatui::{
     layout::Rect,
@@ -69,17 +69,28 @@ pub(crate) fn render_header(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>, vi
     let line1 = Line::from(vec![
         Span::styled(
             format!("{ticker} {} ", format_price(price)),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("| "),
         Span::styled(tabs, Style::default().fg(Color::Gray)),
         Span::raw(" "),
-        Span::styled(focused, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            focused,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" | "),
         Span::styled(
             connected,
             Style::default()
-                .fg(if ctx.connected { Color::Green } else { Color::Red })
+                .fg(if ctx.connected {
+                    Color::Green
+                } else {
+                    Color::Red
+                })
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
@@ -97,12 +108,26 @@ fn build_data_health_line(
 ) -> Line<'static> {
     let mut spans = vec![Span::styled(
         "DATA ",
-        Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
     )];
 
     if let Some(snapshot) = snapshot {
-        push_exchange_status(&mut spans, "BNC", exchange_age(snapshot, "binance"), 5.0, 15.0);
-        push_exchange_status(&mut spans, "BBT", exchange_age(snapshot, "bybit"), 5.0, 15.0);
+        push_exchange_status(
+            &mut spans,
+            "BNC",
+            exchange_age(snapshot, "binance"),
+            5.0,
+            15.0,
+        );
+        push_exchange_status(
+            &mut spans,
+            "BBT",
+            exchange_age(snapshot, "bybit"),
+            5.0,
+            15.0,
+        );
         push_exchange_status(&mut spans, "OKX", exchange_age(snapshot, "okx"), 5.0, 15.0);
     } else {
         push_exchange_status(&mut spans, "BNC", None, 5.0, 15.0);
@@ -110,13 +135,7 @@ fn build_data_health_line(
         push_exchange_status(&mut spans, "OKX", None, 5.0, 15.0);
     }
 
-    push_exchange_status(
-        &mut spans,
-        "DERB",
-        options_age_secs(state),
-        90.0,
-        180.0,
-    );
+    push_exchange_status(&mut spans, "DERB", options_age_secs(state), 90.0, 180.0);
 
     Line::from(spans)
 }

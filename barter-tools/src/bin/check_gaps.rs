@@ -95,9 +95,10 @@ fn print_result(result: &GapCheckResult, verbose: bool, max_gaps: usize) {
     if !result.gaps.is_empty() && verbose {
         println!("\n--- Gaps ---");
         for (i, gap) in result.gaps.iter().take(max_gaps).enumerate() {
-            let start_dt = chrono::DateTime::from_timestamp((gap.start_ns / 1_000_000_000) as i64, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_else(|| (gap.start_ns / 1_000_000_000).to_string());
+            let start_dt =
+                chrono::DateTime::from_timestamp((gap.start_ns / 1_000_000_000) as i64, 0)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| (gap.start_ns / 1_000_000_000).to_string());
             let end_dt = chrono::DateTime::from_timestamp((gap.end_ns / 1_000_000_000) as i64, 0)
                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_else(|| (gap.end_ns / 1_000_000_000).to_string());

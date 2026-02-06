@@ -450,7 +450,7 @@ mod tests {
         // Result depends on OI distribution and gamma values
         assert!(flip > 0.0, "Flip should be positive");
         assert!(
-            flip >= 90000.0 && flip <= 100000.0,
+            (90000.0..=100000.0).contains(&flip),
             "Flip {} should be within strike range",
             flip
         );

@@ -25,7 +25,7 @@ def main():
         import pyarrow.parquet as pq
         import pandas as pd
     except ImportError:
-        print("ERROR: pyarrow not installed. Run: pip install pyarrow pandas")
+        print("ERROR: pyarrow not installed. Run: uv pip install pyarrow pandas")
         sys.exit(1)
 
     print("=" * 60)

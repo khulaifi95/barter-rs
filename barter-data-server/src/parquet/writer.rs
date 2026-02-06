@@ -2,28 +2,43 @@
 //!
 //! Receives events via channel and writes them to Parquet files with periodic flush.
 
-use crate::parquet::encoder::{encode_fixed_point, encode_fixed_point_i64, PrecisionMode};
+use crate::parquet::encoder::{PrecisionMode, encode_fixed_point, encode_fixed_point_i64};
 use crate::parquet::schema::{
-    bar_schema, trade_schema, extended_bar_schema,
-    AggressorSide, BarMetadata, TradeMetadata, ExtendedBarMetadata,
+    AggressorSide, BarMetadata, ExtendedBarMetadata, OrderBookDeltaMetadata, TradeMetadata,
+    bar_schema, extended_bar_schema, order_book_delta_schema, trade_schema,
 };
 use arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, Float64Builder, Int64Builder, StringBuilder, UInt64Builder,
-    UInt8Builder,
+    ArrayRef, FixedSizeBinaryBuilder, Float64Builder, Int64Builder, StringBuilder, UInt8Builder,
+    UInt64Builder,
 };
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
-use tracing::{debug, error, info};
+use tokio::time::{Duration, interval};
+use tracing::{debug, error, info, warn};
+
+fn parse_bool_env(var: &str, default: bool) -> bool {
+    std::env::var(var)
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(default)
+}
+
+fn parse_usize_env(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
 
 /// Errors that can occur during Parquet writing.
 #[derive(Error, Debug)]
@@ -57,6 +72,10 @@ pub struct ParquetConfig {
     pub s3_region: Option<String>,
     /// Nautilus precision mode (standard or high)
     pub precision_mode: PrecisionMode,
+    /// Fsync after each file write (durability vs throughput)
+    pub fsync: bool,
+    /// Retry count for process_event failures (transient errors)
+    pub event_retry_max: usize,
 }
 
 impl ParquetConfig {
@@ -79,6 +98,8 @@ impl ParquetConfig {
         let s3_bucket = std::env::var("S3_BUCKET").ok();
         let s3_region = std::env::var("S3_REGION").ok();
         let precision_mode = PrecisionMode::from_env();
+        let fsync = parse_bool_env("PARQUET_FSYNC", false);
+        let event_retry_max = parse_usize_env("PARQUET_EVENT_RETRY_MAX", 3);
 
         Self {
             output_dir,
@@ -88,6 +109,8 @@ impl ParquetConfig {
             s3_bucket,
             s3_region,
             precision_mode,
+            fsync,
+            event_retry_max,
         }
     }
 }
@@ -172,12 +195,31 @@ pub struct ExtendedBarEvent {
     pub size_precision: u8,
 }
 
+/// An order book delta event for Parquet writing (Nautilus-compatible).
+#[derive(Debug, Clone)]
+pub struct OrderBookDeltaEvent {
+    pub instrument_id: String,
+    pub action: u8,
+    pub side: u8,
+    pub price: f64,
+    pub size: f64,
+    pub order_id: u64,
+    pub flags: u8,
+    pub sequence: u64,
+    pub ts_event_ns: u64,
+    pub ts_init_ns: u64,
+    pub price_precision: u8,
+    pub size_precision: u8,
+}
+
 /// Event types that can be written to Parquet.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ParquetEvent {
     Trade(TradeEvent),
     Bar(BarEvent),
     ExtendedBar(ExtendedBarEvent),
+    OrderBookDelta(OrderBookDeltaEvent),
 }
 
 /// Buffered trade data for batch writing.
@@ -214,7 +256,8 @@ impl TradeBuffer {
         let size_bytes = encode_fixed_point(trade.size, self.precision_mode);
         self.prices.append_value(price_bytes.as_slice())?;
         self.sizes.append_value(size_bytes.as_slice())?;
-        self.sides.append_value(AggressorSide::from_side(trade.side) as u8);
+        self.sides
+            .append_value(AggressorSide::from_side(trade.side) as u8);
         self.trade_ids.append_value(&trade.trade_id);
         self.ts_events.append_value(trade.ts_event_ns);
         self.ts_inits.append_value(trade.ts_init_ns);
@@ -222,6 +265,7 @@ impl TradeBuffer {
         Ok(())
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn to_record_batch(&mut self) -> Result<RecordBatch, ParquetError> {
         let schema = trade_schema(&self.metadata, self.precision_mode);
         let arrays: Vec<ArrayRef> = vec![
@@ -229,6 +273,88 @@ impl TradeBuffer {
             Arc::new(self.sizes.finish()),
             Arc::new(self.sides.finish()),
             Arc::new(self.trade_ids.finish()),
+            Arc::new(self.ts_events.finish()),
+            Arc::new(self.ts_inits.finish()),
+        ];
+        self.count = 0;
+        Ok(RecordBatch::try_new(schema, arrays)?)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn len(&self) -> usize {
+        self.count
+    }
+}
+
+/// Buffered order book delta data for batch writing.
+struct OrderBookDeltaBuffer {
+    actions: UInt8Builder,
+    sides: UInt8Builder,
+    prices: FixedSizeBinaryBuilder,
+    sizes: FixedSizeBinaryBuilder,
+    order_ids: UInt64Builder,
+    flags: UInt8Builder,
+    sequences: UInt64Builder,
+    ts_events: UInt64Builder,
+    ts_inits: UInt64Builder,
+    metadata: OrderBookDeltaMetadata,
+    count: usize,
+    precision_mode: PrecisionMode,
+}
+
+impl OrderBookDeltaBuffer {
+    fn new(
+        metadata: OrderBookDeltaMetadata,
+        capacity: usize,
+        precision_mode: PrecisionMode,
+    ) -> Self {
+        let bytes_len = precision_mode.bytes_len();
+        Self {
+            actions: UInt8Builder::with_capacity(capacity),
+            sides: UInt8Builder::with_capacity(capacity),
+            prices: FixedSizeBinaryBuilder::with_capacity(capacity, bytes_len),
+            sizes: FixedSizeBinaryBuilder::with_capacity(capacity, bytes_len),
+            order_ids: UInt64Builder::with_capacity(capacity),
+            flags: UInt8Builder::with_capacity(capacity),
+            sequences: UInt64Builder::with_capacity(capacity),
+            ts_events: UInt64Builder::with_capacity(capacity),
+            ts_inits: UInt64Builder::with_capacity(capacity),
+            metadata,
+            count: 0,
+            precision_mode,
+        }
+    }
+
+    fn append(&mut self, delta: &OrderBookDeltaEvent) -> Result<(), ParquetError> {
+        let price_bytes = encode_fixed_point(delta.price, self.precision_mode);
+        let size_bytes = encode_fixed_point(delta.size, self.precision_mode);
+        self.actions.append_value(delta.action);
+        self.sides.append_value(delta.side);
+        self.prices.append_value(price_bytes.as_slice())?;
+        self.sizes.append_value(size_bytes.as_slice())?;
+        self.order_ids.append_value(delta.order_id);
+        self.flags.append_value(delta.flags);
+        self.sequences.append_value(delta.sequence);
+        self.ts_events.append_value(delta.ts_event_ns);
+        self.ts_inits.append_value(delta.ts_init_ns);
+        self.count += 1;
+        Ok(())
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    fn to_record_batch(&mut self) -> Result<RecordBatch, ParquetError> {
+        let schema = order_book_delta_schema(&self.metadata, self.precision_mode);
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(self.actions.finish()),
+            Arc::new(self.sides.finish()),
+            Arc::new(self.prices.finish()),
+            Arc::new(self.sizes.finish()),
+            Arc::new(self.order_ids.finish()),
+            Arc::new(self.flags.finish()),
+            Arc::new(self.sequences.finish()),
             Arc::new(self.ts_events.finish()),
             Arc::new(self.ts_inits.finish()),
         ];
@@ -293,6 +419,7 @@ impl BarBuffer {
         Ok(())
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn to_record_batch(&mut self) -> Result<RecordBatch, ParquetError> {
         let schema = bar_schema(&self.metadata, self.precision_mode);
         let arrays: Vec<ArrayRef> = vec![
@@ -426,25 +553,38 @@ impl ExtendedBarBuffer {
         self.highs.append_value(encode_fixed_point_i64(bar.high));
         self.lows.append_value(encode_fixed_point_i64(bar.low));
         self.closes.append_value(encode_fixed_point_i64(bar.close));
-        self.volumes.append_value(encode_fixed_point_i64(bar.volume));
-        self.quote_volumes.append_value(encode_fixed_point_i64(bar.quote_volume));
+        self.volumes
+            .append_value(encode_fixed_point_i64(bar.volume));
+        self.quote_volumes
+            .append_value(encode_fixed_point_i64(bar.quote_volume));
         self.trade_counts.append_value(bar.trade_count);
-        self.buy_volumes.append_value(encode_fixed_point_i64(bar.buy_volume));
-        self.sell_volumes.append_value(encode_fixed_point_i64(bar.sell_volume));
+        self.buy_volumes
+            .append_value(encode_fixed_point_i64(bar.buy_volume));
+        self.sell_volumes
+            .append_value(encode_fixed_point_i64(bar.sell_volume));
         self.deltas.append_value(encode_fixed_point_i64(bar.delta));
         self.cvds.append_value(encode_fixed_point_i64(bar.cvd));
-        self.open_interests.append_value(encode_fixed_point_i64(bar.open_interest));
-        self.oi_changes.append_value(encode_fixed_point_i64(bar.oi_change));
+        self.open_interests
+            .append_value(encode_fixed_point_i64(bar.open_interest));
+        self.oi_changes
+            .append_value(encode_fixed_point_i64(bar.oi_change));
         self.funding_rates.append_value(bar.funding_rate);
-        self.bid_prices.append_value(encode_fixed_point_i64(bar.bid_price));
-        self.bid_sizes.append_value(encode_fixed_point_i64(bar.bid_size));
-        self.ask_prices.append_value(encode_fixed_point_i64(bar.ask_price));
-        self.ask_sizes.append_value(encode_fixed_point_i64(bar.ask_size));
+        self.bid_prices
+            .append_value(encode_fixed_point_i64(bar.bid_price));
+        self.bid_sizes
+            .append_value(encode_fixed_point_i64(bar.bid_size));
+        self.ask_prices
+            .append_value(encode_fixed_point_i64(bar.ask_price));
+        self.ask_sizes
+            .append_value(encode_fixed_point_i64(bar.ask_size));
         self.spread_bps.append_value(bar.spread_bps);
         self.book_imbalances.append_value(bar.book_imbalance);
-        self.liq_buy_usd.append_value(encode_fixed_point_i64(bar.liq_buy_usd));
-        self.liq_sell_usd.append_value(encode_fixed_point_i64(bar.liq_sell_usd));
-        self.liq_total_usd.append_value(encode_fixed_point_i64(bar.liq_total_usd));
+        self.liq_buy_usd
+            .append_value(encode_fixed_point_i64(bar.liq_buy_usd));
+        self.liq_sell_usd
+            .append_value(encode_fixed_point_i64(bar.liq_sell_usd));
+        self.liq_total_usd
+            .append_value(encode_fixed_point_i64(bar.liq_total_usd));
         self.liq_count.append_value(bar.liq_count);
         self.bid_depth_10bps_base
             .append_value(encode_fixed_point_i64(bar.bid_depth_10bps_base));
@@ -477,6 +617,7 @@ impl ExtendedBarBuffer {
         Ok(())
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn to_record_batch(&mut self) -> Result<RecordBatch, ParquetError> {
         let schema = extended_bar_schema(&self.metadata);
         let arrays: Vec<ArrayRef> = vec![
@@ -540,11 +681,13 @@ impl ExtendedBarBuffer {
 /// Parquet writer that buffers events and writes to files.
 pub struct ParquetWriter {
     config: ParquetConfig,
-    trade_buffers: HashMap<String, TradeBuffer>,
-    bar_buffers: HashMap<String, BarBuffer>,
-    extended_bar_buffers: HashMap<String, ExtendedBarBuffer>,
+    trade_buffers: HashMap<Arc<str>, TradeBuffer>,
+    bar_buffers: HashMap<Arc<str>, BarBuffer>,
+    extended_bar_buffers: HashMap<Arc<str>, ExtendedBarBuffer>,
+    order_book_delta_buffers: HashMap<Arc<str>, OrderBookDeltaBuffer>,
     trades_written: AtomicU64,
     bars_written: AtomicU64,
+    order_book_deltas_written: AtomicU64,
     flush_seq: AtomicU64,
 }
 
@@ -556,8 +699,10 @@ impl ParquetWriter {
             trade_buffers: HashMap::new(),
             bar_buffers: HashMap::new(),
             extended_bar_buffers: HashMap::new(),
+            order_book_delta_buffers: HashMap::new(),
             trades_written: AtomicU64::new(0),
             bars_written: AtomicU64::new(0),
+            order_book_deltas_written: AtomicU64::new(0),
             flush_seq: AtomicU64::new(0),
         }
     }
@@ -566,49 +711,98 @@ impl ParquetWriter {
     pub fn process_event(&mut self, event: ParquetEvent) -> Result<(), ParquetError> {
         match event {
             ParquetEvent::Trade(trade) => {
-                let key = trade.instrument_id.clone();
-                let buffer = self.trade_buffers.entry(key).or_insert_with(|| {
-                    TradeBuffer::new(
+                if let Some(buffer) = self.trade_buffers.get_mut(trade.instrument_id.as_str()) {
+                    buffer.append(&trade)?;
+                } else {
+                    let key: Arc<str> = Arc::from(trade.instrument_id.as_str());
+                    let buffer = TradeBuffer::new(
                         TradeMetadata {
-                            instrument_id: trade.instrument_id.clone(),
+                            instrument_id: key.to_string(),
                             price_precision: trade.price_precision,
                             size_precision: trade.size_precision,
                         },
                         10_000,
                         self.config.precision_mode,
-                    )
-                });
-                buffer.append(&trade)?;
+                    );
+                    self.trade_buffers.insert(key, buffer);
+                    let buffer = self
+                        .trade_buffers
+                        .get_mut(trade.instrument_id.as_str())
+                        .expect("inserted trade buffer missing");
+                    buffer.append(&trade)?;
+                }
             }
             ParquetEvent::Bar(bar) => {
-                let key = bar.bar_type.clone();
-                let buffer = self.bar_buffers.entry(key).or_insert_with(|| {
-                    BarBuffer::new(
+                if let Some(buffer) = self.bar_buffers.get_mut(bar.bar_type.as_str()) {
+                    buffer.append(&bar)?;
+                } else {
+                    let key: Arc<str> = Arc::from(bar.bar_type.as_str());
+                    let buffer = BarBuffer::new(
                         BarMetadata {
-                            bar_type: bar.bar_type.clone(),
+                            bar_type: key.to_string(),
                             instrument_id: bar.instrument_id.clone(),
                             price_precision: bar.price_precision,
                             size_precision: bar.size_precision,
                         },
                         1_000,
                         self.config.precision_mode,
-                    )
-                });
-                buffer.append(&bar)?;
+                    );
+                    self.bar_buffers.insert(key, buffer);
+                    let buffer = self
+                        .bar_buffers
+                        .get_mut(bar.bar_type.as_str())
+                        .expect("inserted bar buffer missing");
+                    buffer.append(&bar)?;
+                }
             }
             ParquetEvent::ExtendedBar(ext_bar) => {
-                let key = ext_bar.instrument_id.clone();
-                let buffer = self.extended_bar_buffers.entry(key).or_insert_with(|| {
-                    ExtendedBarBuffer::new(
+                if let Some(buffer) = self
+                    .extended_bar_buffers
+                    .get_mut(ext_bar.instrument_id.as_str())
+                {
+                    buffer.append(&ext_bar)?;
+                } else {
+                    let key: Arc<str> = Arc::from(ext_bar.instrument_id.as_str());
+                    let buffer = ExtendedBarBuffer::new(
                         ExtendedBarMetadata::new(
-                            &ext_bar.instrument_id,
+                            &key,
                             ext_bar.price_precision,
                             ext_bar.size_precision,
                         ),
                         1_000,
-                    )
-                });
-                buffer.append(&ext_bar)?;
+                    );
+                    self.extended_bar_buffers.insert(key, buffer);
+                    let buffer = self
+                        .extended_bar_buffers
+                        .get_mut(ext_bar.instrument_id.as_str())
+                        .expect("inserted extended bar buffer missing");
+                    buffer.append(&ext_bar)?;
+                }
+            }
+            ParquetEvent::OrderBookDelta(delta) => {
+                if let Some(buffer) = self
+                    .order_book_delta_buffers
+                    .get_mut(delta.instrument_id.as_str())
+                {
+                    buffer.append(&delta)?;
+                } else {
+                    let key: Arc<str> = Arc::from(delta.instrument_id.as_str());
+                    let buffer = OrderBookDeltaBuffer::new(
+                        OrderBookDeltaMetadata {
+                            instrument_id: key.to_string(),
+                            price_precision: delta.price_precision,
+                            size_precision: delta.size_precision,
+                        },
+                        10_000,
+                        self.config.precision_mode,
+                    );
+                    self.order_book_delta_buffers.insert(key, buffer);
+                    let buffer = self
+                        .order_book_delta_buffers
+                        .get_mut(delta.instrument_id.as_str())
+                        .expect("inserted order book delta buffer missing");
+                    buffer.append(&delta)?;
+                }
             }
         }
         Ok(())
@@ -622,14 +816,17 @@ impl ParquetWriter {
         let hour_str = now.format("%H").to_string();
         let flush_seq = self.flush_seq.fetch_add(1, Ordering::Relaxed);
         let mut written_files = Vec::new();
+        let mut errors = 0usize;
 
         // Collect trade batches first to avoid borrow issues
-        let trade_batches: Vec<_> = self.trade_buffers.iter_mut()
+        let trade_batches: Vec<_> = self
+            .trade_buffers
+            .iter_mut()
             .filter(|(_, buffer)| !buffer.is_empty())
             .filter_map(|(instrument_id, buffer)| {
                 let count = buffer.len();
                 match buffer.to_record_batch() {
-                    Ok(batch) => Some((instrument_id.clone(), count, batch)),
+                    Ok(batch) => Some((Arc::clone(instrument_id), count, batch)),
                     Err(e) => {
                         error!("Failed to create trade batch for {}: {}", instrument_id, e);
                         None
@@ -640,31 +837,56 @@ impl ParquetWriter {
 
         // Write trade batches
         for (instrument_id, count, batch) in trade_batches {
-            let safe_id = instrument_id.replace('.', "_").replace('-', "_");
-            let dir = self.config.output_dir
+            let safe_id = sanitize_id(instrument_id.as_ref());
+            let dir = self
+                .config
+                .output_dir
                 .join("trades")
                 .join(&safe_id)
                 .join(&date_str);
             std::fs::create_dir_all(&dir)?;
 
             let path = dir.join(format!("{}_{}.parquet", hour_str, flush_seq));
-            Self::write_batch_static(&path, batch)?;
-            written_files.push(path.clone());
-
-            self.trades_written.fetch_add(count as u64, Ordering::Relaxed);
-            debug!("Flushed {} trades for {} to {:?}", count, instrument_id, path);
+            match Self::write_batch_static(&path, batch, self.config.fsync) {
+                Ok(_) => {
+                    written_files.push(path.clone());
+                    self.trades_written
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                    debug!(
+                        "Flushed {} trades for {} to {:?}",
+                        count,
+                        instrument_id.as_ref(),
+                        path
+                    );
+                }
+                Err(e) => {
+                    errors += 1;
+                    error!(
+                        "Failed to flush trades for {} to {:?}: {}",
+                        instrument_id.as_ref(),
+                        path,
+                        e
+                    );
+                }
+            }
         }
 
         // Collect bar batches first to avoid borrow issues
-        let bar_batches: Vec<_> = self.bar_buffers.iter_mut()
+        let bar_batches: Vec<_> = self
+            .bar_buffers
+            .iter_mut()
             .filter(|(_, buffer)| !buffer.is_empty())
             .filter_map(|(bar_type, buffer)| {
                 let count = buffer.len();
-                let safe_id = bar_type.replace('.', "_").replace('-', "_");
+                let safe_id = sanitize_id(bar_type.as_ref());
                 match buffer.to_record_batch() {
                     Ok(batch) => Some((safe_id, count, batch)),
                     Err(e) => {
-                        error!("Failed to create bar batch for {}: {}", bar_type, e);
+                        error!(
+                            "Failed to create bar batch for {}: {}",
+                            bar_type.as_ref(),
+                            e
+                        );
                         None
                     }
                 }
@@ -673,30 +895,44 @@ impl ParquetWriter {
 
         // Write bar batches
         for (safe_id, count, batch) in bar_batches {
-            let dir = self.config.output_dir
+            let dir = self
+                .config
+                .output_dir
                 .join("bars_1m")
                 .join(&safe_id)
                 .join(&date_str);
             std::fs::create_dir_all(&dir)?;
 
             let path = dir.join(format!("{}_{}.parquet", hour_str, flush_seq));
-            Self::write_batch_static(&path, batch)?;
-            written_files.push(path.clone());
-
-            self.bars_written.fetch_add(count as u64, Ordering::Relaxed);
-            debug!("Flushed {} bars for {} to {:?}", count, safe_id, path);
+            match Self::write_batch_static(&path, batch, self.config.fsync) {
+                Ok(_) => {
+                    written_files.push(path.clone());
+                    self.bars_written.fetch_add(count as u64, Ordering::Relaxed);
+                    debug!("Flushed {} bars for {} to {:?}", count, safe_id, path);
+                }
+                Err(e) => {
+                    errors += 1;
+                    error!("Failed to flush bars for {} to {:?}: {}", safe_id, path, e);
+                }
+            }
         }
 
         // Collect extended bar batches
-        let extended_bar_batches: Vec<_> = self.extended_bar_buffers.iter_mut()
+        let extended_bar_batches: Vec<_> = self
+            .extended_bar_buffers
+            .iter_mut()
             .filter(|(_, buffer)| !buffer.is_empty())
             .filter_map(|(instrument_id, buffer)| {
                 let count = buffer.len();
-                let safe_id = instrument_id.replace('.', "_").replace('-', "_");
+                let safe_id = sanitize_id(instrument_id.as_ref());
                 match buffer.to_record_batch() {
                     Ok(batch) => Some((safe_id, count, batch)),
                     Err(e) => {
-                        error!("Failed to create extended bar batch for {}: {}", instrument_id, e);
+                        error!(
+                            "Failed to create extended bar batch for {}: {}",
+                            instrument_id.as_ref(),
+                            e
+                        );
                         None
                     }
                 }
@@ -705,38 +941,153 @@ impl ParquetWriter {
 
         // Write extended bar batches (separate directory from core bars)
         for (safe_id, count, batch) in extended_bar_batches {
-            let dir = self.config.output_dir
+            let dir = self
+                .config
+                .output_dir
                 .join("extended_bars_1m")
                 .join(&safe_id)
                 .join(&date_str);
             std::fs::create_dir_all(&dir)?;
 
             let path = dir.join(format!("{}_{}.parquet", hour_str, flush_seq));
-            Self::write_batch_static(&path, batch)?;
-            written_files.push(path.clone());
+            match Self::write_batch_static(&path, batch, self.config.fsync) {
+                Ok(_) => {
+                    written_files.push(path.clone());
+                    // Extended bars also count toward bars_written
+                    self.bars_written.fetch_add(count as u64, Ordering::Relaxed);
+                    debug!(
+                        "Flushed {} extended bars for {} to {:?}",
+                        count, safe_id, path
+                    );
+                }
+                Err(e) => {
+                    errors += 1;
+                    error!(
+                        "Failed to flush extended bars for {} to {:?}: {}",
+                        safe_id, path, e
+                    );
+                }
+            }
+        }
 
-            // Extended bars also count toward bars_written
-            self.bars_written.fetch_add(count as u64, Ordering::Relaxed);
-            debug!("Flushed {} extended bars for {} to {:?}", count, safe_id, path);
+        // Collect order book delta batches
+        let order_book_delta_batches: Vec<_> = self
+            .order_book_delta_buffers
+            .iter_mut()
+            .filter(|(_, buffer)| !buffer.is_empty())
+            .filter_map(|(instrument_id, buffer)| {
+                let count = buffer.len();
+                let safe_id = sanitize_id(instrument_id.as_ref());
+                match buffer.to_record_batch() {
+                    Ok(batch) => Some((safe_id, count, batch)),
+                    Err(e) => {
+                        error!(
+                            "Failed to create order book delta batch for {}: {}",
+                            instrument_id.as_ref(),
+                            e
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        // Write order book delta batches
+        for (safe_id, count, batch) in order_book_delta_batches {
+            let dir = self
+                .config
+                .output_dir
+                .join("order_book_deltas")
+                .join(&safe_id)
+                .join(&date_str);
+            std::fs::create_dir_all(&dir)?;
+
+            let path = dir.join(format!("{}_{}.parquet", hour_str, flush_seq));
+            match Self::write_batch_static(&path, batch, self.config.fsync) {
+                Ok(_) => {
+                    written_files.push(path.clone());
+                    self.order_book_deltas_written
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                    debug!(
+                        "Flushed {} order book deltas for {} to {:?}",
+                        count, safe_id, path
+                    );
+                }
+                Err(e) => {
+                    errors += 1;
+                    error!(
+                        "Failed to flush order book deltas for {} to {:?}: {}",
+                        safe_id, path, e
+                    );
+                }
+            }
+        }
+
+        if errors > 0 {
+            warn!("Parquet flush completed with {} error(s)", errors);
         }
 
         Ok(written_files)
     }
 
-    /// Write a record batch to a Parquet file (static method to avoid borrow issues).
-    fn write_batch_static(path: &Path, batch: RecordBatch) -> Result<(), ParquetError> {
+    /// Write a record batch to a Parquet file ATOMICALLY.
+    ///
+    /// Uses temp file + fsync + rename pattern to prevent partial reads by watchers.
+    fn write_batch_static(
+        path: &Path,
+        batch: RecordBatch,
+        fsync: bool,
+    ) -> Result<(), ParquetError> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let tmp_path = path.with_extension("parquet.tmp");
+
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .build();
 
-        // For simplicity, overwrite the file each flush within the hour
-        // A production system might append or use unique filenames
-        let file = File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))?;
-        writer.write(&batch)?;
-        writer.close()?;
+        // 1. Write to temp file
+        {
+            let file = File::create(&tmp_path)?;
+            let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))?;
+            if let Err(err) = writer.write(&batch) {
+                if Self::is_writer_finished_error(&err) {
+                    warn!(
+                        "Parquet writer already finished for {:?}: {}",
+                        tmp_path, err
+                    );
+                } else {
+                    return Err(ParquetError::Parquet(err));
+                }
+            }
+            if let Err(err) = writer.close() {
+                if Self::is_writer_finished_error(&err) {
+                    warn!(
+                        "Parquet writer already finished on close for {:?}: {}",
+                        tmp_path, err
+                    );
+                } else {
+                    return Err(ParquetError::Parquet(err));
+                }
+            }
+        }
+
+        // 2. Fsync temp file to ensure durability before rename
+        if fsync {
+            fsync_path(&tmp_path)?;
+        }
+
+        // 3. Atomic rename (safe for watchers)
+        std::fs::rename(&tmp_path, path)?;
 
         Ok(())
+    }
+
+    fn is_writer_finished_error(err: &parquet::errors::ParquetError) -> bool {
+        err.to_string()
+            .contains("SerializedFileWriter already finished")
     }
 
     /// Get total trades written.
@@ -748,18 +1099,38 @@ impl ParquetWriter {
     pub fn bars_written(&self) -> u64 {
         self.bars_written.load(Ordering::Relaxed)
     }
+
+    /// Get total order book deltas written.
+    pub fn order_book_deltas_written(&self) -> u64 {
+        self.order_book_deltas_written.load(Ordering::Relaxed)
+    }
+}
+
+fn sanitize_id(id: &str) -> String {
+    id.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+fn fsync_path(path: &Path) -> Result<(), ParquetError> {
+    let file = File::open(path)?;
+    if Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| file.sync_all())?;
+    } else {
+        file.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Run the Parquet writer as an async task.
 ///
 /// Consumes events from the channel and periodically flushes to disk.
 /// If S3 is enabled, also uploads written files to S3 after each flush.
-pub async fn run_parquet_writer_task(
-    mut rx: mpsc::Receiver<ParquetEvent>,
-    config: ParquetConfig,
-) {
-    info!("Parquet writer starting: output_dir={:?}, flush_interval={}s, s3_enabled={}",
-          config.output_dir, config.flush_interval_secs, config.s3_enabled);
+pub async fn run_parquet_writer_task(mut rx: mpsc::Receiver<ParquetEvent>, config: ParquetConfig) {
+    info!(
+        "Parquet writer starting: output_dir={:?}, flush_interval={}s, s3_enabled={}",
+        config.output_dir, config.flush_interval_secs, config.s3_enabled
+    );
     info!("Parquet precision mode: {:?}", config.precision_mode);
 
     // Ensure output directory exists
@@ -778,7 +1149,10 @@ pub async fn run_parquet_writer_task(
                         Some(storage)
                     }
                     Err(e) => {
-                        error!("Failed to initialize S3 storage, continuing with local only: {}", e);
+                        error!(
+                            "Failed to initialize S3 storage, continuing with local only: {}",
+                            e
+                        );
                         None
                     }
                 }
@@ -794,23 +1168,69 @@ pub async fn run_parquet_writer_task(
 
     let output_dir = config.output_dir.clone();
     let flush_secs = config.flush_interval_secs;
+    let retry_max = config.event_retry_max;
     let mut writer = ParquetWriter::new(config);
     let mut flush_interval = interval(Duration::from_secs(flush_secs));
     let mut events_since_flush = 0u64;
+    let mut retry_queue: VecDeque<(ParquetEvent, usize)> = VecDeque::new();
+
+    fn drain_retry_queue(
+        writer: &mut ParquetWriter,
+        retry_queue: &mut VecDeque<(ParquetEvent, usize)>,
+        retry_max: usize,
+        events_since_flush: &mut u64,
+    ) {
+        let mut pending = retry_queue.len();
+        while pending > 0 {
+            pending -= 1;
+            if let Some((event, attempts)) = retry_queue.pop_front() {
+                match writer.process_event(event.clone()) {
+                    Ok(_) => {
+                        *events_since_flush += 1;
+                    }
+                    Err(err) => {
+                        if attempts < retry_max {
+                            retry_queue.push_back((event, attempts + 1));
+                            warn!(
+                                "Parquet retry {}/{} failed: {}",
+                                attempts + 1,
+                                retry_max,
+                                err
+                            );
+                        } else {
+                            error!("Dropping Parquet event after {} retries: {}", attempts, err);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     loop {
         tokio::select! {
             event = rx.recv() => {
                 match event {
                     Some(e) => {
-                        if let Err(err) = writer.process_event(e) {
-                            error!("Parquet process error: {}", err);
+                        if let Err(err) = writer.process_event(e.clone()) {
+                            if retry_max > 0 {
+                                retry_queue.push_back((e, 1));
+                                warn!(
+                                    "Parquet process error (queued for retry 1/{}): {}",
+                                    retry_max,
+                                    err
+                                );
+                            } else {
+                                error!("Parquet process error: {}", err);
+                            }
                         } else {
                             events_since_flush += 1;
                         }
                     }
                     None => {
                         info!("Parquet channel closed, performing final flush");
+                        if retry_max > 0 && !retry_queue.is_empty() {
+                            drain_retry_queue(&mut writer, &mut retry_queue, retry_max, &mut events_since_flush);
+                        }
                         match writer.flush() {
                             Ok(files) => {
                                 if let Some(ref s3) = s3_storage {
@@ -824,9 +1244,17 @@ pub async fn run_parquet_writer_task(
                 }
             }
             _ = flush_interval.tick() => {
+                if retry_max > 0 && !retry_queue.is_empty() {
+                    drain_retry_queue(&mut writer, &mut retry_queue, retry_max, &mut events_since_flush);
+                }
                 if events_since_flush > 0 {
-                    info!("Parquet flush: {} events buffered, trades_total={}, bars_total={}",
-                          events_since_flush, writer.trades_written(), writer.bars_written());
+                    info!(
+                        "Parquet flush: {} events buffered, trades_total={}, bars_total={}, l2_total={}",
+                        events_since_flush,
+                        writer.trades_written(),
+                        writer.bars_written(),
+                        writer.order_book_deltas_written()
+                    );
                     match writer.flush() {
                         Ok(files) => {
                             // Upload to S3 if enabled
@@ -842,16 +1270,16 @@ pub async fn run_parquet_writer_task(
         }
     }
 
-    info!("Parquet writer stopped. Total: trades={}, bars={}",
-          writer.trades_written(), writer.bars_written());
+    info!(
+        "Parquet writer stopped. Total: trades={}, bars={}, l2={}",
+        writer.trades_written(),
+        writer.bars_written(),
+        writer.order_book_deltas_written()
+    );
 }
 
 /// Upload local files to S3.
-async fn upload_to_s3(
-    s3: &crate::storage::S3Storage,
-    files: &[PathBuf],
-    output_dir: &Path,
-) {
+async fn upload_to_s3(s3: &crate::storage::S3Storage, files: &[PathBuf], output_dir: &Path) {
     use crate::storage::StorageBackend;
 
     for local_path in files {
@@ -866,13 +1294,14 @@ async fn upload_to_s3(
 
         // Read local file and upload
         match std::fs::read(local_path) {
-            Ok(data) => {
-                match s3.write(&s3_key, &data).await {
-                    Ok(()) => debug!("Uploaded {} bytes to s3://{}", data.len(), s3_key),
-                    Err(e) => error!("S3 upload failed for {}: {}", s3_key, e),
-                }
-            }
-            Err(e) => error!("Failed to read local file {:?} for S3 upload: {}", local_path, e),
+            Ok(data) => match s3.write(&s3_key, &data).await {
+                Ok(()) => debug!("Uploaded {} bytes to s3://{}", data.len(), s3_key),
+                Err(e) => error!("S3 upload failed for {}: {}", s3_key, e),
+            },
+            Err(e) => error!(
+                "Failed to read local file {:?} for S3 upload: {}",
+                local_path, e
+            ),
         }
     }
 }
@@ -935,6 +1364,34 @@ mod tests {
     }
 
     #[test]
+    fn test_order_book_delta_buffer_append_and_batch() {
+        let meta = OrderBookDeltaMetadata::binance_perp("BTCUSDT", 2, 3);
+        let mut buffer = OrderBookDeltaBuffer::new(meta, 100, PrecisionMode::High);
+
+        let delta = OrderBookDeltaEvent {
+            instrument_id: "BTCUSDT-PERP.BINANCE".to_string(),
+            action: 1,
+            side: 1,
+            price: 100_000.0,
+            size: 1.0,
+            order_id: 0,
+            flags: 16,
+            sequence: 42,
+            ts_event_ns: 1_000_000_000,
+            ts_init_ns: 1_000_000_100,
+            price_precision: 2,
+            size_precision: 3,
+        };
+
+        buffer.append(&delta).unwrap();
+        assert_eq!(buffer.len(), 1);
+
+        let batch = buffer.to_record_batch().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 9);
+    }
+
+    #[test]
     fn test_writer_flush_creates_files() {
         let temp_dir = TempDir::new().unwrap();
         let config = ParquetConfig {
@@ -945,6 +1402,8 @@ mod tests {
             s3_bucket: None,
             s3_region: None,
             precision_mode: PrecisionMode::High,
+            fsync: false,
+            event_retry_max: 0,
         };
 
         let mut writer = ParquetWriter::new(config);

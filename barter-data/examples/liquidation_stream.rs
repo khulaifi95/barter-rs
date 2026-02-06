@@ -25,9 +25,7 @@ async fn main() {
         .subscribe([
             (BybitPerpetualsUsd::default(), "btc", "usdt", MarketDataInstrumentKind::Perpetual, Liquidations),
         ])
-        .subscribe([
-            (Okx::default(), "btc", "usdt", MarketDataInstrumentKind::Perpetual, Liquidations),
-        ])
+        .subscribe([(Okx, "btc", "usdt", MarketDataInstrumentKind::Perpetual, Liquidations)])
         .init()
         .await
         .unwrap();

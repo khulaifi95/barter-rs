@@ -1,10 +1,10 @@
+use super::ctval;
 use crate::{
     Identifier,
     event::{MarketEvent, MarketIter},
     exchange::ExchangeSub,
     subscription::open_interest::OpenInterest,
 };
-use super::ctval;
 use barter_instrument::exchange::ExchangeId;
 use barter_integration::subscription::SubscriptionId;
 use chrono::{DateTime, Utc};
@@ -81,7 +81,6 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, OkxOpenInterests)>
             .collect()
     }
 }
-
 
 /// Deserialize an [`OkxOpenInterestMessage`] "arg" field as a Barter [`SubscriptionId`].
 fn de_okx_open_interest_arg_as_subscription_id<'de, D>(

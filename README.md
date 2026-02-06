@@ -57,6 +57,22 @@ and back-testing systems. It is made up of several easy-to-use, extensible crate
 - Issue Engine Commands from an external process (eg/ UI, Telegram, etc.) to initiate actions (CloseAllPositions, OpenOrders, CancelOrders, etc.).
 - EngineState replica manager that processes the Engine AuditStream to facilitate non-hot path monitoring components (eg/ UI, Telegram, etc.).
 
+## Nautilus Custom Data (Local Package)
+If you're loading Barter Parquet datasets into NautilusTrader, install the local
+package that provides custom data classes:
+
+```
+uv pip install -e /Users/screener-m3/projects/barter-rs/packages/barter-nautilus-data
+```
+
+Then register the custom data before using `ParquetDataCatalog`:
+
+```python
+from barter_nautilus_data import register_all_custom_data
+
+register_all_custom_data()
+```
+
 [barter-examples]: https://github.com/barter-rs/barter-rs/tree/develop/barter/examples
 
 ## Examples

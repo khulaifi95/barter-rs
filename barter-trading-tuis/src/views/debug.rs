@@ -1,6 +1,8 @@
 //! Debug view - raw state and snapshot signals for diagnostics.
 
-use crate::views::{format_compact, format_price, render_header, resolve_display_price, ActiveView, ViewContext};
+use crate::views::{
+    format_compact, format_price, render_header, resolve_display_price, ActiveView, ViewContext,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     text::Line,
@@ -144,9 +146,7 @@ fn render_body(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
         )));
         lines.push(Line::from(format!(
             "GAMMA: flip {} dist {} bias {:?}",
-            gamma.gamma_flip_price,
-            gamma.distance_pct,
-            gamma.bias
+            gamma.gamma_flip_price, gamma.distance_pct, gamma.bias
         )));
         lines.push(Line::from(format!(
             "FLOW: {}/{} {:?}",
@@ -161,10 +161,11 @@ fn render_body(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
         lines.push(Line::from("No orchestrator state"));
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" DEBUG ");
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }).block(block), area);
+    let block = Block::default().borders(Borders::ALL).title(" DEBUG ");
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(block),
+        area,
+    );
 }
 
 fn format_age_map(map: &HashMap<String, f64>) -> String {
@@ -199,7 +200,11 @@ fn format_age_map(map: &HashMap<String, f64>) -> String {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
-    let line = if ctx.connected { "CONNECTED" } else { "DISCONNECTED" };
+    let line = if ctx.connected {
+        "CONNECTED"
+    } else {
+        "DISCONNECTED"
+    };
     let block = Block::default().borders(Borders::ALL);
     f.render_widget(Paragraph::new(line).block(block), area);
 }

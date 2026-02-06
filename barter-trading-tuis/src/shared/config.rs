@@ -200,6 +200,7 @@ impl Config {
     }
 
     /// Parse configuration from a TOML string (useful for testing)
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(toml_content: &str) -> Result<Self, ConfigError> {
         let file: ConfigFile = toml::from_str(toml_content)?;
 

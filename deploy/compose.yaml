@@ -1,0 +1,56 @@
+# deploy/compose.yaml
+# Podman Compose for barter-data-server + nautilus-trader
+#
+# Phase 1: Binance BTCUSDT-PERP only, no L2, IPC on persistent volume
+#
+# Usage (local):
+#   podman-compose -f deploy/compose.yaml up -d barter-server
+#
+# Usage (production — bind mounts to /data):
+#   podman-compose -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d
+
+services:
+  barter-server:
+    image: localhost/barter-server:latest
+    container_name: barter-server
+    restart: always
+    env_file: .env
+    volumes:
+      - parquet-data:/data/parquet:rw
+      - ipc-socket:/data/ipc:rw
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /data/ipc/collector-heartbeat.json"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+
+  nautilus:
+    image: localhost/nautilus-trader:latest
+    container_name: nautilus
+    restart: "no"
+    volumes:
+      - parquet-data:/data/parquet:ro
+      - ipc-socket:/data/ipc:rw
+      - catalog:/data/catalog:rw
+    depends_on:
+      barter-server:
+        condition: service_started
+
+  jupyter:
+    image: localhost/nautilus-trader:latest
+    container_name: jupyter
+    restart: "no"
+    ports:
+      - "127.0.0.1:8888:8888"
+    volumes:
+      - parquet-data:/data/parquet:ro
+      - catalog:/data/catalog:rw
+    command: ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--NotebookApp.token=''"]
+    profiles:
+      - jupyter
+
+volumes:
+  parquet-data:
+  ipc-socket:
+  catalog:

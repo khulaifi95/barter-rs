@@ -36,19 +36,18 @@ pub fn calc_correlation(returns_a: &[f64], returns_b: &[f64]) -> Option<f64> {
 
 /// Z-score of current spread vs rolling history
 /// High |z| = significant divergence from normal
-pub fn calc_divergence_zscore(
-    current_spread: f64,
-    spread_history: &VecDeque<f64>,
-) -> Option<f64> {
+pub fn calc_divergence_zscore(current_spread: f64, spread_history: &VecDeque<f64>) -> Option<f64> {
     if spread_history.len() < 20 {
         return None;
     }
 
     let n = spread_history.len() as f64;
     let mean: f64 = spread_history.iter().sum::<f64>() / n;
-    let variance: f64 = spread_history.iter()
+    let variance: f64 = spread_history
+        .iter()
         .map(|x| (x - mean).powi(2))
-        .sum::<f64>() / n;
+        .sum::<f64>()
+        / n;
     let std = variance.sqrt();
 
     if std < 1e-10 {
@@ -63,7 +62,7 @@ pub fn calc_divergence_zscore(
 pub fn calc_lead_lag(
     es_returns: &[f64],
     btc_returns: &[f64],
-    max_lag: usize,  // 6 bars = 30 seconds
+    max_lag: usize, // 6 bars = 30 seconds
 ) -> (i32, f64) {
     let mut best_lag = 0i32;
     let mut best_corr = 0.0f64;
@@ -73,9 +72,13 @@ pub fn calc_lead_lag(
             // BTC leads: shift BTC back
             let abs_lag = (-lag) as usize;
             // Guard: ensure both slices are valid
-            if abs_lag >= btc_returns.len() || abs_lag >= es_returns.len() { continue; }
+            if abs_lag >= btc_returns.len() || abs_lag >= es_returns.len() {
+                continue;
+            }
             let remaining = es_returns.len().min(btc_returns.len()) - abs_lag;
-            if remaining < 5 { continue; }
+            if remaining < 5 {
+                continue;
+            }
             calc_correlation(
                 &es_returns[abs_lag..abs_lag + remaining],
                 &btc_returns[..remaining],
@@ -84,9 +87,13 @@ pub fn calc_lead_lag(
             // ES leads: shift ES back
             let abs_lag = lag as usize;
             // Guard: ensure both slices are valid
-            if abs_lag >= es_returns.len() || abs_lag >= btc_returns.len() { continue; }
+            if abs_lag >= es_returns.len() || abs_lag >= btc_returns.len() {
+                continue;
+            }
             let remaining = es_returns.len().min(btc_returns.len()) - abs_lag;
-            if remaining < 5 { continue; }
+            if remaining < 5 {
+                continue;
+            }
             calc_correlation(
                 &es_returns[..remaining],
                 &btc_returns[abs_lag..abs_lag + remaining],

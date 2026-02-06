@@ -93,8 +93,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let ws_url = get_ws_url();
-    let client =
-        WebSocketClient::with_config(WebSocketConfig::new(ws_url).with_channel_buffer_size(200_000));
+    let client = WebSocketClient::with_config(
+        WebSocketConfig::new(ws_url).with_channel_buffer_size(200_000),
+    );
     let (mut event_rx, mut status_rx) = client.start();
 
     {
@@ -313,7 +314,8 @@ fn render_exchange_dominance_panel(f: &mut Frame, snapshot: &AggregatedSnapshot,
         .border_style(Style::default().fg(Color::Magenta));
 
     // Aggregate raw volume per exchange across all tickers, then recalculate %
-    let mut volume_by_exchange: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut volume_by_exchange: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
     let mut total_volume = 0.0;
 
     for t in snapshot.tickers.values() {
@@ -343,7 +345,10 @@ fn render_exchange_dominance_panel(f: &mut Frame, snapshot: &AggregatedSnapshot,
     // Reorder to always show known exchanges first if they exist
     let mut prioritized: Vec<(String, f64)> = Vec::new();
     for key in ["binance", "bybit", "okx"] {
-        if let Some(pos) = exchanges.iter().position(|(ex, _)| ex.to_lowercase().contains(key)) {
+        if let Some(pos) = exchanges
+            .iter()
+            .position(|(ex, _)| ex.to_lowercase().contains(key))
+        {
             prioritized.push(exchanges[pos].clone());
         }
     }
@@ -356,9 +361,8 @@ fn render_exchange_dominance_panel(f: &mut Frame, snapshot: &AggregatedSnapshot,
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut y = 0;
-    for (exchange, pct) in exchanges.iter().take(inner.height as usize) {
-        let bar_area = Rect::new(inner.x, inner.y + y, inner.width, 1);
+    for (y, (exchange, pct)) in exchanges.iter().take(inner.height as usize).enumerate() {
+        let bar_area = Rect::new(inner.x, inner.y + y as u16, inner.width, 1);
         // Abbreviate exchange name
         let ex_abbr = if exchange.to_lowercase().contains("binance") {
             "Binance"
@@ -375,7 +379,6 @@ fn render_exchange_dominance_panel(f: &mut Frame, snapshot: &AggregatedSnapshot,
             .ratio((pct / 100.0).clamp(0.0, 1.0))
             .label(label);
         f.render_widget(gauge, bar_area);
-        y += 1;
     }
 }
 

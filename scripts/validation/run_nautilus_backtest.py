@@ -9,7 +9,7 @@ Usage:
     python scripts/validation/run_nautilus_backtest.py [--catalog-dir /path/to/catalog]
 
 Prerequisites:
-    pip install nautilus_trader pyarrow
+    uv pip install nautilus_trader pyarrow
 
     # Generate test data first:
     cargo run -p barter-data-server --bin generate-sample-parquet
@@ -34,7 +34,7 @@ try:
     from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 except ImportError as e:
     print(f"ERROR: nautilus_trader not installed or missing dependency: {e}")
-    print("Run: pip install nautilus_trader")
+    print("Run: uv pip install nautilus_trader")
     sys.exit(1)
 
 

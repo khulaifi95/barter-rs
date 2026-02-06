@@ -146,11 +146,7 @@ impl MinuteBarBuilder {
     /// Finalize and return the completed bar.
     pub fn finish(self) -> Option<MinuteBar> {
         // Don't emit empty bars
-        if self.open.is_none() {
-            return None;
-        }
-
-        let open = self.open.unwrap();
+        let open = self.open?;
         let ts_close_ns = self.minute_start_ns + 60_000_000_000; // +60 seconds
         let ts_init_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
 
@@ -195,6 +191,7 @@ impl MinuteBarAggregator {
     }
 
     /// Process a trade event, returning a completed bar if minute boundary crossed.
+    #[allow(clippy::too_many_arguments)]
     pub fn process_trade(
         &mut self,
         instrument_id: &str,
@@ -231,15 +228,18 @@ impl MinuteBarAggregator {
         } else {
             size_precision
         };
-        let builder = self.builders.entry(instrument_id.to_string()).or_insert_with(|| {
-            MinuteBarBuilder::new(
-                instrument_id.to_string(),
-                bar_type,
-                minute_start_ns,
-                price_precision,
-                size_precision,
-            )
-        });
+        let builder = self
+            .builders
+            .entry(instrument_id.to_string())
+            .or_insert_with(|| {
+                MinuteBarBuilder::new(
+                    instrument_id.to_string(),
+                    bar_type,
+                    minute_start_ns,
+                    price_precision,
+                    size_precision,
+                )
+            });
 
         // If the builder is for an old minute (shouldn't happen after above check, but be safe)
         if builder.minute_start_ns() != minute_start_ns {
@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn test_align_to_minute() {
         // 15:30:45.123456789 -> 15:30:00.000000000
-        let ts = 1706540445_123_456_789u64;
+        let ts = 1_706_540_445_123_456_789u64;
         let aligned = align_to_minute(ts);
         assert_eq!(aligned % 60_000_000_000, 0);
     }
@@ -302,7 +302,7 @@ mod tests {
         let mut builder = MinuteBarBuilder::new(
             "BTCUSDT-PERP.BINANCE".to_string(),
             "BTCUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL".to_string(),
-            1706540400_000_000_000,
+            1_706_540_400_000_000_000,
             2,
             3,
         );
@@ -327,7 +327,7 @@ mod tests {
         let builder = MinuteBarBuilder::new(
             "BTCUSDT-PERP.BINANCE".to_string(),
             "BTCUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL".to_string(),
-            1706540400_000_000_000,
+            1_706_540_400_000_000_000,
             2,
             3,
         );
@@ -341,7 +341,7 @@ mod tests {
         let mut agg = MinuteBarAggregator::new(2, 3);
 
         // First minute
-        let minute1_start = 1706540400_000_000_000u64;
+        let minute1_start = 1_706_540_400_000_000_000u64;
         let result = agg.process_trade(
             "BTCUSDT-PERP.BINANCE",
             100_000.0,
@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn test_bar_timestamps() {
-        let minute_start = 1706540400_000_000_000u64;
+        let minute_start = 1_706_540_400_000_000_000u64;
         let mut builder = MinuteBarBuilder::new(
             "BTCUSDT-PERP.BINANCE".to_string(),
             "BTCUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL".to_string(),

@@ -53,7 +53,7 @@ export PARQUET_ENABLED=1
 export PARQUET_OUTPUT_DIR="/tmp/barter_validation_15m"
 export PARQUET_FLUSH_INTERVAL_SECS=60
 export RUST_LOG=info
-export STREAM_L2=0  # Lean mode
+export STREAM_L2=0  # Lean mode (set to 1 if capturing L2 deltas)
 export STREAM_ASSETS=BTC
 export STREAM_VENUES=BINANCE
 export STREAM_PERP=1
@@ -63,6 +63,9 @@ export PARQUET_VENUES=BINANCE
 export PARQUET_WRITE_TRADES=0
 export PARQUET_WRITE_BARS=1
 export PARQUET_WRITE_EXTENDED=1
+export PARQUET_WRITE_L2=0       # Off by default (high volume)
+export PARQUET_L2_MAX_DEPTH=50  # Only used when PARQUET_WRITE_L2=1
+export PARQUET_L2_SAMPLE_MS=0   # 0 = write every L2 update
 
 mkdir -p "$PARQUET_OUTPUT_DIR"
 timeout 900 ./target/release/barter-data-server 2>&1 | tee "$PARQUET_OUTPUT_DIR/server.log"

@@ -2,7 +2,7 @@
 //!
 //! Downloads historical data from https://data.binance.vision/
 
-use chrono::{NaiveDate, Duration};
+use chrono::{Duration, NaiveDate};
 use reqwest::Client;
 use std::path::Path;
 use thiserror::Error;
@@ -136,7 +136,9 @@ impl BinanceDownloader {
         let response = self.client.get(url).send().await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(DownloadError::NotFound { url: url.to_string() });
+            return Err(DownloadError::NotFound {
+                url: url.to_string(),
+            });
         }
 
         let bytes = response.error_for_status()?.bytes().await?;
@@ -169,8 +171,9 @@ impl BinanceDownloader {
 
         while current <= end_date {
             let url = self.build_url(symbol, data_type, current, futures);
-            let filename = url.split('/').last().unwrap_or("unknown.zip");
-            let output_path = self.output_dir
+            let filename = url.rsplit('/').next().unwrap_or("unknown.zip");
+            let output_path = self
+                .output_dir
                 .join(symbol)
                 .join(data_type.path_segment())
                 .join(filename);
@@ -185,7 +188,7 @@ impl BinanceDownloader {
                 }
             }
 
-            current = current + Duration::days(1);
+            current += Duration::days(1);
         }
 
         Ok(stats)
@@ -193,9 +196,7 @@ impl BinanceDownloader {
 
     /// Get output directory path for a symbol and data type.
     pub fn output_path(&self, symbol: &str, data_type: DataType) -> std::path::PathBuf {
-        self.output_dir
-            .join(symbol)
-            .join(data_type.path_segment())
+        self.output_dir.join(symbol).join(data_type.path_segment())
     }
 }
 

@@ -60,7 +60,7 @@ fn generate_synthetic_event(ticker: &str, exchange: &str) -> MarketEventMessage 
         data: serde_json::json!({
             "price": 50000.0 + (rand_u64() % 1000) as f64,
             "amount": 0.1 + (rand_u64() % 100) as f64 / 100.0,
-            "side": if rand_u64() % 2 == 0 { "buy" } else { "sell" }
+            "side": if rand_u64().is_multiple_of(2) { "buy" } else { "sell" }
         }),
     }
 }
@@ -183,7 +183,10 @@ async fn main() {
     let interval_us = 1_000_000 / rate;
     let interval = Duration::from_micros(interval_us);
 
-    info!("Starting load test at {} events/sec (interval: {:?})", rate, interval);
+    info!(
+        "Starting load test at {} events/sec (interval: {:?})",
+        rate, interval
+    );
 
     let start = Instant::now();
     let duration = Duration::from_secs(duration_secs);
@@ -202,10 +205,10 @@ async fn main() {
         EVENTS_GENERATED.fetch_add(1, Ordering::Relaxed);
 
         // Serialize and broadcast (simulates hot path)
-        if let Some(bytes) = serialize_event(&event) {
-            if tx.send(bytes).is_ok() {
-                EVENTS_BROADCAST.fetch_add(1, Ordering::Relaxed);
-            }
+        if let Some(bytes) = serialize_event(&event)
+            && tx.send(bytes).is_ok()
+        {
+            EVENTS_BROADCAST.fetch_add(1, Ordering::Relaxed);
         }
 
         // Send to aggregator (simulates agg_tx.try_send)
@@ -260,8 +263,7 @@ async fn main() {
         EVENTS_DROPPED.load(Ordering::Relaxed)
     );
 
-    let effective_rate =
-        EVENTS_BROADCAST.load(Ordering::Relaxed) as f64 / total_time.as_secs_f64();
+    let effective_rate = EVENTS_BROADCAST.load(Ordering::Relaxed) as f64 / total_time.as_secs_f64();
     info!("Effective rate: {:.1} events/sec", effective_rate);
 
     if EVENTS_DROPPED.load(Ordering::Relaxed) > 0 {

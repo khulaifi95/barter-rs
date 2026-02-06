@@ -20,7 +20,7 @@ Usage:
     python scripts/validation/test_barter_ipc.py --test-decode
 
 Prerequisites:
-    pip install msgpack
+    uv pip install msgpack
 """
 
 import argparse
@@ -32,7 +32,7 @@ from datetime import datetime
 try:
     import msgpack
 except ImportError:
-    print("ERROR: msgpack not installed. Run: pip install msgpack")
+    print("ERROR: msgpack not installed. Run: uv pip install msgpack")
     sys.exit(1)
 
 

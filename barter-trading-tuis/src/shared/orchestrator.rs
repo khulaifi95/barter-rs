@@ -262,12 +262,18 @@ impl StateOrchestrator {
                     GammaStatus::Live { flip_price: _ } => {
                         let flip_buffer = self.config.thresholds().gamma.flip_buffer_pct;
                         // Use front bucket for L2 bias (more actionable)
-                        (ctx.to_gamma_score_from_front_bucket(input.spot_price, flip_buffer), false)
+                        (
+                            ctx.to_gamma_score_from_front_bucket(input.spot_price, flip_buffer),
+                            false,
+                        )
                     }
                     GammaStatus::Stale { last_flip_price: _ } => {
                         // Use stale data but mark as such
                         let flip_buffer = self.config.thresholds().gamma.flip_buffer_pct;
-                        (ctx.to_gamma_score_from_front_bucket(input.spot_price, flip_buffer), false)
+                        (
+                            ctx.to_gamma_score_from_front_bucket(input.spot_price, flip_buffer),
+                            false,
+                        )
                     }
                     GammaStatus::Unavailable => {
                         // NO-GAMMA mode: derive bias from flow
@@ -331,7 +337,10 @@ impl StateOrchestrator {
                 flow_consensus: input.flow_score.clone(),
                 funding_context: input.funding_score.clone(),
                 fuel_context: crate::shared::market_state::FuelScore::default(),
-                options_context: input.options_context.as_ref().map(Self::options_summary_from),
+                options_context: input
+                    .options_context
+                    .as_ref()
+                    .map(Self::options_summary_from),
                 warnings,
             },
             reason,
@@ -532,7 +541,9 @@ impl MarketDataInputBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::market_state::{Direction, FlowScore, FundingScore, VolRegime, VolRegimeScore};
+    use crate::shared::market_state::{
+        Direction, FlowScore, FundingScore, VolRegime, VolRegimeScore,
+    };
 
     fn test_config() -> Config {
         Config::default()
@@ -592,9 +603,11 @@ mod tests {
         let logger = AuditLogger::no_op();
         let mut orchestrator = StateOrchestrator::new(config, logger);
 
-        let mut options_ctx = OptionsContext::default();
-        options_ctx.gamma_flip_price = 90000.0;
-        options_ctx.last_update = Utc::now().timestamp_millis();
+        let options_ctx = OptionsContext {
+            gamma_flip_price: 90000.0,
+            last_update: Utc::now().timestamp_millis(),
+            ..Default::default()
+        };
 
         let input = MarketDataInput {
             spot_price: 92000.0,
@@ -674,9 +687,11 @@ mod tests {
         let logger = AuditLogger::no_op();
         let mut orchestrator = StateOrchestrator::new(config, logger);
 
-        let mut options_ctx = OptionsContext::default();
-        options_ctx.gamma_flip_price = 90000.0;
-        options_ctx.last_update = Utc::now().timestamp_millis();
+        let options_ctx = OptionsContext {
+            gamma_flip_price: 90000.0,
+            last_update: Utc::now().timestamp_millis(),
+            ..Default::default()
+        };
 
         let input = MarketDataInput {
             spot_price: 92000.0,
@@ -722,9 +737,11 @@ mod tests {
         let mut orchestrator = StateOrchestrator::new(config, logger);
 
         // First call - WAIT to READY
-        let mut options_ctx = OptionsContext::default();
-        options_ctx.gamma_flip_price = 90000.0;
-        options_ctx.last_update = Utc::now().timestamp_millis();
+        let options_ctx = OptionsContext {
+            gamma_flip_price: 90000.0,
+            last_update: Utc::now().timestamp_millis(),
+            ..Default::default()
+        };
 
         let input = MarketDataInput {
             spot_price: 92000.0,

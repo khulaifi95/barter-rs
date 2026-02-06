@@ -16,7 +16,7 @@ const C_BUY: Color = Color::Rgb(100, 220, 100);
 const C_SELL: Color = Color::Rgb(220, 100, 100);
 const C_NEUTRAL: Color = Color::Rgb(180, 180, 100);
 const C_DIM: Color = Color::Rgb(100, 100, 100);
-const C_TEXT: Color = Color::Rgb(180, 180, 180);      // Default text - light gray
+const C_TEXT: Color = Color::Rgb(180, 180, 180); // Default text - light gray
 const C_BRIGHT: Color = Color::Rgb(220, 220, 220);
 const C_ACCENT: Color = Color::Rgb(100, 180, 220);
 const C_HEADER: Color = Color::Rgb(140, 140, 140);
@@ -61,9 +61,10 @@ pub fn render_trad_markets_panel(
 
     // If disconnected and no data, show placeholder
     if ibkr_status != IbkrConnectionStatus::Connected && signals.es_price <= 0.0 {
-        let placeholder = vec![
-            Line::from(Span::styled("Waiting for trad feed...", Style::default().fg(C_TEXT))),
-        ];
+        let placeholder = vec![Line::from(Span::styled(
+            "Waiting for trad feed...",
+            Style::default().fg(C_TEXT),
+        ))];
         f.render_widget(Paragraph::new(placeholder), inner);
         return;
     }
@@ -71,7 +72,13 @@ pub fn render_trad_markets_panel(
     let mut lines = Vec::new();
 
     let vwap_pct = |price: f64, vwap: Option<f64>| -> Option<f64> {
-        vwap.and_then(|v| if v > 0.0 { Some((price - v) / v * 100.0) } else { None })
+        vwap.and_then(|v| {
+            if v > 0.0 {
+                Some((price - v) / v * 100.0)
+            } else {
+                None
+            }
+        })
     };
     let vwap_dev = |price: f64, vwap: Option<f64>| -> Option<f64> {
         vwap.and_then(|v| if v > 0.0 { Some(price - v) } else { None })
@@ -83,8 +90,12 @@ pub fn render_trad_markets_panel(
     let nq_vwap_dev = vwap_dev(signals.nq_price, signals.nq_vwap);
 
     // === ROW 1: Price + VWAP deviation % ===
-    let es_vwap_pct_str = es_vwap_pct.map(|v| format!("{:+.2}%", v)).unwrap_or_else(|| "--".to_string());
-    let nq_vwap_pct_str = nq_vwap_pct.map(|v| format!("{:+.2}%", v)).unwrap_or_else(|| "--".to_string());
+    let es_vwap_pct_str = es_vwap_pct
+        .map(|v| format!("{:+.2}%", v))
+        .unwrap_or_else(|| "--".to_string());
+    let nq_vwap_pct_str = nq_vwap_pct
+        .map(|v| format!("{:+.2}%", v))
+        .unwrap_or_else(|| "--".to_string());
     let es_vwap_pct_color = match es_vwap_pct {
         Some(v) if v > 0.0 => C_BUY,
         Some(v) if v < 0.0 => C_SELL,
@@ -100,20 +111,38 @@ pub fn render_trad_markets_panel(
 
     lines.push(Line::from(vec![
         Span::styled("ES ", Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:.2}", signals.es_price), Style::default().fg(C_BRIGHT).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" {}", es_vwap_pct_str), Style::default().fg(es_vwap_pct_color)),
+        Span::styled(
+            format!("{:.2}", signals.es_price),
+            Style::default().fg(C_BRIGHT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {}", es_vwap_pct_str),
+            Style::default().fg(es_vwap_pct_color),
+        ),
         Span::styled("   NQ ", Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:.2}", signals.nq_price), Style::default().fg(C_BRIGHT).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" {}", nq_vwap_pct_str), Style::default().fg(nq_vwap_pct_color)),
+        Span::styled(
+            format!("{:.2}", signals.nq_price),
+            Style::default().fg(C_BRIGHT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {}", nq_vwap_pct_str),
+            Style::default().fg(nq_vwap_pct_color),
+        ),
     ]));
 
     // === ROW 2: VWAP prices in yellow, aligned below ES/NQ prices ===
-    let es_vwap_str = signals.es_vwap.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "--".to_string());
-    let nq_vwap_str = signals.nq_vwap.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "--".to_string());
+    let es_vwap_str = signals
+        .es_vwap
+        .map(|v| format!("{:.2}", v))
+        .unwrap_or_else(|| "--".to_string());
+    let nq_vwap_str = signals
+        .nq_vwap
+        .map(|v| format!("{:.2}", v))
+        .unwrap_or_else(|| "--".to_string());
     lines.push(Line::from(vec![
         Span::styled("   ", Style::default()),
         Span::styled(es_vwap_str, Style::default().fg(C_YELLOW)),
-        Span::styled("              ", Style::default()),  // 14 spaces to align NQ VWAP under NQ price
+        Span::styled("              ", Style::default()), // 14 spaces to align NQ VWAP under NQ price
         Span::styled(nq_vwap_str, Style::default().fg(C_YELLOW)),
     ]));
 
@@ -123,13 +152,25 @@ pub fn render_trad_markets_panel(
     let header_style = Style::default().fg(C_HEADER);
     lines.push(Line::from(vec![
         Span::styled(format!("{:<4}", ""), header_style),
-        Span::styled(format!("{:>width$}", "PRICE", width = COL_PRICE), header_style),
+        Span::styled(
+            format!("{:>width$}", "PRICE", width = COL_PRICE),
+            header_style,
+        ),
         Span::styled(COL_GAP, header_style),
-        Span::styled(format!("{:>width$}", "FLOW", width = COL_FLOW), header_style),
+        Span::styled(
+            format!("{:>width$}", "FLOW", width = COL_FLOW),
+            header_style,
+        ),
         Span::styled(COL_GAP, header_style),
-        Span::styled(format!("{:>width$}", "VWAP", width = COL_VWAP), header_style),
+        Span::styled(
+            format!("{:>width$}", "VWAP", width = COL_VWAP),
+            header_style,
+        ),
         Span::styled(COL_GAP, header_style),
-        Span::styled(format!("{:^width$}", "BIAS", width = COL_BIAS), header_style),
+        Span::styled(
+            format!("{:^width$}", "BIAS", width = COL_BIAS),
+            header_style,
+        ),
     ]));
 
     // === ROW 3-4: ES/NQ matrix rows ===
@@ -141,8 +182,12 @@ pub fn render_trad_markets_panel(
     let nq_price_str = format!("{}{:>+6.2}%", nq_arrow, nq_ret_pct);
     let es_flow_str = format!("δ{:+.0}c", signals.es_delta);
     let nq_flow_str = format!("δ{:+.0}c", signals.nq_delta);
-    let es_vwap_str = es_vwap_dev.map(|v| format!("{:+.1}", v)).unwrap_or_else(|| "--".to_string());
-    let nq_vwap_str = nq_vwap_dev.map(|v| format!("{:+.1}", v)).unwrap_or_else(|| "--".to_string());
+    let es_vwap_str = es_vwap_dev
+        .map(|v| format!("{:+.1}", v))
+        .unwrap_or_else(|| "--".to_string());
+    let nq_vwap_str = nq_vwap_dev
+        .map(|v| format!("{:+.1}", v))
+        .unwrap_or_else(|| "--".to_string());
 
     let es_price_color = if es_ret_pct > PRICE_PCT_THRESHOLD {
         C_BUY
@@ -201,29 +246,54 @@ pub fn render_trad_markets_panel(
 
     lines.push(Line::from(vec![
         Span::styled(format!("{:<4}", "ES"), Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:>width$}", es_price_str, width = COL_PRICE), Style::default().fg(es_price_color)),
+        Span::styled(
+            format!("{:>width$}", es_price_str, width = COL_PRICE),
+            Style::default().fg(es_price_color),
+        ),
         Span::styled(COL_GAP, Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:>width$}", es_flow_str, width = COL_FLOW), Style::default().fg(es_flow_color)),
+        Span::styled(
+            format!("{:>width$}", es_flow_str, width = COL_FLOW),
+            Style::default().fg(es_flow_color),
+        ),
         Span::styled(COL_GAP, Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:>width$}", es_vwap_str, width = COL_VWAP), Style::default().fg(es_vwap_color)),
+        Span::styled(
+            format!("{:>width$}", es_vwap_str, width = COL_VWAP),
+            Style::default().fg(es_vwap_color),
+        ),
         Span::styled(COL_GAP, Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:^width$}", es_bias.0, width = COL_BIAS), Style::default().fg(es_bias.1).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:^width$}", es_bias.0, width = COL_BIAS),
+            Style::default().fg(es_bias.1).add_modifier(Modifier::BOLD),
+        ),
     ]));
 
     lines.push(Line::from(vec![
         Span::styled(format!("{:<4}", "NQ"), Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:>width$}", nq_price_str, width = COL_PRICE), Style::default().fg(nq_price_color)),
+        Span::styled(
+            format!("{:>width$}", nq_price_str, width = COL_PRICE),
+            Style::default().fg(nq_price_color),
+        ),
         Span::styled(COL_GAP, Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:>width$}", nq_flow_str, width = COL_FLOW), Style::default().fg(nq_flow_color)),
+        Span::styled(
+            format!("{:>width$}", nq_flow_str, width = COL_FLOW),
+            Style::default().fg(nq_flow_color),
+        ),
         Span::styled(COL_GAP, Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:>width$}", nq_vwap_str, width = COL_VWAP), Style::default().fg(nq_vwap_color)),
+        Span::styled(
+            format!("{:>width$}", nq_vwap_str, width = COL_VWAP),
+            Style::default().fg(nq_vwap_color),
+        ),
         Span::styled(COL_GAP, Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:^width$}", nq_bias.0, width = COL_BIAS), Style::default().fg(nq_bias.1).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:^width$}", nq_bias.0, width = COL_BIAS),
+            Style::default().fg(nq_bias.1).add_modifier(Modifier::BOLD),
+        ),
     ]));
 
-    lines.push(Line::from(vec![
-        Span::styled("─".repeat(SEP_LEN), Style::default().fg(C_DIM)),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "─".repeat(SEP_LEN),
+        Style::default().fg(C_DIM),
+    )]));
 
     // === ROW 6: Combined summary ===
     let summary_price = if es_ret_pct > PRICE_PCT_THRESHOLD {
@@ -240,8 +310,24 @@ pub fn render_trad_markets_panel(
     } else {
         ("FLAT", C_TEXT)
     };
-    let es_side = es_vwap_dev.map(|v| if v > VWAP_POINTS_THRESHOLD { 1 } else if v < -VWAP_POINTS_THRESHOLD { -1 } else { 0 });
-    let nq_side = nq_vwap_dev.map(|v| if v > VWAP_POINTS_THRESHOLD { 1 } else if v < -VWAP_POINTS_THRESHOLD { -1 } else { 0 });
+    let es_side = es_vwap_dev.map(|v| {
+        if v > VWAP_POINTS_THRESHOLD {
+            1
+        } else if v < -VWAP_POINTS_THRESHOLD {
+            -1
+        } else {
+            0
+        }
+    });
+    let nq_side = nq_vwap_dev.map(|v| {
+        if v > VWAP_POINTS_THRESHOLD {
+            1
+        } else if v < -VWAP_POINTS_THRESHOLD {
+            -1
+        } else {
+            0
+        }
+    });
     let vwap_summary = match (es_side, nq_side) {
         (Some(1), Some(1)) => ("ABOVE", C_BUY),
         (Some(-1), Some(-1)) => ("BELOW", C_SELL),
@@ -259,13 +345,27 @@ pub fn render_trad_markets_panel(
 
     lines.push(Line::from(vec![
         Span::styled(format!("{:<4}", ""), Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:>width$}", summary_price.0, width = COL_PRICE), Style::default().fg(summary_price.1)),
+        Span::styled(
+            format!("{:>width$}", summary_price.0, width = COL_PRICE),
+            Style::default().fg(summary_price.1),
+        ),
         Span::styled(COL_GAP, Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:>width$}", summary_flow.0, width = COL_FLOW), Style::default().fg(summary_flow.1)),
+        Span::styled(
+            format!("{:>width$}", summary_flow.0, width = COL_FLOW),
+            Style::default().fg(summary_flow.1),
+        ),
         Span::styled(COL_GAP, Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:>width$}", vwap_summary.0, width = COL_VWAP), Style::default().fg(vwap_summary.1)),
+        Span::styled(
+            format!("{:>width$}", vwap_summary.0, width = COL_VWAP),
+            Style::default().fg(vwap_summary.1),
+        ),
         Span::styled(COL_GAP, Style::default().fg(C_TEXT)),
-        Span::styled(format!("{:^width$}", trad_bias.0, width = COL_BIAS), Style::default().fg(trad_bias.1).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:^width$}", trad_bias.0, width = COL_BIAS),
+            Style::default()
+                .fg(trad_bias.1)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]));
 
     lines.push(Line::from(""));
@@ -311,11 +411,27 @@ pub fn render_trad_markets_panel(
 
     lines.push(Line::from(vec![
         Span::styled("60s: ", Style::default().fg(C_TEXT)),
-        Span::styled(format!("ES {} BTC ", es_btc_sym), Style::default().fg(es_btc_color).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:+.2}%", btc_es_pct.abs()), Style::default().fg(es_btc_color)),
+        Span::styled(
+            format!("ES {} BTC ", es_btc_sym),
+            Style::default()
+                .fg(es_btc_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:+.2}%", btc_es_pct.abs()),
+            Style::default().fg(es_btc_color),
+        ),
         Span::styled(" │ ", Style::default().fg(C_TEXT)),
-        Span::styled(format!("ES {} NQ ", es_nq_sym), Style::default().fg(es_nq_color).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:+.2}% {}", nq_es_pct.abs(), sync_label), Style::default().fg(es_nq_color)),
+        Span::styled(
+            format!("ES {} NQ ", es_nq_sym),
+            Style::default()
+                .fg(es_nq_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:+.2}% {}", nq_es_pct.abs(), sync_label),
+            Style::default().fg(es_nq_color),
+        ),
     ]));
 
     // === ROW 8: Three cards - ES/NQ, ES/BTC, LEAD ===
@@ -344,8 +460,14 @@ pub fn render_trad_markets_panel(
     let es_btc_val_color = if corr_es_btc > 0.50 { C_BUY } else { C_BRIGHT };
 
     // Card values
-    let es_nq_val = signals.es_nq_corr.map(|c| format!("{:.2}", c)).unwrap_or("--".to_string());
-    let es_btc_val = signals.es_btc_corr.map(|c| format!("{:.2}", c)).unwrap_or("--".to_string());
+    let es_nq_val = signals
+        .es_nq_corr
+        .map(|c| format!("{:.2}", c))
+        .unwrap_or("--".to_string());
+    let es_btc_val = signals
+        .es_btc_corr
+        .map(|c| format!("{:.2}", c))
+        .unwrap_or("--".to_string());
     let lead_corr_ok = signals
         .lead_lag_corr
         .map(|c| c.abs() >= 0.50)
@@ -392,23 +514,42 @@ pub fn render_trad_markets_panel(
     // Card values - centered in 10 char width
     lines.push(Line::from(vec![
         Span::styled("│", Style::default().fg(C_DIM)),
-        Span::styled(format!("{:^10}", es_nq_val), Style::default().fg(es_nq_val_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:^10}", es_nq_val),
+            Style::default()
+                .fg(es_nq_val_color)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("│  ", Style::default().fg(C_DIM)),
         Span::styled("│", Style::default().fg(C_DIM)),
-        Span::styled(format!("{:^10}", es_btc_val), Style::default().fg(es_btc_val_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:^10}", es_btc_val),
+            Style::default()
+                .fg(es_btc_val_color)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("│  ", Style::default().fg(C_DIM)),
         Span::styled("│", Style::default().fg(C_DIM)),
-        Span::styled(format!("{:^10}", lead_val), Style::default().fg(C_BRIGHT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:^10}", lead_val),
+            Style::default().fg(C_BRIGHT).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("│", Style::default().fg(C_DIM)),
     ]));
 
     // Card labels - centered in 10 char width
     lines.push(Line::from(vec![
         Span::styled("│", Style::default().fg(C_DIM)),
-        Span::styled(format!("{:^10}", es_nq_label), Style::default().fg(es_nq_color)),
+        Span::styled(
+            format!("{:^10}", es_nq_label),
+            Style::default().fg(es_nq_color),
+        ),
         Span::styled("│  ", Style::default().fg(C_DIM)),
         Span::styled("│", Style::default().fg(C_DIM)),
-        Span::styled(format!("{:^10}", es_btc_label), Style::default().fg(es_btc_color)),
+        Span::styled(
+            format!("{:^10}", es_btc_label),
+            Style::default().fg(es_btc_color),
+        ),
         Span::styled("│  ", Style::default().fg(C_DIM)),
         Span::styled("│", Style::default().fg(C_DIM)),
         Span::styled(format!("{:^10}", lead_time), Style::default().fg(C_ACCENT)),
@@ -428,9 +569,10 @@ pub fn render_trad_markets_panel(
     // === ROW 5: DIVERGENCE with gradient bar ===
     let div_z = signals.divergence_z.unwrap_or(0.0);
 
-    lines.push(Line::from(vec![
-        Span::styled("DIVERGENCE", Style::default().fg(C_TEXT)),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "DIVERGENCE",
+        Style::default().fg(C_TEXT),
+    )]));
 
     // Divergence gauge - match box width (3 boxes * 12 + 2 gaps * 2 = 40, minus labels)
     // Total 40 chars: "-2σ " (4) + bar (32) + " +2σ" (4) = 40
@@ -506,7 +648,11 @@ pub fn render_trad_markets_panel(
     } else if nq_flow == "flat" {
         "NQ flat"
     } else if es_flow == "flat" {
-        if nq_flow == "buy" { "NQ buying" } else { "NQ selling" }
+        if nq_flow == "buy" {
+            "NQ buying"
+        } else {
+            "NQ selling"
+        }
     } else {
         "NQ diverges"
     };
@@ -515,9 +661,17 @@ pub fn render_trad_markets_panel(
         Some(c) if c <= -0.5 => format!("BTC inverse to TradFi ⚡ (ρ={:.2})", c),
         Some(c) if c.abs() >= 0.5 => {
             let direction = if es_flow == "buy" {
-                if vwap_pos == "below" { "BTC may bounce ▲" } else { "BTC likely follows ▲" }
+                if vwap_pos == "below" {
+                    "BTC may bounce ▲"
+                } else {
+                    "BTC likely follows ▲"
+                }
             } else if es_flow == "sell" {
-                if vwap_pos == "above" { "BTC may drop ▼" } else { "BTC likely follows ▼" }
+                if vwap_pos == "above" {
+                    "BTC may drop ▼"
+                } else {
+                    "BTC likely follows ▼"
+                }
             } else {
                 "BTC direction unclear"
             };
@@ -543,12 +697,14 @@ pub fn render_trad_markets_panel(
     let trad_line = format!("→ {}, {}", es_state, nq_note);
     let crypto_line = format!("→ {}", crypto_note);
 
-    lines.push(Line::from(vec![
-        Span::styled(fit_line(trad_line), Style::default().fg(C_TEXT)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(fit_line(crypto_line), Style::default().fg(C_TEXT)),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        fit_line(trad_line),
+        Style::default().fg(C_TEXT),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        fit_line(crypto_line),
+        Style::default().fg(C_TEXT),
+    )]));
 
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -570,15 +726,15 @@ fn render_divergence_gauge_colored(z: f64, width: usize) -> Vec<Span<'static>> {
 
         // Color gradient: red on left, yellow in center, green on right
         let color = if i < center / 2 {
-            C_SELL  // Strong red (far left)
+            C_SELL // Strong red (far left)
         } else if i < center {
-            Color::Rgb(200, 150, 100)  // Orange-ish (left of center)
+            Color::Rgb(200, 150, 100) // Orange-ish (left of center)
         } else if i == center {
-            C_NEUTRAL  // Yellow (center)
+            C_NEUTRAL // Yellow (center)
         } else if i < center + center / 2 {
-            Color::Rgb(150, 200, 100)  // Yellow-green (right of center)
+            Color::Rgb(150, 200, 100) // Yellow-green (right of center)
         } else {
-            C_BUY  // Strong green (far right)
+            C_BUY // Strong green (far right)
         };
 
         // Make the marker brighter

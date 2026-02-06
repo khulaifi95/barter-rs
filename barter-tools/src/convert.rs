@@ -482,21 +482,15 @@ mod tests {
 "#;
         std::fs::write(&csv_path, csv_content).unwrap();
 
-        let rows = convert_klines_to_parquet(
-            &csv_path,
-            &parquet_path,
-            "BTCUSDT",
-            2,
-            3,
-        )
-        .unwrap();
+        let rows = convert_klines_to_parquet(&csv_path, &parquet_path, "BTCUSDT", 2, 3).unwrap();
 
         assert_eq!(rows, 2);
         assert!(parquet_path.exists());
 
         // Verify Parquet file
         let file = File::open(&parquet_path).unwrap();
-        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(file, 1024).unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(file, 1024).unwrap();
         let batches: Vec<_> = reader.collect();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].as_ref().unwrap().num_rows(), 2);
@@ -514,14 +508,7 @@ mod tests {
 "#;
         std::fs::write(&csv_path, csv_content).unwrap();
 
-        let rows = convert_trades_to_parquet(
-            &csv_path,
-            &parquet_path,
-            "BTCUSDT",
-            2,
-            3,
-        )
-        .unwrap();
+        let rows = convert_trades_to_parquet(&csv_path, &parquet_path, "BTCUSDT", 2, 3).unwrap();
 
         assert_eq!(rows, 2);
         assert!(parquet_path.exists());

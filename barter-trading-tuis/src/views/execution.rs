@@ -1,6 +1,9 @@
 //! Execution view - focused on trade-ready context.
 
-use crate::views::{format_optional_price, format_price, render_header, resolve_display_price, ActiveView, ViewContext};
+use crate::views::{
+    format_optional_price, format_price, render_header, resolve_display_price, ActiveView,
+    ViewContext,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     text::Line,
@@ -61,7 +64,10 @@ fn render_execution_context(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" EXECUTION CONTEXT ");
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }).block(block), area);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(block),
+        area,
+    );
 }
 
 fn render_options_levels(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
@@ -94,7 +100,10 @@ fn render_options_levels(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" OPTIONS LEVELS ");
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }).block(block), area);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(block),
+        area,
+    );
 }
 
 fn render_footer(f: &mut Frame, area: Rect, ctx: &ViewContext<'_>) {

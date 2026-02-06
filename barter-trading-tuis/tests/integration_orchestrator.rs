@@ -13,35 +13,40 @@ use std::collections::HashMap;
 
 /// Create a healthy market snapshot with good conditions
 fn healthy_snapshot() -> TickerSnapshot {
-    let mut snap = TickerSnapshot::default();
-    snap.ticker = "BTC".to_string();
-    snap.binance_perp_last = Some(92000.0);
-    snap.realized_vol_1h = Some(0.02);
-    snap.realized_vol_trend = VolTrend::Stable;
-    snap.atr_14_pct = Some(0.5);
-    snap.cvd_5m_total = 500000.0;
-    snap.cvd_per_exchange_5m = {
+    let cvd_per_exchange_5m = {
         let mut m = HashMap::new();
         m.insert("binance".to_string(), 300000.0);
         m.insert("bybit".to_string(), 150000.0);
         m.insert("okx".to_string(), 50000.0);
         m
     };
-    snap.funding_rate_by_exchange = {
+    let funding_rate_by_exchange = {
         let mut m = HashMap::new();
         m.insert("binance".to_string(), 0.0001);
         m.insert("bybit".to_string(), 0.00012);
         m
     };
-    snap.exchange_health = {
+    let exchange_health = {
         let mut m = HashMap::new();
         m.insert("binance".to_string(), 0.5);
         m.insert("bybit".to_string(), 0.8);
         m.insert("okx".to_string(), 0.6);
         m
     };
-    snap.flow_signal = FlowSignal::Neutral;
-    snap
+
+    TickerSnapshot {
+        ticker: "BTC".to_string(),
+        binance_perp_last: Some(92000.0),
+        realized_vol_1h: Some(0.02),
+        realized_vol_trend: VolTrend::Stable,
+        atr_14_pct: Some(0.5),
+        cvd_5m_total: 500000.0,
+        cvd_per_exchange_5m,
+        funding_rate_by_exchange,
+        exchange_health,
+        flow_signal: FlowSignal::Neutral,
+        ..Default::default()
+    }
 }
 
 /// Create a chaotic market snapshot (high vol)
@@ -91,11 +96,17 @@ fn test_healthy_market_produces_ready_or_caution() {
 
     // Should have bias in non-Wait state
     if result.state.state != State::Wait {
-        assert!(result.state.bias.is_some(), "Non-Wait state should have bias");
+        assert!(
+            result.state.bias.is_some(),
+            "Non-Wait state should have bias"
+        );
     }
 
     // No gamma data means NO-GAMMA mode
-    assert!(result.no_gamma_mode, "Should be in NO-GAMMA mode without options");
+    assert!(
+        result.no_gamma_mode,
+        "Should be in NO-GAMMA mode without options"
+    );
 }
 
 #[test]

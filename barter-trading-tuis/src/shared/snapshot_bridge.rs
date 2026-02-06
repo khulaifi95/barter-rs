@@ -41,7 +41,10 @@ pub fn build_market_data_input(
 }
 
 /// Build VolRegimeScore from snapshot volatility data
-fn build_vol_score(snapshot: &TickerSnapshot, server_snapshot: Option<&SnapshotTicker>) -> VolRegimeScore {
+fn build_vol_score(
+    snapshot: &TickerSnapshot,
+    server_snapshot: Option<&SnapshotTicker>,
+) -> VolRegimeScore {
     // Use realized volatility if available
     let current_rv = snapshot.realized_vol_1h.unwrap_or(0.0);
 
@@ -86,7 +89,10 @@ fn build_vol_score(snapshot: &TickerSnapshot, server_snapshot: Option<&SnapshotT
 }
 
 /// Build FlowScore from CVD data across exchanges
-fn build_flow_score(snapshot: &TickerSnapshot, server_snapshot: Option<&SnapshotTicker>) -> FlowScore {
+fn build_flow_score(
+    snapshot: &TickerSnapshot,
+    server_snapshot: Option<&SnapshotTicker>,
+) -> FlowScore {
     let cvd_5m = &snapshot.cvd_per_exchange_5m;
 
     // Count venues with positive/negative CVD
@@ -122,7 +128,8 @@ fn build_flow_score(snapshot: &TickerSnapshot, server_snapshot: Option<&Snapshot
     // Both can indicate absorption-like behavior
     let absorption_detected = matches!(
         snapshot.flow_signal,
-        crate::shared::state::FlowSignal::Distribution | crate::shared::state::FlowSignal::Exhaustion
+        crate::shared::state::FlowSignal::Distribution
+            | crate::shared::state::FlowSignal::Exhaustion
     );
 
     // Calculate pass criteria (2/3 consensus)
@@ -144,7 +151,10 @@ fn build_flow_score(snapshot: &TickerSnapshot, server_snapshot: Option<&Snapshot
 }
 
 /// Build FundingScore from exchange funding rates
-fn build_funding_score(snapshot: &TickerSnapshot, server_snapshot: Option<&SnapshotTicker>) -> FundingScore {
+fn build_funding_score(
+    snapshot: &TickerSnapshot,
+    server_snapshot: Option<&SnapshotTicker>,
+) -> FundingScore {
     let (current_rate, rate_15m_ago, velocity) = if let Some(server) = server_snapshot {
         let rate_15m_ago = server.funding_rate - server.funding_velocity;
         (server.funding_rate, rate_15m_ago, server.funding_velocity)
@@ -152,16 +162,20 @@ fn build_funding_score(snapshot: &TickerSnapshot, server_snapshot: Option<&Snaps
         let rates = &snapshot.funding_rate_by_exchange;
 
         // Calculate average funding rate
-        let (sum, count) = rates.iter().fold((0.0, 0), |(sum, count), (_, &rate)| {
-            (sum + rate, count + 1)
-        });
+        let (sum, count) = rates
+            .iter()
+            .fold((0.0, 0), |(sum, count), (_, &rate)| (sum + rate, count + 1));
 
         let current_rate = if count > 0 { sum / count as f64 } else { 0.0 };
-        (current_rate, snapshot.funding_rate_15m_ago, snapshot.funding_velocity_15m)
+        (
+            current_rate,
+            snapshot.funding_rate_15m_ago,
+            snapshot.funding_velocity_15m,
+        )
     };
 
     // Thresholds from spec
-    let is_extreme = current_rate > 0.0005 || current_rate < -0.0002;
+    let is_extreme = !(-0.0002..=0.0005).contains(&current_rate);
     let is_spiking = false; // Threshold applied in MarketState with per-ticker config
 
     FundingScore {
@@ -174,7 +188,10 @@ fn build_funding_score(snapshot: &TickerSnapshot, server_snapshot: Option<&Snaps
     }
 }
 
-fn build_fuel_input(snapshot: &TickerSnapshot, server_snapshot: Option<&SnapshotTicker>) -> FuelInput {
+fn build_fuel_input(
+    snapshot: &TickerSnapshot,
+    server_snapshot: Option<&SnapshotTicker>,
+) -> FuelInput {
     if let Some(server) = server_snapshot {
         return FuelInput {
             rvol_5m: server.rvol_5m,
@@ -183,7 +200,10 @@ fn build_fuel_input(snapshot: &TickerSnapshot, server_snapshot: Option<&Snapshot
         };
     }
 
-    let spot = snapshot.binance_perp_last.or(snapshot.latest_price).unwrap_or(0.0);
+    let spot = snapshot
+        .binance_perp_last
+        .or(snapshot.latest_price)
+        .unwrap_or(0.0);
     let avg_5m = if snapshot.vol_1h > 0.0 {
         snapshot.vol_1h / 12.0
     } else {
@@ -253,8 +273,8 @@ pub fn build_all_inputs(
         .tickers
         .values()
         .map(|ticker_snap| {
-            let server_ticker = server_snapshot
-                .and_then(|snap| snap.tickers.get(&ticker_snap.ticker));
+            let server_ticker =
+                server_snapshot.and_then(|snap| snap.tickers.get(&ticker_snap.ticker));
             build_market_data_input(ticker_snap, server_ticker, trad_status)
         })
         .collect()
@@ -277,34 +297,35 @@ mod tests {
     use std::collections::HashMap;
 
     fn sample_snapshot() -> TickerSnapshot {
-        let mut snap = TickerSnapshot::default();
-        snap.ticker = "BTC".to_string();
-        snap.binance_perp_last = Some(92000.0);
-        snap.realized_vol_1h = Some(0.02);
-        snap.realized_vol_trend = VolTrend::Stable;
-        snap.atr_14_pct = Some(0.5);
-        snap.cvd_5m_total = 500000.0;
-        snap.cvd_per_exchange_5m = {
-            let mut m = HashMap::new();
-            m.insert("binance".to_string(), 300000.0);
-            m.insert("bybit".to_string(), 150000.0);
-            m.insert("okx".to_string(), 50000.0);
-            m
-        };
-        snap.funding_rate_by_exchange = {
-            let mut m = HashMap::new();
-            m.insert("binance".to_string(), 0.0001);
-            m.insert("bybit".to_string(), 0.00012);
-            m
-        };
-        snap.exchange_health = {
-            let mut m = HashMap::new();
-            m.insert("binance".to_string(), 0.5);
-            m.insert("bybit".to_string(), 0.8);
-            m
-        };
-        snap.flow_signal = FlowSignal::Neutral;
-        snap
+        TickerSnapshot {
+            ticker: "BTC".to_string(),
+            binance_perp_last: Some(92000.0),
+            realized_vol_1h: Some(0.02),
+            realized_vol_trend: VolTrend::Stable,
+            atr_14_pct: Some(0.5),
+            cvd_5m_total: 500000.0,
+            cvd_per_exchange_5m: {
+                let mut m = HashMap::new();
+                m.insert("binance".to_string(), 300000.0);
+                m.insert("bybit".to_string(), 150000.0);
+                m.insert("okx".to_string(), 50000.0);
+                m
+            },
+            funding_rate_by_exchange: {
+                let mut m = HashMap::new();
+                m.insert("binance".to_string(), 0.0001);
+                m.insert("bybit".to_string(), 0.00012);
+                m
+            },
+            exchange_health: {
+                let mut m = HashMap::new();
+                m.insert("binance".to_string(), 0.5);
+                m.insert("bybit".to_string(), 0.8);
+                m
+            },
+            flow_signal: FlowSignal::Neutral,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -351,7 +372,8 @@ mod tests {
     #[test]
     fn test_build_flow_score_mixed() {
         let mut snap = sample_snapshot();
-        snap.cvd_per_exchange_5m.insert("okx".to_string(), -100000.0);
+        snap.cvd_per_exchange_5m
+            .insert("okx".to_string(), -100000.0);
         let flow = build_flow_score(&snap, None);
 
         // 2 positive, 1 negative = 2/3 consensus

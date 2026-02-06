@@ -13,12 +13,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use barter_trading_tuis::shared::market_state::{Direction as FlowDirection, State, TradingBias};
 use barter_trading_tuis::{
     AggregatedSnapshot, Aggregator, ConnectionStatus, DivergenceSignal, FlowSignal,
     OrchestratorResult, Side, WebSocketClient, WebSocketConfig,
 };
-use barter_trading_tuis::shared::market_state::{Direction as FlowDirection, State, TradingBias};
-use rustls::crypto::ring::default_provider;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -32,8 +31,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
+use rustls::crypto::ring::default_provider;
 use serde::Deserialize;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{watch, Mutex};
 
 static TICKERS: OnceLock<Vec<String>> = OnceLock::new();
 
@@ -124,7 +124,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let aggregator = Arc::new(Mutex::new(Aggregator::new()));
     let connected = Arc::new(AtomicBool::new(false));
     // Watch channel for sharing MarketState from orchestrator to UI
-    let (state_tx, state_rx) = watch::channel::<HashMap<String, OrchestratorResult>>(HashMap::new());
+    let (state_tx, state_rx) =
+        watch::channel::<HashMap<String, OrchestratorResult>>(HashMap::new());
 
     // WebSocket client
     let ws_url = get_ws_url();
@@ -142,7 +143,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut state_map: HashMap<String, OrchestratorResult> = HashMap::new();
             while let Some(event) = event_rx.recv().await {
                 if event.kind == "orchestrator_result" {
-                    if let Ok(msg) = serde_json::from_value::<OrchestratorMessage>(event.data.clone()) {
+                    if let Ok(msg) =
+                        serde_json::from_value::<OrchestratorMessage>(event.data.clone())
+                    {
                         state_map.insert(msg.ticker, msg.result);
                         let _ = state_tx.send(state_map.clone());
                     }
@@ -314,7 +317,9 @@ fn render_market_state_panel(
 
         spans.push(Span::styled(
             format!("{} {} ", ticker, price_str),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
 
         if let Some(result) = result_opt {
@@ -329,7 +334,9 @@ fn render_market_state_panel(
 
             spans.push(Span::styled(
                 format!("{} ", state_str),
-                Style::default().fg(state_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(state_color)
+                    .add_modifier(Modifier::BOLD),
             ));
 
             // Bias (if present)
@@ -369,13 +376,13 @@ fn render_market_state_panel(
             // NO-GAMMA/NO-TRAD indicators
             if result.no_gamma_mode {
                 // Options data unavailable/stale for this ticker
-                spans.push(Span::styled(" [NO-OPTS]", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    " [NO-OPTS]",
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
         } else {
-            spans.push(Span::styled(
-                "INIT",
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled("INIT", Style::default().fg(Color::DarkGray)));
         }
 
         let line = Line::from(spans);
@@ -435,18 +442,20 @@ fn render_orderflow_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggrega
                 "STABLE"
             };
 
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{:3}:", ticker),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                format!("{:3}:", ticker),
+                Style::default().add_modifier(Modifier::BOLD),
+            )]));
             lines.push(Line::from(vec![
                 Span::raw("   1m "),
                 Span::styled(bar_1m, Style::default().fg(color_1m)),
                 Span::styled(
                     format!(" {} ", if imb_1m >= 50.0 { "BUY " } else { "SELL" }),
-                    Style::default().fg(if imb_1m >= 50.0 { Color::Green } else { Color::Red }),
+                    Style::default().fg(if imb_1m >= 50.0 {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
                 ),
                 Span::styled(
                     format!(" {:>3.0}% Δ {:>+.1}M/min  ", imb_1m, flow_1m / 1_000_000.0),
@@ -458,10 +467,19 @@ fn render_orderflow_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggrega
                 Span::styled(bar_5m, Style::default().fg(color_5m)),
                 Span::styled(
                     format!(" {} ", if imb_5m >= 50.0 { "BUY " } else { "SELL" }),
-                    Style::default().fg(if imb_5m >= 50.0 { Color::Green } else { Color::Red }),
+                    Style::default().fg(if imb_5m >= 50.0 {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
                 ),
                 Span::styled(
-                    format!(" {:>3.0}% Δ {:>+.1}M/min  {}", imb_5m, flow_5m / 1_000_000.0, trend),
+                    format!(
+                        " {:>3.0}% Δ {:>+.1}M/min  {}",
+                        imb_5m,
+                        flow_5m / 1_000_000.0,
+                        trend
+                    ),
                     Style::default().fg(color_5m),
                 ),
             ]));
@@ -511,7 +529,12 @@ fn render_exchange_intelligence(f: &mut ratatui::Frame, area: Rect, snapshot: &A
 
         // OI Section Header with better spacing
         lines.push(Line::from(vec![
-            Span::styled("OI Δ ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "OI Δ ",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("(5m/15m)", Style::default().fg(Color::DarkGray)),
         ]));
 
@@ -527,20 +550,57 @@ fn render_exchange_intelligence(f: &mut ratatui::Frame, area: Rect, snapshot: &A
             let delta_15m_usd = total_delta_15m_usd * share;
 
             // Color each value independently based on its own sign
-            let color_5m = if delta_5m_usd > 0.0 { Color::Green } else if delta_5m_usd < 0.0 { Color::Red } else { Color::Gray };
-            let color_15m = if delta_15m_usd > 0.0 { Color::Green } else if delta_15m_usd < 0.0 { Color::Red } else { Color::Gray };
-            let arrow = if delta_5m_usd > 0.0 { "↑" } else if delta_5m_usd < 0.0 { "↓" } else { "→" };
+            let color_5m = if delta_5m_usd > 0.0 {
+                Color::Green
+            } else if delta_5m_usd < 0.0 {
+                Color::Red
+            } else {
+                Color::Gray
+            };
+            let color_15m = if delta_15m_usd > 0.0 {
+                Color::Green
+            } else if delta_15m_usd < 0.0 {
+                Color::Red
+            } else {
+                Color::Gray
+            };
+            let arrow = if delta_5m_usd > 0.0 {
+                "↑"
+            } else if delta_5m_usd < 0.0 {
+                "↓"
+            } else {
+                "→"
+            };
 
             // Use OI freshness for dot color (green < 5s, yellow 5-15s, red > 15s)
-            let oi_age = t.oi_freshness_per_exchange.get(exch).copied().unwrap_or(999.0);
-            let oi_freshness_color = if oi_age < 5.0 { Color::Green } else if oi_age < 15.0 { Color::Yellow } else { Color::Red };
+            let oi_age = t
+                .oi_freshness_per_exchange
+                .get(exch)
+                .copied()
+                .unwrap_or(999.0);
+            let oi_freshness_color = if oi_age < 5.0 {
+                Color::Green
+            } else if oi_age < 15.0 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
 
             lines.push(Line::from(vec![
                 Span::styled(format!("  {:3}", exch), Style::default().fg(Color::Cyan)),
-                Span::styled(format!(" {:>2.0}%  ", share_pct), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:>7}", format_delta(delta_5m_usd)), Style::default().fg(color_5m)),
+                Span::styled(
+                    format!(" {:>2.0}%  ", share_pct),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("{:>7}", format_delta(delta_5m_usd)),
+                    Style::default().fg(color_5m),
+                ),
                 Span::styled("/", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<7} ", format_delta(delta_15m_usd)), Style::default().fg(color_15m)),
+                Span::styled(
+                    format!("{:<7} ", format_delta(delta_15m_usd)),
+                    Style::default().fg(color_15m),
+                ),
                 Span::styled(arrow, Style::default().fg(color_5m)),
                 Span::styled(" ●", Style::default().fg(oi_freshness_color)),
             ]));
@@ -550,13 +610,20 @@ fn render_exchange_intelligence(f: &mut ratatui::Frame, area: Rect, snapshot: &A
 
         // CVD Section Header
         lines.push(Line::from(vec![
-            Span::styled("CVD ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "CVD ",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("(5m/15m)", Style::default().fg(Color::DarkGray)),
         ]));
 
         // Per-exchange CVD - aggregate by abbreviated exchange name
-        let mut cvd_by_exch_5m: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
-        let mut cvd_by_exch_15m: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
+        let mut cvd_by_exch_5m: std::collections::HashMap<&str, f64> =
+            std::collections::HashMap::new();
+        let mut cvd_by_exch_15m: std::collections::HashMap<&str, f64> =
+            std::collections::HashMap::new();
 
         for (name, val) in &t.cvd_per_exchange_5m {
             let abbrev = abbreviate_exchange_for_display(name);
@@ -583,19 +650,43 @@ fn render_exchange_intelligence(f: &mut ratatui::Frame, area: Rect, snapshot: &A
             let cvd_15m = cvd_by_exch_15m.get(exch).copied().unwrap_or(0.0);
 
             // Color each value independently based on its own sign
-            let color_5m = if cvd_5m > 0.0 { Color::Green } else if cvd_5m < 0.0 { Color::Red } else { Color::Gray };
-            let color_15m = if cvd_15m > 0.0 { Color::Green } else if cvd_15m < 0.0 { Color::Red } else { Color::Gray };
+            let color_5m = if cvd_5m > 0.0 {
+                Color::Green
+            } else if cvd_5m < 0.0 {
+                Color::Red
+            } else {
+                Color::Gray
+            };
+            let color_15m = if cvd_15m > 0.0 {
+                Color::Green
+            } else if cvd_15m < 0.0 {
+                Color::Red
+            } else {
+                Color::Gray
+            };
 
             // Arrow based on 5m (short-term direction)
-            let arrow = if cvd_5m > 0.0 { "↑" } else if cvd_5m < 0.0 { "↓" } else { "→" };
+            let arrow = if cvd_5m > 0.0 {
+                "↑"
+            } else if cvd_5m < 0.0 {
+                "↓"
+            } else {
+                "→"
+            };
 
             let is_leader = exch == leader_exch;
 
             lines.push(Line::from(vec![
                 Span::styled(format!("  {:3}", exch), Style::default().fg(Color::Cyan)),
-                Span::styled(format!("       {:>7}", format_delta(cvd_5m)), Style::default().fg(color_5m)),
+                Span::styled(
+                    format!("       {:>7}", format_delta(cvd_5m)),
+                    Style::default().fg(color_5m),
+                ),
                 Span::styled("/", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<7} ", format_delta(cvd_15m)), Style::default().fg(color_15m)),
+                Span::styled(
+                    format!("{:<7} ", format_delta(cvd_15m)),
+                    Style::default().fg(color_15m),
+                ),
                 Span::styled(arrow, Style::default().fg(color_5m)),
                 if is_leader {
                     Span::styled(" ★", Style::default().fg(Color::Yellow))
@@ -614,14 +705,25 @@ fn render_exchange_intelligence(f: &mut ratatui::Frame, area: Rect, snapshot: &A
         let net_flow = bnc_5m + okx_5m + bbt_5m;
 
         // Count directions
-        let buying_count = [bnc_5m, okx_5m, bbt_5m].iter().filter(|&&x| x > 0.0).count();
-        let selling_count = [bnc_5m, okx_5m, bbt_5m].iter().filter(|&&x| x < 0.0).count();
+        let buying_count = [bnc_5m, okx_5m, bbt_5m]
+            .iter()
+            .filter(|&&x| x > 0.0)
+            .count();
+        let selling_count = [bnc_5m, okx_5m, bbt_5m]
+            .iter()
+            .filter(|&&x| x < 0.0)
+            .count();
 
         if buying_count == 3 {
             // All buying - strong bullish consensus
             lines.push(Line::from(vec![
                 Span::styled("  ✓ ", Style::default().fg(Color::Green)),
-                Span::styled("CONSENSUS ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "CONSENSUS ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("All BUYING ", Style::default().fg(Color::White)),
                 Span::styled(format_delta(net_flow), Style::default().fg(Color::Green)),
                 Span::styled(" (3/3)", Style::default().fg(Color::DarkGray)),
@@ -630,7 +732,10 @@ fn render_exchange_intelligence(f: &mut ratatui::Frame, area: Rect, snapshot: &A
             // All selling - strong bearish consensus
             lines.push(Line::from(vec![
                 Span::styled("  ✓ ", Style::default().fg(Color::Red)),
-                Span::styled("CONSENSUS ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "CONSENSUS ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("All SELLING ", Style::default().fg(Color::White)),
                 Span::styled(format_delta(net_flow), Style::default().fg(Color::Red)),
                 Span::styled(" (3/3)", Style::default().fg(Color::DarkGray)),
@@ -639,21 +744,53 @@ fn render_exchange_intelligence(f: &mut ratatui::Frame, area: Rect, snapshot: &A
             // Mixed signals - divergence
             let mut buyers: Vec<&str> = vec![];
             let mut sellers: Vec<&str> = vec![];
-            if bnc_5m > 0.0 { buyers.push("BNC"); } else if bnc_5m < 0.0 { sellers.push("BNC"); }
-            if okx_5m > 0.0 { buyers.push("OKX"); } else if okx_5m < 0.0 { sellers.push("OKX"); }
-            if bbt_5m > 0.0 { buyers.push("BBT"); } else if bbt_5m < 0.0 { sellers.push("BBT"); }
+            if bnc_5m > 0.0 {
+                buyers.push("BNC");
+            } else if bnc_5m < 0.0 {
+                sellers.push("BNC");
+            }
+            if okx_5m > 0.0 {
+                buyers.push("OKX");
+            } else if okx_5m < 0.0 {
+                sellers.push("OKX");
+            }
+            if bbt_5m > 0.0 {
+                buyers.push("BBT");
+            } else if bbt_5m < 0.0 {
+                sellers.push("BBT");
+            }
 
-            let buyer_str = if buyers.is_empty() { "none".to_string() } else { buyers.join("/") };
-            let seller_str = if sellers.is_empty() { "none".to_string() } else { sellers.join("/") };
+            let buyer_str = if buyers.is_empty() {
+                "none".to_string()
+            } else {
+                buyers.join("/")
+            };
+            let seller_str = if sellers.is_empty() {
+                "none".to_string()
+            } else {
+                sellers.join("/")
+            };
 
             lines.push(Line::from(vec![
                 Span::styled("  ⚠ ", Style::default().fg(Color::Yellow)),
-                Span::styled("MIXED ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "MIXED ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(format!("{} ", buyer_str), Style::default().fg(Color::Green)),
                 Span::styled("vs ", Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{} ", seller_str), Style::default().fg(Color::Red)),
                 Span::styled("Net:", Style::default().fg(Color::DarkGray)),
-                Span::styled(format_delta(net_flow), Style::default().fg(if net_flow > 0.0 { Color::Green } else { Color::Red })),
+                Span::styled(
+                    format_delta(net_flow),
+                    Style::default().fg(if net_flow > 0.0 {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
+                ),
             ]));
         }
     } else {
@@ -691,7 +828,7 @@ fn format_delta(value: f64) -> String {
     } else if abs >= 1.0 {
         format!("{:+.0}", value)
     } else {
-        "~0".to_string()  // Avoid showing +0 or -0 for tiny values
+        "~0".to_string() // Avoid showing +0 or -0 for tiny values
     }
 }
 
@@ -757,9 +894,15 @@ fn render_liquidation_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggre
                     Span::raw(format!("${:<6.0} ", cluster.price_level)),
                     Span::styled(bar, Style::default().fg(bar_color)),
                     Span::raw(format!(" {:>5} ", usd_display)),
-                    Span::styled(format!("{}L", cluster.long_count), Style::default().fg(Color::Green)),
+                    Span::styled(
+                        format!("{}L", cluster.long_count),
+                        Style::default().fg(Color::Green),
+                    ),
                     Span::raw("/"),
-                    Span::styled(format!("{}S", cluster.short_count), Style::default().fg(Color::Red)),
+                    Span::styled(
+                        format!("{}S", cluster.short_count),
+                        Style::default().fg(Color::Red),
+                    ),
                     if danger {
                         Span::styled(
                             " DANGER",
@@ -818,7 +961,9 @@ fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggr
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{} ", ticker),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("{:<8} ", price_str)),
                 // Speed indicator
@@ -861,9 +1006,24 @@ fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggr
             };
 
             // Build per-exchange OI breakdown string - convert to USD
-            let bnc_delta_usd = t.oi_delta_per_exchange_5m.get("BNC").copied().unwrap_or(0.0) * ticker_price;
-            let okx_delta_usd = t.oi_delta_per_exchange_5m.get("OKX").copied().unwrap_or(0.0) * ticker_price;
-            let bbt_delta_usd = t.oi_delta_per_exchange_5m.get("BBT").copied().unwrap_or(0.0) * ticker_price;
+            let bnc_delta_usd = t
+                .oi_delta_per_exchange_5m
+                .get("BNC")
+                .copied()
+                .unwrap_or(0.0)
+                * ticker_price;
+            let okx_delta_usd = t
+                .oi_delta_per_exchange_5m
+                .get("OKX")
+                .copied()
+                .unwrap_or(0.0)
+                * ticker_price;
+            let bbt_delta_usd = t
+                .oi_delta_per_exchange_5m
+                .get("BBT")
+                .copied()
+                .unwrap_or(0.0)
+                * ticker_price;
 
             let oi_breakdown = format!(
                 "BNC{} OKX{} BBT{}",
@@ -901,46 +1061,79 @@ fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggr
             ]));
 
             // VWAP line: daily | session [SESSION]
-            let vwap_daily_str = t.vwap_daily
+            let vwap_daily_str = t
+                .vwap_daily
                 .map(|v| format!("${:.2}", v))
                 .unwrap_or_else(|| "---".to_string());
-            let vwap_session_str = t.vwap_session
+            let vwap_session_str = t
+                .vwap_session
                 .map(|v| format!("${:.2}", v))
                 .unwrap_or_else(|| "---".to_string());
-            let session_label = t.current_session
-                .map(|s| s.label())
-                .unwrap_or("---");
-            let dev_str = t.vwap_daily_deviation
+            let session_label = t.current_session.map(|s| s.label()).unwrap_or("---");
+            let dev_str = t
+                .vwap_daily_deviation
                 .map(|d| format!("({:+.2}%)", d))
                 .unwrap_or_default();
-            let dev_color = t.vwap_daily_deviation
-                .map(|d| if d > 0.0 { Color::Green } else if d < 0.0 { Color::Red } else { Color::Gray })
+            let dev_color = t
+                .vwap_daily_deviation
+                .map(|d| {
+                    if d > 0.0 {
+                        Color::Green
+                    } else if d < 0.0 {
+                        Color::Red
+                    } else {
+                        Color::Gray
+                    }
+                })
                 .unwrap_or(Color::Gray);
 
             lines.push(Line::from(vec![
                 Span::styled(" dVWAP: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{} ", vwap_daily_str), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{} ", vwap_daily_str),
+                    Style::default().fg(Color::White),
+                ),
                 Span::styled(dev_str, Style::default().fg(dev_color)),
                 Span::styled(" sVWAP: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{} ", vwap_session_str), Style::default().fg(Color::Cyan)),
-                Span::styled(format!("[{}]", session_label), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} ", vwap_session_str),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("[{}]", session_label),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]));
 
             // tvVWAP line (TradingView style - HLC3 on 5m candles)
-            let tv_vwap_str = t.tv_vwap
+            let tv_vwap_str = t
+                .tv_vwap
                 .map(|v| format!("${:.2}", v))
                 .unwrap_or_else(|| "---".to_string());
-            let tv_dev_str = t.tv_vwap_deviation
+            let tv_dev_str = t
+                .tv_vwap_deviation
                 .map(|d| format!("({:+.2}%)", d))
                 .unwrap_or_default();
-            let tv_dev_color = t.tv_vwap_deviation
-                .map(|d| if d > 0.0 { Color::Green } else if d < 0.0 { Color::Red } else { Color::Gray })
+            let tv_dev_color = t
+                .tv_vwap_deviation
+                .map(|d| {
+                    if d > 0.0 {
+                        Color::Green
+                    } else if d < 0.0 {
+                        Color::Red
+                    } else {
+                        Color::Gray
+                    }
+                })
                 .unwrap_or(Color::Gray);
 
             if t.candles_5m_len >= 12 {
                 lines.push(Line::from(vec![
                     Span::styled(" tvVWAP: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("{} ", tv_vwap_str), Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{} ", tv_vwap_str),
+                        Style::default().fg(Color::Yellow),
+                    ),
                     Span::styled(tv_dev_str, Style::default().fg(tv_dev_color)),
                 ]));
             } else {
@@ -951,18 +1144,22 @@ fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggr
             }
 
             // ATR + Volatility line (compact)
-            let atr_str = t.atr_14
+            let atr_str = t
+                .atr_14
                 .map(|a| format!("${:.2}", a))
                 .unwrap_or_else(|| "---".to_string());
-            let atr_pct_str = t.atr_14_pct
+            let atr_pct_str = t
+                .atr_14_pct
                 .map(|p| format!("({:.2}%)", p))
                 .unwrap_or_default();
 
             // Realized volatility (30m/1h)
-            let rv_30m_str = t.realized_vol_30m
+            let rv_30m_str = t
+                .realized_vol_30m
                 .map(|v| format!("{:.2}%", v))
                 .unwrap_or_else(|| "---".to_string());
-            let rv_1h_str = t.realized_vol_1h
+            let rv_1h_str = t
+                .realized_vol_1h
                 .map(|v| format!("{:.2}%", v))
                 .unwrap_or_else(|| "---".to_string());
             let rv_arrow = t.realized_vol_trend.arrow();
@@ -976,9 +1173,15 @@ fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggr
             lines.push(Line::from(vec![
                 Span::styled(" ATR: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{} ", atr_str), Style::default().fg(Color::Magenta)),
-                Span::styled(format!("{} ", atr_pct_str), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} ", atr_pct_str),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(" RV: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{}/{}{} ", rv_30m_str, rv_1h_str, rv_arrow), Style::default().fg(rv_color)),
+                Span::styled(
+                    format!("{}/{}{} ", rv_30m_str, rv_1h_str, rv_arrow),
+                    Style::default().fg(rv_color),
+                ),
                 Span::styled(rv_label, Style::default().fg(rv_color)),
             ]));
 
@@ -992,8 +1195,16 @@ fn render_market_stats_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &Aggr
                 ("BAL", Color::Yellow)
             };
 
-            let bnc_imb = t.per_exchange_book_imbalance.get("BNC").copied().unwrap_or(50.0);
-            let bbt_imb = t.per_exchange_book_imbalance.get("BBT").copied().unwrap_or(50.0);
+            let bnc_imb = t
+                .per_exchange_book_imbalance
+                .get("BNC")
+                .copied()
+                .unwrap_or(50.0);
+            let bbt_imb = t
+                .per_exchange_book_imbalance
+                .get("BBT")
+                .copied()
+                .unwrap_or(50.0);
 
             // Only show if we have book data
             if !t.per_exchange_book_imbalance.is_empty() {
@@ -1072,7 +1283,7 @@ struct AggWhale {
 fn current_whale_threshold_hint(snapshot: &AggregatedSnapshot) -> f64 {
     let mut min_thr = f64::MAX;
     let mut found = false;
-    for (_ticker, snap) in &snapshot.tickers {
+    for snap in snapshot.tickers.values() {
         let avg = snap.avg_trade_usd_5m;
         if avg > 0.0 {
             let thr = (avg * whale_multiplier_display()).max(whale_floor_display());
@@ -1090,7 +1301,9 @@ fn current_whale_threshold_hint(snapshot: &AggregatedSnapshot) -> f64 {
 }
 
 fn render_whale_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedSnapshot) {
-    let mut block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan));
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
 
     let available_rows = area.height.saturating_sub(2) as usize;
     let display_limit = available_rows.max(5);
@@ -1176,8 +1389,8 @@ fn render_whale_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedS
     }
 
     let mut aggregated: Vec<AggWhale> = buckets
-        .into_iter()
-        .map(|(_, mut v)| {
+        .into_values()
+        .map(|mut v| {
             // Promote to mega if aggregated volume crosses threshold
             if v.volume_usd >= mega_threshold {
                 v.is_mega = true;
@@ -1188,9 +1401,11 @@ fn render_whale_panel(f: &mut ratatui::Frame, area: Rect, snapshot: &AggregatedS
 
     // Stable ordering: newest first, then larger volume
     aggregated.sort_by(|a, b| {
-        b.time
-            .cmp(&a.time)
-            .then_with(|| b.volume_usd.partial_cmp(&a.volume_usd).unwrap_or(std::cmp::Ordering::Equal))
+        b.time.cmp(&a.time).then_with(|| {
+            b.volume_usd
+                .partial_cmp(&a.volume_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
 
     let mut lines = Vec::new();
@@ -1302,15 +1517,24 @@ fn render_cvd_panel(
             // Header per ticker
             lines.push(Line::from(Span::styled(
                 format!("{}:", ticker),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )));
 
             // 1m line with velocity and flow signal
-            let cvd_1m_dir = if cvd_1m > 0.0 { "↑" } else if cvd_1m < 0.0 { "↓" } else { "→" };
+            let cvd_1m_dir = if cvd_1m > 0.0 {
+                "↑"
+            } else if cvd_1m < 0.0 {
+                "↓"
+            } else {
+                "→"
+            };
             let vel_1m_label = velocity_label(vel_1m, ticker);
 
             // Use 30s to detect early turning signal
-            let signal_30s_opposing = (cvd_30s > 0.0 && cvd_1m < 0.0) || (cvd_30s < 0.0 && cvd_1m > 0.0);
+            let signal_30s_opposing =
+                (cvd_30s > 0.0 && cvd_1m < 0.0) || (cvd_30s < 0.0 && cvd_1m > 0.0);
             let signal_30s_strong = cvd_30s.abs() > cvd_threshold(ticker) / 2.0;
 
             let (flow_label, flow_color) = if signal_30s_opposing && signal_30s_strong {
@@ -1319,7 +1543,13 @@ fn render_cvd_panel(
                 flow_signal_label(flow_signal)
             };
 
-            let cvd_1m_color = if cvd_1m > 0.0 { Color::Green } else if cvd_1m < 0.0 { Color::Red } else { Color::Gray };
+            let cvd_1m_color = if cvd_1m > 0.0 {
+                Color::Green
+            } else if cvd_1m < 0.0 {
+                Color::Red
+            } else {
+                Color::Gray
+            };
 
             lines.push(Line::from(vec![
                 Span::styled("  1m:  ", Style::default().fg(Color::DarkGray)),
@@ -1335,12 +1565,24 @@ fn render_cvd_panel(
             ]));
 
             // 5m line with divergence signal
-            let cvd_5m_dir = if cvd_5m > 0.0 { "↑" } else if cvd_5m < 0.0 { "↓" } else { "→" };
+            let cvd_5m_dir = if cvd_5m > 0.0 {
+                "↑"
+            } else if cvd_5m < 0.0 {
+                "↓"
+            } else {
+                "→"
+            };
             let vel_5m_label = velocity_label(vel_5m, ticker);
             let divergence_5m = divergence_from_dirs(price_dir_1m, cvd_5m_dir);
             let (div_label, div_color) = divergence_label(divergence_5m);
 
-            let cvd_5m_color = if cvd_5m > 0.0 { Color::Green } else if cvd_5m < 0.0 { Color::Red } else { Color::Gray };
+            let cvd_5m_color = if cvd_5m > 0.0 {
+                Color::Green
+            } else if cvd_5m < 0.0 {
+                Color::Red
+            } else {
+                Color::Gray
+            };
 
             lines.push(Line::from(vec![
                 Span::styled("  5m:  ", Style::default().fg(Color::DarkGray)),
@@ -1356,8 +1598,20 @@ fn render_cvd_panel(
             ]));
 
             // 15m line with velocity per minute
-            let cvd_15m_dir = if cvd_15m > 0.0 { "↑" } else if cvd_15m < 0.0 { "↓" } else { "→" };
-            let cvd_15m_color = if cvd_15m > 0.0 { Color::Green } else if cvd_15m < 0.0 { Color::Red } else { Color::Gray };
+            let cvd_15m_dir = if cvd_15m > 0.0 {
+                "↑"
+            } else if cvd_15m < 0.0 {
+                "↓"
+            } else {
+                "→"
+            };
+            let cvd_15m_color = if cvd_15m > 0.0 {
+                Color::Green
+            } else if cvd_15m < 0.0 {
+                Color::Red
+            } else {
+                Color::Gray
+            };
 
             lines.push(Line::from(vec![
                 Span::styled("  15m: ", Style::default().fg(Color::DarkGray)),
@@ -1396,9 +1650,9 @@ fn render_cvd_panel(
 /// Get CVD threshold for a ticker (used for 30s signal detection)
 fn cvd_threshold(ticker: &str) -> f64 {
     match ticker {
-        "BTC" => 10_000_000.0,  // $10M for BTC
-        "ETH" => 5_000_000.0,   // $5M for ETH
-        _ => 1_000_000.0,       // $1M for others
+        "BTC" => 10_000_000.0, // $10M for BTC
+        "ETH" => 5_000_000.0,  // $5M for ETH
+        _ => 1_000_000.0,      // $1M for others
     }
 }
 
@@ -1410,7 +1664,11 @@ fn velocity_label(velocity: f64, ticker: &str) -> &'static str {
         _ => 100_000.0,
     };
     if velocity.abs() > threshold * 2.0 {
-        if velocity > 0.0 { "ACCEL" } else { "DECEL" }
+        if velocity > 0.0 {
+            "ACCEL"
+        } else {
+            "DECEL"
+        }
     } else if velocity.abs() > threshold {
         "STEADY"
     } else {

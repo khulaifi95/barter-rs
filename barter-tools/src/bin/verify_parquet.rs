@@ -6,7 +6,7 @@
 //!   verify-parquet ./test.parquet
 //!   verify-parquet ./parquet/bars_1m --type bars --recursive
 
-use barter_tools::verify::{verify_bar_file, verify_trade_file, verify_directory};
+use barter_tools::verify::{verify_bar_file, verify_directory, verify_trade_file};
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -115,7 +115,10 @@ fn main() -> anyhow::Result<()> {
     println!("Files with errors: {}", total_errors);
 
     if total_errors > 0 {
-        println!("\n⚠ Verification found {} file(s) with issues", total_errors);
+        println!(
+            "\n⚠ Verification found {} file(s) with issues",
+            total_errors
+        );
         std::process::exit(1);
     } else {
         println!("\n✓ All files verified successfully!");

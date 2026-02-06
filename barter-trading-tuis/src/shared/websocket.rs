@@ -469,17 +469,18 @@ mod tests {
         assert_eq!(config.lag_stale_duration, Duration::from_secs(10));
         assert_eq!(config.reconnect_delay, Duration::from_secs(2));
         assert_eq!(config.channel_buffer_size, 1000);
-        assert!(!config.expect_envelope, "Default should be non-envelope format");
+        assert!(
+            !config.expect_envelope,
+            "Default should be non-envelope format"
+        );
     }
 
     #[test]
     fn test_expect_envelope_config() {
-        let config = WebSocketConfig::default()
-            .with_expect_envelope(true);
+        let config = WebSocketConfig::default().with_expect_envelope(true);
         assert!(config.expect_envelope);
 
-        let config_raw = WebSocketConfig::default()
-            .with_expect_envelope(false);
+        let config_raw = WebSocketConfig::default().with_expect_envelope(false);
         assert!(!config_raw.expect_envelope);
     }
 
@@ -563,15 +564,22 @@ mod tests {
         let parsed_raw: Result<MarketEventMessage, _> = serde_json::from_str(&envelope_json);
         // This should fail gracefully (no crash, just parse error)
         // The envelope has different fields, so parsing as raw will fail
-        assert!(parsed_raw.is_err(), "Should fail to parse envelope as raw format");
+        assert!(
+            parsed_raw.is_err(),
+            "Should fail to parse envelope as raw format"
+        );
 
         // Now test the reverse: raw sent, envelope expected
         let raw_json = serde_json::to_string(&event).unwrap();
         let parsed_envelope: Result<MarketEventEnvelope, _> = serde_json::from_str(&raw_json);
-        assert!(parsed_envelope.is_err(), "Should fail to parse raw as envelope format");
+        assert!(
+            parsed_envelope.is_err(),
+            "Should fail to parse raw as envelope format"
+        );
     }
 
     #[test]
+    #[allow(invalid_from_utf8)]
     fn test_invalid_utf8_binary_frame_handling() {
         // Simulate invalid UTF-8 bytes
         let invalid_bytes: &[u8] = &[0xFF, 0xFE, 0x00, 0x01];
@@ -605,14 +613,18 @@ mod tests {
         // Event with 5s lag (under threshold)
         let event_time_5s = chrono::DateTime::from_timestamp_millis(now_ms - 5_000).unwrap();
         let lag_5s = now_ms - event_time_5s.timestamp_millis();
-        assert!(lag_5s < config.lag_stale_threshold.as_millis() as i64,
-            "5s lag should be under 15s threshold");
+        assert!(
+            lag_5s < config.lag_stale_threshold.as_millis() as i64,
+            "5s lag should be under 15s threshold"
+        );
 
         // Event with 20s lag (over threshold)
         let event_time_20s = chrono::DateTime::from_timestamp_millis(now_ms - 20_000).unwrap();
         let lag_20s = now_ms - event_time_20s.timestamp_millis();
-        assert!(lag_20s >= config.lag_stale_threshold.as_millis() as i64,
-            "20s lag should exceed 15s threshold");
+        assert!(
+            lag_20s >= config.lag_stale_threshold.as_millis() as i64,
+            "20s lag should exceed 15s threshold"
+        );
     }
 
     #[test]
@@ -625,7 +637,8 @@ mod tests {
         assert!(is_welcome, "Should detect welcome message");
 
         // Non-welcome message
-        let trade_json = r#"{"time_exchange":"2024-01-01T00:00:00Z","exchange":"Test","kind":"trade"}"#;
+        let trade_json =
+            r#"{"time_exchange":"2024-01-01T00:00:00Z","exchange":"Test","kind":"trade"}"#;
         let is_not_welcome = !trade_json.contains(r#""type":"welcome"#);
         assert!(is_not_welcome, "Should not detect trade as welcome");
     }
@@ -635,40 +648,46 @@ mod tests {
     #[test]
     fn test_stale_timeout_should_trigger_reconnect() {
         // This tests the logic that triggers reconnection when no events arrive
-        let config = WebSocketConfig::default()
-            .with_stale_timeout(Duration::from_secs(15));
+        let config = WebSocketConfig::default().with_stale_timeout(Duration::from_secs(15));
 
         // Simulate: last event was 20 seconds ago
         let last_event = std::time::Instant::now() - Duration::from_secs(20);
 
         // This is the check from the actual code
         let should_reconnect = last_event.elapsed() > config.stale_timeout;
-        assert!(should_reconnect, "Should trigger reconnect when stale_timeout (15s) exceeded");
+        assert!(
+            should_reconnect,
+            "Should trigger reconnect when stale_timeout (15s) exceeded"
+        );
     }
 
     #[test]
     fn test_stale_timeout_should_not_trigger_prematurely() {
-        let config = WebSocketConfig::default()
-            .with_stale_timeout(Duration::from_secs(15));
+        let config = WebSocketConfig::default().with_stale_timeout(Duration::from_secs(15));
 
         // Simulate: last event was 10 seconds ago (under threshold)
         let last_event = std::time::Instant::now() - Duration::from_secs(10);
 
         let should_reconnect = last_event.elapsed() > config.stale_timeout;
-        assert!(!should_reconnect, "Should NOT trigger reconnect when under stale_timeout");
+        assert!(
+            !should_reconnect,
+            "Should NOT trigger reconnect when under stale_timeout"
+        );
     }
 
     #[test]
     fn test_trade_stale_timeout_trigger() {
-        let config = WebSocketConfig::default()
-            .with_trade_stale_timeout(Duration::from_secs(15));
+        let config = WebSocketConfig::default().with_trade_stale_timeout(Duration::from_secs(15));
 
         // Last trade was 20 seconds ago
         let last_trade_event = std::time::Instant::now() - Duration::from_secs(20);
 
         // This is the check from the actual code
         let should_reconnect = last_trade_event.elapsed() > config.trade_stale_timeout;
-        assert!(should_reconnect, "Should trigger reconnect when no trades for > trade_stale_timeout");
+        assert!(
+            should_reconnect,
+            "Should trigger reconnect when no trades for > trade_stale_timeout"
+        );
     }
 
     #[test]
@@ -685,29 +704,35 @@ mod tests {
 
         // First check: lag exceeds threshold, start timer
         let mut lag_breach_since: Option<Instant> = None;
-        if lag_ms >= threshold_ms {
-            if lag_breach_since.is_none() {
-                lag_breach_since = Some(Instant::now());
-            }
+        if lag_ms >= threshold_ms && lag_breach_since.is_none() {
+            lag_breach_since = Some(Instant::now());
         }
-        assert!(lag_breach_since.is_some(), "Should start lag breach timer when threshold exceeded");
+        assert!(
+            lag_breach_since.is_some(),
+            "Should start lag breach timer when threshold exceeded"
+        );
 
         // Simulate: breach has been ongoing for 5 seconds (under duration)
         // In real code, we'd wait; here we just check the logic
         let breach_start = Instant::now() - Duration::from_secs(5);
         let should_reconnect_5s = breach_start.elapsed() >= config.lag_stale_duration;
-        assert!(!should_reconnect_5s, "Should NOT reconnect after only 5s of lag (duration is 10s)");
+        assert!(
+            !should_reconnect_5s,
+            "Should NOT reconnect after only 5s of lag (duration is 10s)"
+        );
 
         // Simulate: breach has been ongoing for 12 seconds (over duration)
         let breach_start_12s = Instant::now() - Duration::from_secs(12);
         let should_reconnect_12s = breach_start_12s.elapsed() >= config.lag_stale_duration;
-        assert!(should_reconnect_12s, "Should reconnect after 12s of lag (duration is 10s)");
+        assert!(
+            should_reconnect_12s,
+            "Should reconnect after 12s of lag (duration is 10s)"
+        );
     }
 
     #[test]
     fn test_lag_breach_resets_when_lag_recovers() {
-        let config = WebSocketConfig::default()
-            .with_lag_stale_threshold(Duration::from_secs(15));
+        let config = WebSocketConfig::default().with_lag_stale_threshold(Duration::from_secs(15));
 
         let threshold_ms = config.lag_stale_threshold.as_millis() as i64;
 
@@ -720,21 +745,29 @@ mod tests {
             lag_breach_since = None; // Reset
         }
 
-        assert!(lag_breach_since.is_none(), "Lag breach should reset when lag recovers");
+        assert!(
+            lag_breach_since.is_none(),
+            "Lag breach should reset when lag recovers"
+        );
     }
 
     #[test]
     fn test_reconnect_delay_configuration() {
-        let config = WebSocketConfig::default()
-            .with_reconnect_delay(Duration::from_secs(5));
+        let config = WebSocketConfig::default().with_reconnect_delay(Duration::from_secs(5));
 
-        assert_eq!(config.reconnect_delay, Duration::from_secs(5),
-            "Reconnect delay should be configurable");
+        assert_eq!(
+            config.reconnect_delay,
+            Duration::from_secs(5),
+            "Reconnect delay should be configurable"
+        );
 
         // Default is 2 seconds
         let default_config = WebSocketConfig::default();
-        assert_eq!(default_config.reconnect_delay, Duration::from_secs(2),
-            "Default reconnect delay should be 2 seconds");
+        assert_eq!(
+            default_config.reconnect_delay,
+            Duration::from_secs(2),
+            "Default reconnect delay should be 2 seconds"
+        );
     }
 
     #[test]
@@ -761,7 +794,10 @@ mod tests {
 
         // Any of these should trigger reconnect
         let should_reconnect = general_stale || trade_stale || lag_stale;
-        assert!(should_reconnect, "At least one stale condition should trigger reconnect");
+        assert!(
+            should_reconnect,
+            "At least one stale condition should trigger reconnect"
+        );
 
         // Verify each individually
         assert!(general_stale, "General stale should be true");
