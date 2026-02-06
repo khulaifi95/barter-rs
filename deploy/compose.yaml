@@ -51,6 +51,6 @@ services:
       - jupyter
 
 volumes:
-  parquet-data:
-  ipc-socket:
-  catalog:
+  parquet-data: {}
+  ipc-socket: {}
+  catalog: {}
