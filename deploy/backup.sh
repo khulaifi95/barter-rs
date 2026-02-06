@@ -2,7 +2,7 @@
 # deploy/backup.sh — Compress old parquet data and rotate local backups
 #
 # Runs daily via cron at 00:05 UTC:
-#   5 0 * * * /home/deploy/barter/backup.sh >> /data/backups/backup.log 2>&1
+#   5 0 * * * /home/deployer/barter/backup.sh >> /data/backups/backup.log 2>&1
 
 set -euo pipefail
 

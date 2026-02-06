@@ -4,7 +4,7 @@
 # Prerequisites:
 #   - musl-cross installed: brew install filosottile/musl-cross/musl-cross
 #   - Rust target added: rustup target add x86_64-unknown-linux-musl
-#   - SSH access to VPS: ssh deploy@$VPS_HOST
+#   - SSH access to VPS: ssh deployer@$VPS_HOST
 #
 # Usage:
 #   ./deploy/deploy.sh              # full deploy (build + transfer + restart)
@@ -18,8 +18,8 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEPLOY_DIR="$SCRIPT_DIR"
 
 # ── Configuration ──────────────────────────────────────────────
-VPS_HOST="${VPS_HOST:-deploy@vps}"
-VPS_DEPLOY_DIR="/home/deploy/barter"
+VPS_HOST="${VPS_HOST:-deployer@vps}"
+VPS_DEPLOY_DIR="/home/deployer/barter"
 MUSL_TARGET="x86_64-unknown-linux-musl"
 BINARY_NAME="barter-data-server"
 BINARY_SRC="$PROJECT_DIR/target/$MUSL_TARGET/release/$BINARY_NAME"

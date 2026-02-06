@@ -19,7 +19,7 @@ services:
       - parquet-data:/data/parquet:rw
       - ipc-socket:/data/ipc:rw
     healthcheck:
-      test: ["CMD", "sh", "-c", "test -f /data/ipc/collector-heartbeat.json"]
+      test: "test -f /data/ipc/collector-heartbeat.json"
       interval: 60s
       timeout: 5s
       retries: 3
