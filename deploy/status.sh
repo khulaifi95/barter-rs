@@ -59,12 +59,17 @@ check_heartbeat() {
         exit_code=1
     fi
 
-    # Check barter-features container (if it exists)
+    # Check barter-features container
     if podman ps -a --format "{{.Names}}" 2>/dev/null | grep -q "^barter-features$"; then
+        # Container exists — verify it's running
         if ! podman ps --format "{{.Names}}" 2>/dev/null | grep -q "^barter-features$"; then
             echo "ALERT: barter-features container exists but is not running"
             exit_code=1
         fi
+    elif [ -f "$HOME/barter/compose.yaml" ] && grep -q "barter-features:" "$HOME/barter/compose.yaml" 2>/dev/null; then
+        # Compose defines barter-features but container doesn't exist at all
+        echo "ALERT: barter-features configured in compose.yaml but container does not exist"
+        exit_code=1
     fi
 
     return $exit_code
