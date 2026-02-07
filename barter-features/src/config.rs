@@ -385,8 +385,8 @@ impl Config {
 
     /// Create configuration from environment variables.
     pub fn from_env() -> Result<Self> {
-        let input_dir =
-            std::env::var("BARTER_FEATURES_INPUT_DIR").unwrap_or_else(|_| "/data/raw".to_string());
+        let input_dir = std::env::var("BARTER_FEATURES_INPUT_DIR")
+            .unwrap_or_else(|_| "/data/parquet".to_string());
         let output_dir = std::env::var("BARTER_FEATURES_OUTPUT_DIR")
             .unwrap_or_else(|_| "/data/features".to_string());
         let checkpoint_dir = std::env::var("BARTER_FEATURES_CHECKPOINT_DIR")

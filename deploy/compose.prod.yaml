@@ -8,6 +8,9 @@ services:
   barter-server:
     cpuset_cpus: "0-1"
 
+  barter-features:
+    cpuset_cpus: "2-3"
+
   nautilus:
     cpuset_cpus: "2-3"
 
@@ -27,6 +30,18 @@ volumes:
       type: none
       o: bind
       device: /data/ipc
+  features-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/features
+  checkpoints-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/_checkpoints
   catalog:
     driver: local
     driver_opts:

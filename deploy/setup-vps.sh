@@ -35,7 +35,7 @@ else
 fi
 
 echo "==> Creating data directories..."
-mkdir -p /data/parquet /data/ipc /data/catalog /data/backups
+mkdir -p /data/parquet /data/ipc /data/catalog /data/features /data/_checkpoints /data/backups
 chown -R deployer:deployer /data
 
 echo "==> Configuring journald log rotation (max 500MB)..."
@@ -62,12 +62,17 @@ echo "  Backup cron set: daily at 00:05 UTC"
 
 echo "==> Setting up disk monitor cron..."
 DISK_CRON="*/30 * * * * /home/deployer/barter/status.sh --check-disk >> /data/backups/disk-monitor.log 2>&1"
-(crontab -u deployer -l 2>/dev/null | grep -v status.sh; echo "$DISK_CRON") | crontab -u deployer -
+(crontab -u deployer -l 2>/dev/null | grep -v "check-disk"; echo "$DISK_CRON") | crontab -u deployer -
 echo "  Disk monitor cron set: every 30 minutes"
+
+echo "==> Setting up heartbeat watchdog cron..."
+HB_CRON="*/5 * * * * /home/deployer/barter/status.sh --check-heartbeat >> /data/backups/heartbeat-monitor.log 2>&1"
+(crontab -u deployer -l 2>/dev/null | grep -v "check-heartbeat"; echo "$HB_CRON") | crontab -u deployer -
+echo "  Heartbeat watchdog cron set: every 5 minutes"
 
 echo ""
 echo "==> VPS setup complete!"
-echo "    Data dirs:  /data/{parquet,ipc,catalog,backups}"
+echo "    Data dirs:  /data/{parquet,ipc,catalog,features,_checkpoints,backups}"
 echo "    Deploy dir: /home/deployer/barter/ (created on first deploy)"
 echo "    Firewall:   SSH only (port 22)"
 echo "    Next step:  Run ./deploy/deploy.sh from your Mac"

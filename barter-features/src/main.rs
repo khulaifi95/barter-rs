@@ -11,8 +11,8 @@ use tracing_subscriber::FmtSubscriber;
 #[command(name = "barter-features")]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Input directory containing raw parquet files
-    #[arg(long, default_value = "/data/raw")]
+    /// Input directory containing parquet files from barter-data-server
+    #[arg(long, default_value = "/data/parquet")]
     input: PathBuf,
 
     /// Output directory for computed features

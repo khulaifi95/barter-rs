@@ -1,7 +1,7 @@
 # deploy/compose.yaml
-# Podman Compose for barter-data-server + nautilus-trader
+# Podman Compose for barter-data-server + barter-features + nautilus-trader
 #
-# Phase 1: Binance BTCUSDT-PERP only, no L2, IPC on persistent volume
+# Phase 1: Binance BTCUSDT-PERP only, L2 compute, IPC on persistent volume
 #
 # Usage (local):
 #   podman-compose -f deploy/compose.yaml up -d barter-server
@@ -25,12 +25,32 @@ services:
       retries: 3
       start_period: 90s
 
+  barter-features:
+    image: localhost/barter-features:latest
+    container_name: barter-features
+    restart: always
+    volumes:
+      - parquet-data:/data/parquet:ro
+      - features-data:/data/features:rw
+      - checkpoints-data:/data/_checkpoints:rw
+    command: ["--input", "/data/parquet", "--output", "/data/features", "--mode", "watch"]
+    depends_on:
+      barter-server:
+        condition: service_started
+    healthcheck:
+      test: "test -f /data/_checkpoints/features_state.json"
+      interval: 120s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+
   nautilus:
     image: localhost/nautilus-trader:latest
     container_name: nautilus
     restart: "no"
     volumes:
       - parquet-data:/data/parquet:ro
+      - features-data:/data/features:ro
       - ipc-socket:/data/ipc:rw
       - catalog:/data/catalog:rw
     depends_on:
@@ -45,6 +65,7 @@ services:
       - "127.0.0.1:8888:8888"
     volumes:
       - parquet-data:/data/parquet:ro
+      - features-data:/data/features:ro
       - catalog:/data/catalog:rw
     command: ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--NotebookApp.token=''"]
     profiles:
@@ -53,4 +74,6 @@ services:
 volumes:
   parquet-data: {}
   ipc-socket: {}
+  features-data: {}
+  checkpoints-data: {}
   catalog: {}

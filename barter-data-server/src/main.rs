@@ -45,7 +45,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{
     Arc,
-    atomic::{AtomicI64, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
 };
 use std::time::Instant;
 #[cfg(unix)]
@@ -2115,6 +2115,43 @@ async fn main() {
     } else {
         stream_filter
     };
+    // Log stream filter state at startup
+    info!(
+        "Stream filter: l2={}, trades={}, l1={}, oi={}, liq={}, cvd={}, funding={}, spot={}, perp={}",
+        stream_filter.allow_l2,
+        stream_filter.allow_trades,
+        stream_filter.allow_l1,
+        stream_filter.allow_oi,
+        stream_filter.allow_liq,
+        stream_filter.allow_cvd,
+        stream_filter.allow_funding,
+        stream_filter.allow_spot,
+        stream_filter.allow_perp
+    );
+
+    // Warn if L2 is off but extended bars are enabled (depth bands will be zero)
+    if !stream_filter.allow_l2 && parquet_filter.write_extended {
+        warn!(
+            "STREAM_L2 is disabled but PARQUET_WRITE_EXTENDED is on: \
+             depth band columns will be zero in extended bars"
+        );
+    }
+
+    // Depth-band health check flag: set to true when compute_depth_bands() returns Some
+    let depth_bands_seen = Arc::new(AtomicBool::new(false));
+    if stream_filter.allow_l2 && parquet_filter.write_extended {
+        let flag = Arc::clone(&depth_bands_seen);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            if !flag.load(Ordering::Relaxed) {
+                warn!(
+                    "STREAM_L2 is enabled but no depth bands have been computed after 5 minutes; \
+                     check that L2 order book data is arriving"
+                );
+            }
+        });
+    }
+
     let streams = init_market_streams(&stream_filter).await;
 
     // Combine WebSocket and REST API streams
@@ -2538,6 +2575,9 @@ async fn main() {
                                         let cache = l2_book_cache.lock().await;
                                         cache.get(&instrument_id).and_then(compute_depth_bands)
                                     };
+                                    if depth_bands.is_some() {
+                                        depth_bands_seen.store(true, Ordering::Relaxed);
+                                    }
 
                                     // Also create and send extended bar (Barter-only, with CVD/delta)
                                     let extended_bar = {

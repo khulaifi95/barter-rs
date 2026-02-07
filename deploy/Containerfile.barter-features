@@ -1,0 +1,29 @@
+# Containerfile.barter-features
+# Alpine-based container for pre-compiled static musl binary
+# Build context: deploy/ directory (binary must be pre-built)
+#
+# Usage:
+#   cargo build -p barter-features --bin barter-features \
+#     --target x86_64-unknown-linux-musl --release
+#   cp target/x86_64-unknown-linux-musl/release/barter-features deploy/
+#   podman build -f deploy/Containerfile.barter-features -t barter-features:latest deploy/
+
+FROM alpine:3.21
+
+# ca-certificates for any future HTTPS needs
+RUN apk add --no-cache ca-certificates
+
+# Create non-root user
+RUN adduser -D -h /app barter
+USER barter
+WORKDIR /app
+
+# Copy pre-built static binary
+COPY --chown=barter:barter barter-features /app/barter-features
+
+# Data directories created at runtime via volume mounts:
+#   /data/parquet       - input (read-only, from barter-data-server)
+#   /data/features      - output (read-write)
+#   /data/_checkpoints  - checkpoint state (read-write)
+
+ENTRYPOINT ["/app/barter-features"]

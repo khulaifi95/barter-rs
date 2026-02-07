@@ -3,7 +3,7 @@
 
 [general]
 schema_version = "1.2.0"
-input_dir = "/data/raw"
+input_dir = "/data/parquet"
 output_dir = "/data/features"
 checkpoint_dir = "/data/_checkpoints"
 mode = "watch"
