@@ -34,6 +34,10 @@ else
     echo "  User 'deployer' already exists"
 fi
 
+echo "==> Enabling linger for deployer (rootless podman survives reboot)..."
+loginctl enable-linger deployer
+echo "  Linger enabled"
+
 echo "==> Creating data directories..."
 mkdir -p /data/parquet /data/ipc /data/catalog /data/features /data/_checkpoints /data/backups
 chown -R deployer:deployer /data
