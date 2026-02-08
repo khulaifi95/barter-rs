@@ -2823,8 +2823,10 @@ async fn main() {
                         if let Some(frame) = serialize_for_uds(&message) {
                             let _ = tx_uds.send(frame);
                         }
-                        if let Some(bytes) = serialize_for_broadcast(&broadcast_config, message) {
-                            let _ = tx_l2.send(bytes); // Ignore errors if no receivers
+                        if tx_l2.receiver_count() > 0
+                            && let Some(bytes) = serialize_for_broadcast(&broadcast_config, message)
+                        {
+                            let _ = tx_l2.send(bytes);
                         }
                         continue; // Don't fall through to trade channel
                     }
@@ -2955,30 +2957,17 @@ async fn main() {
                     }
 
                     // Broadcast to trade channel (hot path - NO L2 here)
-                    // Pre-serialized to avoid per-client JSON serialization overhead
-                    if let Some(bytes) = serialize_for_broadcast(&broadcast_config, message) {
+                    // Skip serialization + send when no WS subscribers (avoids
+                    // per-message JSON allocation and warn-level log spam)
+                    if tx_trades.receiver_count() > 0
+                        && let Some(bytes) = serialize_for_broadcast(&broadcast_config, message)
+                    {
                         match tx_trades.send(bytes) {
                             Ok(count) => {
-                                if is_trade {
-                                    debug!("Trade sent to {} receivers", count);
-                                }
-                                if is_liquidation {
-                                    debug!("Liquidation sent to {} receivers", count);
-                                }
-                                if is_open_interest {
-                                    debug!("OpenInterest sent to {} receivers", count);
-                                }
+                                debug!("Broadcast sent to {} receivers", count);
                             }
                             Err(e) => {
-                                if is_trade {
-                                    warn!("Failed to broadcast trade: {:?}", e);
-                                }
-                                if is_liquidation {
-                                    warn!("Failed to broadcast liquidation: {:?}", e);
-                                }
-                                if is_open_interest {
-                                    warn!("Failed to broadcast open_interest: {:?}", e);
-                                }
+                                debug!("Broadcast send failed (subscriber disconnected): {:?}", e);
                             }
                         }
                     }

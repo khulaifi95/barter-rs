@@ -66,14 +66,14 @@ services:
     volumes:
       - parquet-data:/data/parquet:ro
       - features-data:/data/features:ro
+      - notebooks-data:/home/jovyan/work:rw
       - catalog:/data/catalog:rw
-    command: ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--NotebookApp.token=''"]
-    profiles:
-      - jupyter
+    command: ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--NotebookApp.token=''", "--notebook-dir=/home/jovyan/work"]
 
 volumes:
   parquet-data: {}
   ipc-socket: {}
   features-data: {}
   checkpoints-data: {}
+  notebooks-data: {}
   catalog: {}

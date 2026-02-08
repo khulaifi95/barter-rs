@@ -42,6 +42,12 @@ volumes:
       type: none
       o: bind
       device: /data/_checkpoints
+  notebooks-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/notebooks
   catalog:
     driver: local
     driver_opts:
