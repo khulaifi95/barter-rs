@@ -1,0 +1,24 @@
+# Containerfile.jupyter
+# Stock Jupyter scipy-notebook with nautilus_trader + pyarrow
+#
+# Uses the official jupyter/scipy-notebook base which ships a fully
+# working JupyterLab build (no broken static assets).
+#
+# Build on VPS (not cross-compiled — pure Python):
+#   podman build --platform linux/amd64 \
+#     -f Containerfile.jupyter -t barter-jupyter:latest .
+
+FROM quay.io/jupyter/scipy-notebook:python-3.12
+
+USER root
+
+# Install trading/data packages not included in scipy-notebook
+RUN pip install --no-cache-dir \
+    nautilus_trader \
+    pyarrow \
+    msgpack
+
+USER ${NB_UID}
+
+# Default: JupyterLab on port 8888 (inherited from base image)
+# Token controlled via JUPYTER_TOKEN env var in compose

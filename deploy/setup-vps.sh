@@ -39,7 +39,7 @@ loginctl enable-linger deployer
 echo "  Linger enabled"
 
 echo "==> Creating data directories..."
-mkdir -p /data/parquet /data/ipc /data/catalog /data/features /data/_checkpoints /data/backups
+mkdir -p /data/parquet /data/ipc /data/catalog /data/features /data/_checkpoints /data/backups /data/notebooks
 chown -R deployer:deployer /data
 
 echo "==> Configuring journald log rotation (max 500MB)..."
@@ -76,7 +76,7 @@ echo "  Heartbeat watchdog cron set: every 5 minutes"
 
 echo ""
 echo "==> VPS setup complete!"
-echo "    Data dirs:  /data/{parquet,ipc,catalog,features,_checkpoints,backups}"
+echo "    Data dirs:  /data/{parquet,ipc,catalog,features,_checkpoints,backups,notebooks}"
 echo "    Deploy dir: /home/deployer/barter/ (created on first deploy)"
 echo "    Firewall:   SSH only (port 22)"
 echo "    Next step:  Run ./deploy/deploy.sh from your Mac"

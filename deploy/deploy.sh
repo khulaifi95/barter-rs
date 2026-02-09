@@ -12,6 +12,7 @@
 #   ./deploy/deploy.sh --build-only # just cross-compile, don't deploy
 #   ./deploy/deploy.sh --server-only # only deploy barter-server
 #   ./deploy/deploy.sh --features-only # only deploy barter-features
+#   ./deploy/deploy.sh --jupyter-only # only build+deploy jupyter image (on VPS)
 
 set -euo pipefail
 
@@ -35,14 +36,16 @@ SKIP_BUILD=false
 BUILD_ONLY=false
 SERVER_ONLY=false
 FEATURES_ONLY=false
+JUPYTER_ONLY=false
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=true ;;
         --build-only) BUILD_ONLY=true ;;
         --server-only) SERVER_ONLY=true ;;
         --features-only) FEATURES_ONLY=true ;;
+        --jupyter-only) JUPYTER_ONLY=true ;;
         --help|-h)
-            echo "Usage: $0 [--skip-build] [--build-only] [--server-only] [--features-only]"
+            echo "Usage: $0 [--skip-build] [--build-only] [--server-only] [--features-only] [--jupyter-only]"
             exit 0
             ;;
     esac
@@ -51,11 +54,18 @@ done
 # Determine which components to deploy
 DEPLOY_SERVER=true
 DEPLOY_FEATURES=true
+DEPLOY_JUPYTER=false
 if [ "$SERVER_ONLY" = true ]; then
     DEPLOY_FEATURES=false
 fi
 if [ "$FEATURES_ONLY" = true ]; then
     DEPLOY_SERVER=false
+fi
+if [ "$JUPYTER_ONLY" = true ]; then
+    DEPLOY_SERVER=false
+    DEPLOY_FEATURES=false
+    DEPLOY_JUPYTER=true
+    SKIP_BUILD=true   # no Rust cross-compile needed
 fi
 
 # ── Step 1: Cross-compile ─────────────────────────────────────
@@ -133,6 +143,7 @@ scp "$DEPLOY_DIR/compose.prod.yaml" "$VPS_HOST:$VPS_DEPLOY_DIR/"
 scp "$DEPLOY_DIR/.env.production" "$VPS_HOST:$VPS_DEPLOY_DIR/"
 scp "$DEPLOY_DIR/status.sh" "$VPS_HOST:$VPS_DEPLOY_DIR/"
 scp "$DEPLOY_DIR/backup.sh" "$VPS_HOST:$VPS_DEPLOY_DIR/"
+scp "$DEPLOY_DIR/Containerfile.jupyter" "$VPS_HOST:$VPS_DEPLOY_DIR/"
 
 if [ "$DEPLOY_SERVER" = true ]; then
     scp "$DEPLOY_DIR/barter-server.tar.gz" "$VPS_HOST:$VPS_DEPLOY_DIR/"
@@ -165,6 +176,12 @@ if [ -f barter-features.tar.gz ]; then
     rm barter-features.tar.gz
 fi
 
+# Build jupyter image on VPS (pure Python, no cross-compile needed)
+if [ "$DEPLOY_JUPYTER" = true ]; then
+    echo "  Building barter-jupyter image on VPS (this may take a few minutes)..."
+    podman build -f Containerfile.jupyter -t barter-jupyter:latest .
+fi
+
 # Restart updated services
 if [ "$DEPLOY_SERVER" = true ]; then
     echo "  Restarting barter-server..."
@@ -180,17 +197,38 @@ if [ "$DEPLOY_FEATURES" = true ]; then
     podman-compose -f compose.yaml -f compose.prod.yaml up -d barter-features
 fi
 
+if [ "$DEPLOY_JUPYTER" = true ]; then
+    echo "  Restarting jupyter..."
+    podman-compose -f compose.yaml -f compose.prod.yaml stop jupyter 2>/dev/null || true
+    podman rm -f jupyter 2>/dev/null || true
+    podman-compose -f compose.yaml -f compose.prod.yaml up -d jupyter
+fi
+
 # Wait for healthcheck
-echo "  Waiting for health check (up to 120s)..."
-for i in \$(seq 1 12); do
-    sleep 10
-    if [ -f /data/ipc/collector-heartbeat.json ]; then
-        echo "  Heartbeat file found after \${i}0s"
-        cat /data/ipc/collector-heartbeat.json | python3 -m json.tool 2>/dev/null || cat /data/ipc/collector-heartbeat.json
-        break
+if [ "$DEPLOY_SERVER" = true ] || [ "$DEPLOY_FEATURES" = true ]; then
+    echo "  Waiting for health check (up to 120s)..."
+    for i in \$(seq 1 12); do
+        sleep 10
+        if [ -f /data/ipc/collector-heartbeat.json ]; then
+            echo "  Heartbeat file found after \${i}0s"
+            cat /data/ipc/collector-heartbeat.json | python3 -m json.tool 2>/dev/null || cat /data/ipc/collector-heartbeat.json
+            break
+        fi
+        echo "  Waiting... (\${i}0s)"
+    done
+fi
+
+if [ "$DEPLOY_JUPYTER" = true ]; then
+    echo "  Waiting for jupyter to start (up to 30s)..."
+    sleep 5
+    if podman ps --format "{{.Names}}" | grep -q "^jupyter\$"; then
+        echo "  Jupyter container running"
+        podman logs --tail 5 jupyter 2>/dev/null || true
+    else
+        echo "  WARNING: Jupyter container not running yet"
+        podman logs --tail 10 jupyter 2>/dev/null || true
     fi
-    echo "  Waiting... (\${i}0s)"
-done
+fi
 
 echo "  Container status:"
 podman ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"

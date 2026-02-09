@@ -165,6 +165,17 @@ TOTAL_FILES=$(find "$PARQUET_DIR" -name "*.parquet" 2>/dev/null | wc -l)
 echo "  Total parquet files: $TOTAL_FILES"
 echo ""
 
+# Jupyter status
+echo "── Jupyter ──"
+if podman ps --format "{{.Names}}" 2>/dev/null | grep -q "^jupyter$"; then
+    echo "  Container: RUNNING"
+    JUPYTER_PORT=$(podman port jupyter 2>/dev/null | head -1)
+    echo "  Port: ${JUPYTER_PORT:-unknown}"
+else
+    echo "  Container: NOT RUNNING"
+fi
+echo ""
+
 # Recent logs
 echo "── Recent Logs (barter-server, last 20 lines) ──"
 podman logs --tail 20 barter-server 2>/dev/null || echo "  No logs available"

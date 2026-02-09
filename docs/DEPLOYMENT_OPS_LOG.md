@@ -1,5 +1,55 @@
 # Deployment Operations Log
 
+## 2026-02-09: Fix JupyterLab White-Screen (Dedicated Jupyter Image)
+
+**Problem:** JupyterLab container uses `nautilus-trader:latest` image which has a broken Lab build — 404 on `/static/lab/static/remoteEntry.*.js`, resulting in white screen.
+
+**Root cause:** The `Containerfile.nautilus` installs `jupyter` (classic notebook package) but the Lab UI static assets are missing or corrupt in the resulting image.
+
+**Fix:** Create a dedicated `barter-jupyter` image based on `quay.io/jupyter/scipy-notebook:python-3.12`, which ships a fully working JupyterLab build.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `deploy/Containerfile.jupyter` | **NEW** — scipy-notebook base + nautilus_trader, pyarrow, msgpack |
+| `deploy/compose.yaml` | jupyter service → `localhost/barter-jupyter:latest`, use `JUPYTER_TOKEN` env var |
+| `deploy/compose.prod.yaml` | No changes needed (CPU pinning + volume binds already correct) |
+| `deploy/deploy.sh` | Added `--jupyter-only` flag; builds image ON VPS (pure Python, no cross-compile) |
+| `deploy/status.sh` | Added jupyter container status to full report |
+| `deploy/setup-vps.sh` | Added `/data/notebooks` to directory creation |
+
+### Deploy Command
+
+```bash
+# First time (or after Containerfile changes):
+./deploy/deploy.sh --jupyter-only
+
+# Verify on VPS:
+ssh deployer@46.62.142.15 'podman ps | grep jupyter'
+ssh deployer@46.62.142.15 'podman logs --tail 5 jupyter'
+```
+
+### Access
+
+```bash
+# SSH tunnel from local machine:
+ssh -L 8888:127.0.0.1:8888 ops1@46.62.142.15 -N
+
+# Open in browser:
+# http://localhost:8888/lab
+```
+
+### Notes
+
+- Image is built on VPS (not cross-compiled) since it's pure Python — avoids platform wheel mismatch
+- scipy-notebook includes pandas, numpy, scipy, matplotlib, seaborn + working JupyterLab
+- nautilus_trader, pyarrow, msgpack installed on top via pip
+- No authentication token (loopback-only access via SSH tunnel)
+- Notebooks persist at `/data/notebooks` on VPS
+
+---
+
 ## 2026-02-07: L2 Compute Mode + Healthcheck Fix
 
 **VPS:** Hetzner CX32, `deployer@46.62.142.15`, Ubuntu 24.04

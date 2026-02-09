@@ -58,17 +58,19 @@ services:
         condition: service_started
 
   jupyter:
-    image: localhost/nautilus-trader:latest
+    image: localhost/barter-jupyter:latest
     container_name: jupyter
     restart: "no"
     ports:
       - "127.0.0.1:8888:8888"
+    environment:
+      JUPYTER_TOKEN: ""
     volumes:
       - parquet-data:/data/parquet:ro
       - features-data:/data/features:ro
       - notebooks-data:/home/jovyan/work:rw
       - catalog:/data/catalog:rw
-    command: ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--NotebookApp.token=''", "--notebook-dir=/home/jovyan/work"]
+    command: ["start-notebook.py", "--IdentityProvider.token=''"]
 
 volumes:
   parquet-data: {}
