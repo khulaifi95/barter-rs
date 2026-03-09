@@ -74,6 +74,16 @@ HB_CRON="*/5 * * * * /home/deployer/barter/status.sh --check-heartbeat >> /data/
 (crontab -u deployer -l 2>/dev/null | grep -v "check-heartbeat"; echo "$HB_CRON") | crontab -u deployer -
 echo "  Heartbeat watchdog cron set: every 5 minutes"
 
+echo "==> Setting up daily gap report cron..."
+GAP_CRON="0 2 * * * /home/deployer/barter/gap_report.sh >> /tmp/gap_report.log 2>&1"
+(crontab -u deployer -l 2>/dev/null | grep -v "gap_report"; echo "$GAP_CRON") | crontab -u deployer -
+echo "  Gap report cron set: daily at 02:00 UTC"
+
+echo "==> Setting up daily OOM check cron..."
+OOM_CRON="10 2 * * * /home/deployer/barter/oom_check.sh >> /tmp/oom_check.log 2>&1"
+(crontab -u deployer -l 2>/dev/null | grep -v "oom_check"; echo "$OOM_CRON") | crontab -u deployer -
+echo "  OOM check cron set: daily at 02:10 UTC"
+
 echo ""
 echo "==> VPS setup complete!"
 echo "    Data dirs:  /data/{parquet,ipc,catalog,features,_checkpoints,backups,notebooks}"

@@ -143,6 +143,9 @@ scp "$DEPLOY_DIR/compose.prod.yaml" "$VPS_HOST:$VPS_DEPLOY_DIR/"
 scp "$DEPLOY_DIR/.env.production" "$VPS_HOST:$VPS_DEPLOY_DIR/"
 scp "$DEPLOY_DIR/status.sh" "$VPS_HOST:$VPS_DEPLOY_DIR/"
 scp "$DEPLOY_DIR/backup.sh" "$VPS_HOST:$VPS_DEPLOY_DIR/"
+scp "$DEPLOY_DIR/gap_report.sh" "$VPS_HOST:$VPS_DEPLOY_DIR/"
+scp "$DEPLOY_DIR/gap_audit.py" "$VPS_HOST:$VPS_DEPLOY_DIR/"
+scp "$DEPLOY_DIR/oom_check.sh" "$VPS_HOST:$VPS_DEPLOY_DIR/"
 scp "$DEPLOY_DIR/Containerfile.jupyter" "$VPS_HOST:$VPS_DEPLOY_DIR/"
 
 if [ "$DEPLOY_SERVER" = true ]; then
