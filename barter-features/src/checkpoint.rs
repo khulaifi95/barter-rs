@@ -1,10 +1,11 @@
 //! Checkpoint system for tracking processed files and enabling idempotent restarts.
 //!
 //! Features:
-//! - SHA256 hashing of file contents
+//! - Fast (mtime, size) fingerprinting for watch-mode deduplication
+//! - SHA256 hashing available for batch-mode verification
 //! - JSON persistence
 //! - Skip already-processed files on restart
-//! - Detect changed files (different hash) for reprocessing
+//! - Detect changed files for reprocessing
 
 use crate::error::Result;
 use chrono::{DateTime, Utc};
@@ -41,8 +42,16 @@ pub struct InstrumentCheckpoint {
 /// Checkpoint info for a single processed file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileCheckpoint {
-    /// SHA256 hash of file content
+    /// Legacy field kept for backward compatibility with existing checkpoint JSON.
+    /// No longer computed — checks use (size, mtime) instead.
+    #[serde(default)]
     pub file_hash: String,
+    /// File size in bytes at processing time
+    #[serde(default)]
+    pub file_size: u64,
+    /// File mtime as seconds since epoch
+    #[serde(default)]
+    pub file_mtime_secs: i64,
     /// Number of rows processed from this file
     pub rows_processed: u64,
     /// Last ts_event processed
@@ -134,33 +143,62 @@ impl Checkpoint {
         Ok(())
     }
 
-    /// Check if a file has already been processed (same hash).
+    /// Check if a file has already been processed using fast (size, mtime) fingerprint.
+    ///
+    /// Falls back to path-only check for legacy checkpoints that lack size/mtime fields.
+    /// Does NOT re-hash the file — this is the hot path called on every rescan tick.
     pub fn is_file_processed(&self, instrument_id: &str, file_path: &Path) -> bool {
         let file_key = file_path.to_string_lossy().to_string();
 
         if let Some(instr) = self.instruments.get(instrument_id)
             && let Some(checkpoint) = instr.processed_files.get(&file_key)
-            && let Ok(current_hash) = compute_file_hash(file_path)
         {
-            return checkpoint.file_hash == current_hash;
+            // Fast path: compare (size, mtime) — no I/O beyond stat()
+            if checkpoint.file_size > 0
+                && let Ok(meta) = std::fs::metadata(file_path)
+            {
+                let current_size = meta.len();
+                let current_mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                return checkpoint.file_size == current_size
+                    && checkpoint.file_mtime_secs == current_mtime;
+            }
+            // Legacy checkpoint without size/mtime — treat as processed
+            return true;
         }
         false
     }
 
-    /// Check if a file needs reprocessing (exists but hash differs).
+    /// Check if a file needs reprocessing (exists in checkpoint but fingerprint differs).
     pub fn needs_reprocessing(&self, instrument_id: &str, file_path: &Path) -> bool {
         let file_key = file_path.to_string_lossy().to_string();
 
         if let Some(instr) = self.instruments.get(instrument_id)
             && let Some(checkpoint) = instr.processed_files.get(&file_key)
-            && let Ok(current_hash) = compute_file_hash(file_path)
         {
-            return checkpoint.file_hash != current_hash;
+            if checkpoint.file_size > 0
+                && let Ok(meta) = std::fs::metadata(file_path)
+            {
+                let current_size = meta.len();
+                let current_mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                return checkpoint.file_size != current_size
+                    || checkpoint.file_mtime_secs != current_mtime;
+            }
+            return false; // Legacy: assume unchanged
         }
         false
     }
 
-    /// Mark a file as processed.
+    /// Mark a file as processed, recording (size, mtime) for fast future checks.
     pub fn mark_processed(
         &mut self,
         instrument_id: &str,
@@ -169,7 +207,20 @@ impl Checkpoint {
         last_ts_event: i64,
     ) -> Result<()> {
         let file_key = file_path.to_string_lossy().to_string();
-        let file_hash = compute_file_hash(file_path)?;
+
+        // Read file metadata for fast fingerprinting
+        let (file_size, file_mtime_secs) = std::fs::metadata(file_path)
+            .map(|meta| {
+                let size = meta.len();
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                (size, mtime)
+            })
+            .unwrap_or((0, 0));
 
         let instr = self
             .instruments
@@ -182,7 +233,9 @@ impl Checkpoint {
         instr.processed_files.insert(
             file_key,
             FileCheckpoint {
-                file_hash,
+                file_hash: String::new(),
+                file_size,
+                file_mtime_secs,
                 rows_processed,
                 last_ts_event,
                 processed_at: Utc::now(),
@@ -348,11 +401,12 @@ mod tests {
         // File unchanged - no reprocessing needed
         assert!(!checkpoint.needs_reprocessing("BTCUSDT", &file_path));
 
-        // Modify file
+        // Modify file with different size so (size, mtime) check detects the change
         let mut f = File::create(&file_path).unwrap();
-        f.write_all(b"modified content").unwrap();
+        f.write_all(b"modified content that is longer than the original")
+            .unwrap();
 
-        // Now needs reprocessing
+        // Now needs reprocessing (different file size)
         assert!(checkpoint.needs_reprocessing("BTCUSDT", &file_path));
     }
 

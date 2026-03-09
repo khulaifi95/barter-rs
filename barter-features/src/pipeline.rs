@@ -8,12 +8,11 @@ use crate::features::{
 };
 use crate::output::{FeatureWriter, OutputMetadata};
 use crate::precision::PrecisionMode;
-use crate::reader::{
-    ExtendedBar, read_extended_bars, read_trades_with_precision, trade_instrument_id_from_schema,
-};
-use crate::watcher::{AsyncFileWatcher, scan_ready_files};
+use crate::reader::{ExtendedBar, read_extended_bars, trade_instrument_id_from_schema};
+use crate::watcher::{AsyncFileWatcher, scan_ready_files, scan_ready_files_since};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tracing::{debug, error, info, warn};
 
 /// Session key: (instrument_id, session_date)
@@ -50,6 +49,8 @@ pub struct Pipeline {
     session_trades_precision: HashMap<SessionKey, PrecisionMode>,
     /// Optional allowlist of instruments to process (normalized)
     allowed_instruments: Option<HashSet<String>>,
+    /// Timestamp of last rescan (for incremental scanning in watch mode)
+    last_rescan_time: SystemTime,
 }
 
 impl Pipeline {
@@ -102,6 +103,7 @@ impl Pipeline {
             accumulated_large_trades: HashMap::new(),
             session_trades_precision: HashMap::new(),
             allowed_instruments,
+            last_rescan_time: SystemTime::UNIX_EPOCH,
         })
     }
 
@@ -323,8 +325,8 @@ impl Pipeline {
             self.config.checkpoint.save_interval_secs,
         ));
 
-        // Session timeout: 1 hour in nanoseconds
-        const SESSION_TIMEOUT_NS: i64 = 3600 * 1_000_000_000;
+        // Session timeout: 15 minutes in nanoseconds (was 1 hour — reduced to limit memory)
+        const SESSION_TIMEOUT_NS: i64 = 900 * 1_000_000_000;
 
         loop {
             tokio::select! {
@@ -356,15 +358,25 @@ impl Pipeline {
                         );
                     }
 
-                    // Safety net: periodic rescan for files that were too fresh on first notify event
-                    let rescan_files = scan_ready_files(
+                    // Safety net: incremental rescan — only descend into dirs
+                    // modified since last scan (skips ~99% of the 62K file tree).
+                    let scan_cutoff = self.last_rescan_time;
+                    let rescan_files = scan_ready_files_since(
                         &self.config.general.input_dir,
                         self.config.watcher.stable_mtime_secs,
+                        scan_cutoff,
+                        0,
                     );
+                    let mut scanned = 0u32;
                     for path in rescan_files {
+                        scanned += 1;
                         if let Err(e) = self.process_file(&path).await {
                             error!("Error processing {:?} during rescan: {}", path, e);
                         }
+                    }
+                    self.last_rescan_time = SystemTime::now();
+                    if scanned > 0 {
+                        debug!("Incremental rescan processed {} new files", scanned);
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -471,16 +483,16 @@ impl Pipeline {
             }
         }
 
-        // Clone accumulated bars for processing (releases mutable borrow)
-        let accumulated_bars = self
-            .active_sessions
-            .get(&session_key)
-            .map(|acc| acc.bars.clone())
-            .unwrap_or_default();
-
-        // Re-process all accumulated bars to get complete session state
-        let (all_brackets, all_events) =
-            self.compute_session_output(&accumulated_bars, instrument_id, &session_date)?;
+        // Borrow accumulated bars as a slice — no clone needed since compute_session_output
+        // only requires &self (shared borrow), same as active_sessions.get().
+        let (all_brackets, all_events) = {
+            let bars = self
+                .active_sessions
+                .get(&session_key)
+                .map(|acc| acc.bars.as_slice())
+                .unwrap_or(&[]);
+            self.compute_session_output(bars, instrument_id, &session_date)?
+        };
 
         // Write outputs (overwrites previous - this is correct for incremental updates)
         if !all_brackets.is_empty() {
@@ -654,18 +666,9 @@ impl Pipeline {
                 }
             }
         } else {
-            // Incremental update from this file only
-            let (trades, precision) = read_trades_with_precision(path)?;
-            if trades.is_empty() {
-                return Ok(());
-            }
-
-            info!(
-                "Read {} trades from {:?} (precision: {:?})",
-                trades.len(),
-                path,
-                precision
-            );
+            // Incremental update from this file only — stream trades, never hold full file
+            let mut reader = crate::reader::trades::TradeReader::open(path)?;
+            let precision = reader.precision_mode();
 
             self.session_trades_precision
                 .entry(session_key.clone())
@@ -677,7 +680,9 @@ impl Pipeline {
                 .or_insert(precision);
 
             let mut new_large_trades = Vec::new();
-            for trade in &trades {
+            let mut trade_count = 0u64;
+            while let Some(trade) = reader.next()? {
+                trade_count += 1;
                 if let Some(large_trade) = self.trade_detector.process_trade(
                     trade.ts_event,
                     &output_instrument_id,
@@ -689,6 +694,15 @@ impl Pipeline {
                     new_large_trades.push(large_trade);
                 }
             }
+
+            if trade_count == 0 {
+                return Ok(());
+            }
+
+            info!(
+                "Streamed {} trades from {:?} (precision: {:?})",
+                trade_count, path, precision
+            );
 
             if !new_large_trades.is_empty() {
                 let accumulated = self
@@ -707,12 +721,8 @@ impl Pipeline {
                     .and_then(|v| v.last())
                     .map(|t| t.ts_event)
                     .unwrap_or(0);
-                self.checkpoint.mark_processed(
-                    instrument_id,
-                    path,
-                    trades.len() as u64,
-                    last_ts,
-                )?;
+                self.checkpoint
+                    .mark_processed(instrument_id, path, trade_count, last_ts)?;
             }
         }
 
@@ -756,47 +766,46 @@ impl Pipeline {
         Ok(())
     }
 
+    /// Detect large trades by streaming through files one at a time.
+    ///
+    /// Instead of loading all trades into memory, reads each file with a streaming
+    /// reader and processes trades individually through the detector.
     fn compute_large_trades_from_files(
         &self,
         files: &[PathBuf],
         output_instrument_id: &str,
     ) -> Result<LargeTradesOutput> {
-        let mut all_trades = Vec::new();
+        let mut large_trades = Vec::new();
         let mut detected_precision = PrecisionMode::Standard;
         let mut file_rows = Vec::new();
 
         for file in files {
-            match read_trades_with_precision(file) {
-                Ok((trades, precision)) => {
-                    file_rows.push((file.clone(), trades.len() as u64));
-                    all_trades.extend(trades);
+            match crate::reader::trades::TradeReader::open(file) {
+                Ok(mut reader) => {
+                    let precision = reader.precision_mode();
                     if precision == PrecisionMode::High {
                         detected_precision = PrecisionMode::High;
                     }
+                    let mut row_count = 0u64;
+                    // Stream trades one at a time — never hold full file in memory
+                    while let Some(trade) = reader.next()? {
+                        row_count += 1;
+                        if let Some(large_trade) = self.trade_detector.process_trade(
+                            trade.ts_event,
+                            output_instrument_id,
+                            &trade.trade_id,
+                            trade.price,
+                            trade.size,
+                            &trade.side,
+                        ) {
+                            large_trades.push(large_trade);
+                        }
+                    }
+                    file_rows.push((file.clone(), row_count));
                 }
                 Err(e) => {
                     warn!("Failed to read trades from {:?}: {}", file, e);
                 }
-            }
-        }
-
-        if all_trades.is_empty() {
-            return Ok((Vec::new(), detected_precision, file_rows));
-        }
-
-        all_trades.sort_by_key(|t| t.ts_event);
-
-        let mut large_trades = Vec::new();
-        for trade in &all_trades {
-            if let Some(large_trade) = self.trade_detector.process_trade(
-                trade.ts_event,
-                output_instrument_id,
-                &trade.trade_id,
-                trade.price,
-                trade.size,
-                &trade.side,
-            ) {
-                large_trades.push(large_trade);
             }
         }
 
@@ -819,17 +828,30 @@ impl Pipeline {
             .first()
             .and_then(|file| trade_instrument_id_from_schema(file).ok().flatten())
             .unwrap_or_else(|| instrument_id.to_string());
-        // Read all trades from all files, tracking highest precision
-        let mut all_trades = Vec::new();
+        // Stream trades from all files — never hold all trades in memory
+        let mut large_trades = Vec::new();
         let mut detected_precision = PrecisionMode::Standard;
+        let mut total_trade_count = 0u64;
 
         for file in files {
-            match read_trades_with_precision(file) {
-                Ok((trades, precision)) => {
-                    all_trades.extend(trades);
-                    // Use highest precision if any file has high precision
+            match crate::reader::trades::TradeReader::open(file) {
+                Ok(mut reader) => {
+                    let precision = reader.precision_mode();
                     if precision == PrecisionMode::High {
                         detected_precision = PrecisionMode::High;
+                    }
+                    while let Some(trade) = reader.next()? {
+                        total_trade_count += 1;
+                        if let Some(large_trade) = self.trade_detector.process_trade(
+                            trade.ts_event,
+                            &output_instrument_id,
+                            &trade.trade_id,
+                            trade.price,
+                            trade.size,
+                            &trade.side,
+                        ) {
+                            large_trades.push(large_trade);
+                        }
                     }
                 }
                 Err(e) => {
@@ -839,37 +861,19 @@ impl Pipeline {
             }
         }
 
-        if all_trades.is_empty() {
+        if total_trade_count == 0 {
             return Ok(());
         }
 
-        // Sort trades by timestamp
-        all_trades.sort_by_key(|t| t.ts_event);
         info!(
-            "Loaded {} total trades for session (precision: {:?})",
-            all_trades.len(),
-            detected_precision
+            "Streamed {} total trades for session (precision: {:?})",
+            total_trade_count, detected_precision
         );
-
-        // Process each trade through the detector
-        let mut large_trades = Vec::new();
-        for trade in &all_trades {
-            if let Some(large_trade) = self.trade_detector.process_trade(
-                trade.ts_event,
-                &output_instrument_id,
-                &trade.trade_id,
-                trade.price,
-                trade.size,
-                &trade.side,
-            ) {
-                large_trades.push(large_trade);
-            }
-        }
 
         info!(
             "Detected {} large trades from {} total trades",
             large_trades.len(),
-            all_trades.len()
+            total_trade_count
         );
 
         // Skip writing if no large trades detected
@@ -881,12 +885,8 @@ impl Pipeline {
             // Update checkpoint for all processed files
             if self.config.checkpoint.enabled {
                 for file in files {
-                    self.checkpoint.mark_processed(
-                        instrument_id,
-                        file,
-                        all_trades.len() as u64,
-                        0,
-                    )?;
+                    self.checkpoint
+                        .mark_processed(instrument_id, file, total_trade_count, 0)?;
                 }
             }
             return Ok(());
@@ -920,12 +920,8 @@ impl Pipeline {
         if self.config.checkpoint.enabled {
             let last_ts = large_trades.last().map(|t| t.ts_event).unwrap_or(0);
             for file in files {
-                self.checkpoint.mark_processed(
-                    instrument_id,
-                    file,
-                    all_trades.len() as u64,
-                    last_ts,
-                )?;
+                self.checkpoint
+                    .mark_processed(instrument_id, file, total_trade_count, last_ts)?;
             }
         }
 

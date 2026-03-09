@@ -233,6 +233,59 @@ pub fn scan_ready_files(dir: &Path, stable_mtime_secs: u64) -> Vec<PathBuf> {
     files
 }
 
+/// Scan a directory tree for ready parquet files, skipping subdirectories
+/// whose mtime is older than `since`.
+///
+/// The VPS tree is: `root/{type}/{instrument}/{date}/files.parquet`.
+/// When a file is created inside a date directory, its mtime updates.
+/// By checking directory mtime before descending, we avoid stat()'ing
+/// the ~62K files in old date directories — only today's dir gets scanned.
+///
+/// `depth` tracks recursion level so we know when we've reached leaf
+/// directories (depth 3 = date dirs) vs intermediate ones.
+pub fn scan_ready_files_since(
+    dir: &Path,
+    stable_mtime_secs: u64,
+    since: SystemTime,
+    depth: u32,
+) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return files,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // At depth >= 2 (date-level dirs), check mtime before descending.
+            // Intermediate dirs (type, instrument) are always traversed because
+            // their mtime doesn't change when files are added in subdirectories.
+            if depth >= 2 {
+                let dominated = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .is_some_and(|mtime| mtime < since);
+                if dominated {
+                    continue;
+                }
+            }
+            files.extend(scan_ready_files_since(
+                &path,
+                stable_mtime_secs,
+                since,
+                depth + 1,
+            ));
+        } else if is_file_ready(&path, stable_mtime_secs) {
+            files.push(path);
+        }
+    }
+
+    files
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +387,45 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("complete.parquet"));
+    }
+
+    #[test]
+    fn test_scan_ready_files_since_skips_old_dirs() {
+        // Simulate: root/type/instrument/date/file.parquet (depth 3 = date level)
+        let dir = tempdir().unwrap();
+        let old_date_dir = dir.path().join("trades").join("BTC").join("2026-02-01");
+        let new_date_dir = dir.path().join("trades").join("BTC").join("2026-03-08");
+        std::fs::create_dir_all(&old_date_dir).unwrap();
+        std::fs::create_dir_all(&new_date_dir).unwrap();
+
+        // Create files in both date dirs
+        let old_file = old_date_dir.join("old.parquet");
+        let new_file = new_date_dir.join("new.parquet");
+        let mut f1 = File::create(&old_file).unwrap();
+        f1.write_all(b"old data").unwrap();
+        drop(f1);
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Record cutoff after old file was created
+        let cutoff = SystemTime::now();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Create new file after cutoff
+        let mut f2 = File::create(&new_file).unwrap();
+        f2.write_all(b"new data").unwrap();
+        drop(f2);
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Full scan should find both
+        let all = scan_ready_files(dir.path(), 0);
+        assert_eq!(all.len(), 2);
+
+        // Incremental scan since cutoff should only find the new file
+        let incremental = scan_ready_files_since(dir.path(), 0, cutoff, 0);
+        assert_eq!(incremental.len(), 1);
+        assert!(incremental[0].ends_with("new.parquet"));
     }
 }

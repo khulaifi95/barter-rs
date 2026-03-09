@@ -75,14 +75,43 @@ check_heartbeat() {
     return $exit_code
 }
 
+# ── Healthchecks.io ping (reads URLs from .env) ──────────────
+# Pings the given URL with exit code: /0 on success, /fail on failure.
+# Sends check output as request body (visible in healthchecks.io dashboard).
+ping_healthcheck() {
+    local url="$1" exit_code="$2" output="$3"
+    if [ -n "$url" ]; then
+        if [ "$exit_code" -eq 0 ]; then
+            curl -fsS -m 10 --retry 3 --data-raw "$output" "$url/0" >/dev/null 2>&1 || true
+        else
+            curl -fsS -m 10 --retry 3 --data-raw "$output" "$url/fail" >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+# Source ping URLs from .env if available
+HC_HEARTBEAT_URL=""
+HC_DISK_URL=""
+HC_BACKUP_URL=""
+if [ -f "$HOME/barter/.env.monitoring" ]; then
+    # shellcheck source=/dev/null
+    . "$HOME/barter/.env.monitoring"
+fi
+
 if [ "$CHECK_DISK_ONLY" = true ]; then
-    check_disk
-    exit $?
+    output=$(check_disk 2>&1)
+    rc=$?
+    [ -n "$output" ] && echo "$output"
+    ping_healthcheck "$HC_DISK_URL" "$rc" "$output"
+    exit $rc
 fi
 
 if [ "$CHECK_HEARTBEAT_ONLY" = true ]; then
-    check_heartbeat
-    exit $?
+    output=$(check_heartbeat 2>&1)
+    rc=$?
+    [ -n "$output" ] && echo "$output"
+    ping_healthcheck "$HC_HEARTBEAT_URL" "$rc" "$output"
+    exit $rc
 fi
 
 # ── Full status report ────────────────────────────────────────

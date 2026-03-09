@@ -11,7 +11,7 @@ use crate::precision::{PrecisionMode, decode_fixed_point};
 use arrow::array::{Array, FixedSizeBinaryArray, StringArray, UInt8Array, UInt64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use std::fs::File;
 use std::path::Path;
 use tracing::debug;
@@ -40,17 +40,21 @@ impl Trade {
     }
 }
 
-/// Reader for trade parquet files.
+/// Streaming reader for trade parquet files.
+///
+/// Reads one RecordBatch at a time instead of loading the entire file into memory.
 pub struct TradeReader {
-    batches: Vec<RecordBatch>,
-    current_batch: usize,
+    /// Lazy batch iterator — only one batch in memory at a time
+    batch_reader: ParquetRecordBatchReader,
+    /// Current batch being iterated (replaced as we advance)
+    current_batch: Option<RecordBatch>,
     current_row: usize,
     /// Detected precision mode from the parquet schema
     precision_mode: PrecisionMode,
 }
 
 impl TradeReader {
-    /// Open a parquet file for reading trades.
+    /// Open a parquet file for streaming reads.
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
@@ -59,20 +63,13 @@ impl TradeReader {
         let schema = builder.schema();
         let precision_mode = detect_precision_from_schema(schema)?;
 
-        let reader = builder.build()?;
+        let batch_reader = builder.build()?;
 
-        let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<Vec<_>, _>>()?;
-
-        debug!(
-            "Opened trades {:?} with {} batches, precision={:?}",
-            path,
-            batches.len(),
-            precision_mode
-        );
+        debug!("Opened trades {:?}, precision={:?}", path, precision_mode);
 
         Ok(Self {
-            batches,
-            current_batch: 0,
+            batch_reader,
+            current_batch: None,
             current_row: 0,
             precision_mode,
         })
@@ -83,14 +80,9 @@ impl TradeReader {
         self.precision_mode
     }
 
-    /// Get total row count across all batches.
-    pub fn total_rows(&self) -> usize {
-        self.batches.iter().map(|b| b.num_rows()).sum()
-    }
-
     /// Read all trades from the file.
     pub fn read_all(&mut self) -> Result<Vec<Trade>> {
-        let mut trades = Vec::with_capacity(self.total_rows());
+        let mut trades = Vec::new();
 
         while let Some(trade) = self.next()? {
             trades.push(trade);
@@ -102,26 +94,26 @@ impl TradeReader {
     /// Read the next trade, if any.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Trade>> {
-        while self.current_batch < self.batches.len() {
-            let batch = &self.batches[self.current_batch];
-
-            if self.current_row < batch.num_rows() {
+        loop {
+            // Try to read from current batch
+            if let Some(batch) = &self.current_batch
+                && self.current_row < batch.num_rows()
+            {
                 let trade = self.read_trade_from_batch(batch, self.current_row)?;
                 self.current_row += 1;
                 return Ok(Some(trade));
             }
 
-            self.current_batch += 1;
-            self.current_row = 0;
+            // Advance to next batch (drops the previous one, freeing memory)
+            match self.batch_reader.next() {
+                Some(Ok(batch)) => {
+                    self.current_batch = Some(batch);
+                    self.current_row = 0;
+                }
+                Some(Err(e)) => return Err(FeatureError::Arrow(e)),
+                None => return Ok(None),
+            }
         }
-
-        Ok(None)
-    }
-
-    /// Reset reader to beginning.
-    pub fn reset(&mut self) {
-        self.current_batch = 0;
-        self.current_row = 0;
     }
 
     fn read_trade_from_batch(&self, batch: &RecordBatch, row: usize) -> Result<Trade> {
